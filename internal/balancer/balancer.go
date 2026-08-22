@@ -38,6 +38,10 @@ var (
 	ErrAllThrottled = errors.New("所有可用接入点均被限流或熔断")
 )
 
+// maxFallbackChain 限制 fallback 链展开后的总长度，防止配置成环或过深时
+// 单次请求退避到无限多个模型上。
+const maxFallbackChain = 16
+
 // Balancer 是负载均衡器。
 type Balancer struct {
 	mu        sync.RWMutex
@@ -124,6 +128,40 @@ func (b *Balancer) applyStat(op statOp) {
 	if op.subkeyID != "" {
 		_ = b.store.AccumulateSubKey(op.subkeyID, op.ok, op.prompt, op.completion)
 	}
+	// 落库的同时同步内存副本：Snapshot* 读的是 b.accounts / b.endpoints，
+	// 若只写 DB，管理 UI 会一直显示上次 Refresh 时的陈旧统计。
+	b.accumulateInMemory(op)
+}
+
+// accumulateInMemory 把一次统计增量同步到内存中的账号/叶节点副本，
+// 使 SnapshotAccounts / SnapshotEndpoints 无需 Refresh 即可反映最新用量。
+func (b *Balancer) accumulateInMemory(op statOp) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now().Unix()
+	if a, ok := b.accounts[op.accountID]; ok {
+		bumpStats(&a.TotalRequests, &a.SuccessRequests, &a.FailRequests,
+			&a.PromptTokens, &a.CompletionTokens, &a.TotalTokens, op)
+		a.LastUsedAt = now
+	}
+	if e, ok := b.endpoints[op.endpointID]; ok {
+		bumpStats(&e.TotalRequests, &e.SuccessRequests, &e.FailRequests,
+			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, op)
+		e.LastUsedAt = now
+	}
+}
+
+// bumpStats 施加一次请求的统计增量（调用方须持有 b.mu 写锁）。
+func bumpStats(total, success, fail, prompt, completion, tokens *int64, op statOp) {
+	*total++
+	if op.ok {
+		*success++
+	} else {
+		*fail++
+	}
+	*prompt += op.prompt
+	*completion += op.completion
+	*tokens += op.prompt + op.completion
 }
 
 func (b *Balancer) drain() {
@@ -225,6 +263,65 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 	picked.Runtime.RPM.Add(1)
 
 	return picked, nil
+}
+
+// FallbackChain 解析某易读模型名的有序 fallback 链。
+//
+// 按广度优先展开：请求名在前，然后是它 Fallback 列表里的每一项（保持配置顺序），
+// 再依次展开这些模型各自的 Fallback。去重、防环，总长上限 maxFallbackChain。
+// 例如 A.Fallback=[B,C]，B.Fallback=[D] → [A, B, C, D]。
+//
+// UI 把该字段描述为「逗号分隔，按顺序尝试」，因此这里必须遍历列表全部条目，
+// 而不能只取首项——否则用户配置的第二个及以后的候选会被静默忽略。
+func (b *Balancer) FallbackChain(modelName string) []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if modelName == "" {
+		return nil
+	}
+	chain := []string{modelName}
+	seen := map[string]bool{modelName: true}
+	for i := 0; i < len(chain) && len(chain) < maxFallbackChain; i++ {
+		m, ok := b.models[chain[i]]
+		if !ok {
+			continue
+		}
+		for _, f := range m.Fallback {
+			if f == "" || seen[f] {
+				continue
+			}
+			seen[f] = true
+			chain = append(chain, f)
+			if len(chain) >= maxFallbackChain {
+				break
+			}
+		}
+	}
+	return chain
+}
+
+// SelectWithFallback 先按请求的模型名做常规 Select；若该模型在所有账号的元组都
+// 不可用（ErrAllThrottled / ErrNoAccount / ErrNoEndpoint），自动沿 fallback 链
+// 依次尝试后续模型。返回命中的叶节点与实际使用的模型名。
+//
+// allowedAccounts 为账号白名单（子 Key 限定可用的账号）；allowedModels 为模型
+// 白名单（子 Key 限定的模型；非空时，fallback 链里不在白名单的模型会被跳过，
+// 避免「子 Key 仅授权模型 A，却经 fallback 打到未授权的模型 B」）。
+func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowedModels []string, exclude map[string]bool) (*model.Endpoint, string, error) {
+	allowModel := setOf(allowedModels)
+	chain := b.FallbackChain(modelName)
+	var lastErr error
+	for _, name := range chain {
+		if len(allowModel) > 0 && !allowModel[name] {
+			continue // 子 Key 未授权的 fallback 目标，跳过
+		}
+		ep, err := b.Select(name, allowedAccounts, exclude)
+		if err == nil {
+			return ep, name, nil
+		}
+		lastErr = err
+	}
+	return nil, modelName, lastErr
 }
 
 // weightTable 计算每个候选叶子的统一权重（叶.weight > 账号.weight > 1）。

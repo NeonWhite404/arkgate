@@ -176,3 +176,137 @@ func TestTPMLimitThrottles(t *testing.T) {
 		t.Fatalf("want ErrAllThrottled for TPM exhausted, got %v", err)
 	}
 }
+
+func TestFallbackChain(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "a", Enabled: true, Fallback: []string{"b", "c"}},
+		{Name: "b", Enabled: true, Fallback: []string{"d"}},
+		{Name: "d", Enabled: true},
+	})
+	got := b.FallbackChain("a")
+	// 广度优先：a 的两个候选 b、c 都要保留（按配置顺序），再展开 b 的 d。
+	want := []string{"a", "b", "c", "d"}
+	if !equalStrs(got, want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+// TestFallbackChainKeepsAllBranches 锁定「列表里每一项都会被尝试」这一语义——
+// UI 承诺「逗号分隔，按顺序尝试」，早期实现只取首项，会静默丢弃后续候选。
+func TestFallbackChainKeepsAllBranches(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "a", Enabled: true, Fallback: []string{"b", "c", "d"}},
+	})
+	got := b.FallbackChain("a")
+	want := []string{"a", "b", "c", "d"}
+	if !equalStrs(got, want) {
+		t.Fatalf("all configured fallbacks must be kept: want %v, got %v", want, got)
+	}
+}
+
+func TestFallbackChainDedupes(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "a", Enabled: true, Fallback: []string{"b", "c"}},
+		{Name: "b", Enabled: true, Fallback: []string{"c", "a"}},
+		{Name: "c", Enabled: true},
+	})
+	got := b.FallbackChain("a")
+	want := []string{"a", "b", "c"}
+	if !equalStrs(got, want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+func equalStrs(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFallbackChainCycle(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "a", Enabled: true, Fallback: []string{"b"}},
+		{Name: "b", Enabled: true, Fallback: []string{"a"}},
+	})
+	got := b.FallbackChain("a")
+	if len(got) != 2 {
+		t.Fatalf("cycle should terminate after 2, got %v", got)
+	}
+}
+
+func TestSelectWithFallback(t *testing.T) {
+	b := newTestBalancer()
+	// m 的元组全部熔断；fallback 模型 m2 可用。
+	b.seed([]*model.Account{mkAcc("a1", 1)}, []*model.Endpoint{
+		mkEP("e1", "a1", "m", "ep-1", 1),
+		mkEP("e2", "a1", "m2", "ep-2", 1),
+	}, []*model.Model{
+		{Name: "m", Enabled: true, Fallback: []string{"m2"}},
+		{Name: "m2", Enabled: true},
+	})
+	b.mu.Lock()
+	b.endpoints["e1"].Runtime.CircuitOpenUntil = 1 << 62 // 熔断 m 的唯一元组
+	b.mu.Unlock()
+
+	ep, actual, err := b.SelectWithFallback("m", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("select with fallback: %v", err)
+	}
+	if ep.EP != "ep-2" || actual != "m2" {
+		t.Fatalf("want fallback to m2/ep-2, got %s/%s", actual, ep.EP)
+	}
+	b.Release(ep)
+}
+
+// TestAccumulateInMemoryUpdatesSnapshot 锁定「统计落库的同时也更新内存副本」这一
+// 语义。SnapshotAccounts/SnapshotEndpoints 读的是内存 map，若只写 DB，管理 UI 会
+// 一直显示上次 Refresh 时的陈旧数字。
+func TestAccumulateInMemoryUpdatesSnapshot(t *testing.T) {
+	b := newTestBalancer()
+	b.seed([]*model.Account{mkAcc("a1", 1)}, []*model.Endpoint{
+		mkEP("e1", "a1", "m", "ep-1", 1),
+	}, []*model.Model{{Name: "m", Enabled: true}})
+
+	b.accumulateInMemory(statOp{accountID: "a1", endpointID: "e1", ok: true, prompt: 10, completion: 5})
+	b.accumulateInMemory(statOp{accountID: "a1", endpointID: "e1", ok: false, prompt: 3, completion: 0})
+
+	accs := b.SnapshotAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("want 1 account, got %d", len(accs))
+	}
+	a := accs[0]
+	if a.TotalRequests != 2 || a.SuccessRequests != 1 || a.FailRequests != 1 {
+		t.Fatalf("account counters: total=%d ok=%d fail=%d", a.TotalRequests, a.SuccessRequests, a.FailRequests)
+	}
+	if a.PromptTokens != 13 || a.CompletionTokens != 5 || a.TotalTokens != 18 {
+		t.Fatalf("account tokens: p=%d c=%d t=%d", a.PromptTokens, a.CompletionTokens, a.TotalTokens)
+	}
+	if a.LastUsedAt == 0 {
+		t.Fatal("LastUsedAt should be stamped")
+	}
+
+	eps := b.SnapshotEndpoints()
+	if len(eps) != 1 {
+		t.Fatalf("want 1 endpoint, got %d", len(eps))
+	}
+	if eps[0].TotalRequests != 2 || eps[0].TotalTokens != 18 {
+		t.Fatalf("endpoint counters: total=%d tokens=%d", eps[0].TotalRequests, eps[0].TotalTokens)
+	}
+}
+
+// TestAccumulateInMemoryUnknownIDs 未知 ID 不应 panic（例如叶子刚被删除，
+// 但仍有在途请求回报统计）。
+func TestAccumulateInMemoryUnknownIDs(t *testing.T) {
+	b := newTestBalancer()
+	b.accumulateInMemory(statOp{accountID: "nope", endpointID: "nope", ok: true, prompt: 1})
+}

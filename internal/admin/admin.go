@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,6 +108,7 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/logs", a.handleLogs)
 	reg("/api/stats", a.handleStats)
 	reg("/api/overview", a.handleOverview)
+	reg("/api/usage/series", a.handleUsageSeries)
 
 	return mux
 }
@@ -317,13 +319,32 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
-		var m model.Model
-		if err := decode(r, &m); err != nil {
+		// 解码到 map 做「部分更新」：直接反序列化成 model.Model 会把请求里未出现的
+		// 字段当成零值写回（描述被清空、enabled 被置 false、fallback 被清链），
+		// 与「编辑」语义不符。这里只覆盖请求显式带上的键。
+		var probe map[string]any
+		if err := decode(r, &probe); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
-		m.Name = name
-		if err := a.store.UpsertModel(&m); err != nil {
+		existing, err := a.store.GetModel(name)
+		if err != nil {
+			writeJSON(w, 404, map[string]any{"detail": "模型不存在"})
+			return
+		}
+		if v, ok := probe["display"].(string); ok {
+			existing.Display = v
+		}
+		if v, ok := probe["description"].(string); ok {
+			existing.Description = v
+		}
+		if v, ok := probe["enabled"].(bool); ok {
+			existing.Enabled = v
+		}
+		if raw, ok := probe["fallback"]; ok {
+			existing.Fallback = stringSlice(raw)
+		}
+		if err := a.store.UpsertModel(existing); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
@@ -592,6 +613,9 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleOverview 返回总览数据：账号/元组运行态 + 模型数 + 子 Key 数。
+//
+// 统计由 balancer.applyStat 在落库时同步进内存，这里直接读快照即可拿到最新值，
+// 无需 Refresh()（那会做三次全表扫描并抢写锁，阻塞所有在途 Select）。
 func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 	accs := a.bal.SnapshotAccounts()
 	eps := a.bal.SnapshotEndpoints()
@@ -635,6 +659,26 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleUsageSeries 返回子 Key × 模型 的按小时用量序列（最近 24 小时），供总览页绘图。
+func (a *Admin) handleUsageSeries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	hours := 24
+	if v := r.URL.Query().Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 168 {
+			hours = n
+		}
+	}
+	series, err := a.store.QueryUsageSeries(hours)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, series)
+}
+
 // ─────────────────────────── 工具 ───────────────────────────
 
 func decode(r *http.Request, v any) error {
@@ -644,6 +688,9 @@ func decode(r *http.Request, v any) error {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	if code >= 400 {
+		log.Printf("admin: error %d: %+v", code, v)
+	}
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("admin: write json: %v", err)
 	}
@@ -682,4 +729,20 @@ func intField(v any) int {
 	default:
 		return 0
 	}
+}
+
+// stringSlice 把 JSON 解码得到的 []any 安全转成 []string，跳过非字符串与空串。
+// 显式返回非 nil 空切片，使「清空 fallback 链」能被正确持久化为 []。
+func stringSlice(v any) []string {
+	raw, ok := v.([]any)
+	if !ok {
+		return []string{}
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
 }

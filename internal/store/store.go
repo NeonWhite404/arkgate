@@ -74,6 +74,7 @@ func (s *Store) migrate() error {
 			display TEXT NOT NULL DEFAULT '',
 			description TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL DEFAULT 1,
+			fallback TEXT NOT NULL DEFAULT '[]',
 			created_at INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS endpoints (
@@ -119,7 +120,9 @@ func (s *Store) migrate() error {
 			account_id TEXT NOT NULL DEFAULT '',
 			account_name TEXT NOT NULL DEFAULT '',
 			endpoint_id TEXT NOT NULL DEFAULT '',
+			requested_model TEXT NOT NULL DEFAULT '',
 			model TEXT NOT NULL DEFAULT '',
+			ep TEXT NOT NULL DEFAULT '',
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -153,6 +156,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE endpoints ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE endpoints ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN endpoint_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_logs ADD COLUMN requested_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_logs ADD COLUMN ep TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE models ADD COLUMN fallback TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE accounts ADD COLUMN weight INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE accounts ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN total_requests INTEGER NOT NULL DEFAULT 0`,
@@ -282,7 +288,7 @@ func (s *Store) AccumulateAccount(id string, ok bool, pt, ct int64) error {
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT name,display,description,enabled,created_at FROM models ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT name,display,description,enabled,fallback,created_at FROM models ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -290,21 +296,40 @@ func (s *Store) ListModels() ([]*model.Model, error) {
 	out := []*model.Model{}
 	for rows.Next() {
 		m := &model.Model{}
-		if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &m.CreatedAt); err != nil {
+		var fb string
+		if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		_ = json.Unmarshal([]byte(fb), &m.Fallback)
 		out = append(out, m)
 	}
 	return out, rows.Err()
 }
 
+// GetModel 按易读模型名读取单个模型（供「部分更新」先读后合并）。
+func (s *Store) GetModel(name string) (*model.Model, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m := &model.Model{}
+	var fb string
+	err := s.db.QueryRow(
+		`SELECT name,display,description,enabled,fallback,created_at FROM models WHERE name=?`, name,
+	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(fb), &m.Fallback)
+	return m, nil
+}
+
 func (s *Store) UpsertModel(m *model.Model) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,created_at)
-		VALUES(?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
-		description=excluded.description, enabled=excluded.enabled`,
-		m.Name, m.Display, m.Description, boolInt(m.Enabled), nonzero(m.CreatedAt, nowUnix()))
+	fb, _ := json.Marshal(m.Fallback)
+	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at)
+		VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback`,
+		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()))
 	return err
 }
 
@@ -513,10 +538,10 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
-		(ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,model,prompt_tokens,completion_tokens,total_tokens,status,latency_ms,error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,requested_model,model,ep,prompt_tokens,completion_tokens,total_tokens,status,latency_ms,error)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.EndpointID,
-		l.Model, l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.Status, l.LatencyMs, l.Error)
+		l.RequestedModel, l.Model, l.EP, l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.Status, l.LatencyMs, l.Error)
 	return err
 }
 
@@ -526,7 +551,7 @@ func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id,ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,model,
+	rows, err := s.db.Query(`SELECT id,ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,requested_model,model,ep,
 		prompt_tokens,completion_tokens,total_tokens,status,latency_ms,error
 		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
@@ -537,7 +562,7 @@ func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
 	for rows.Next() {
 		l := &model.UsageLog{}
 		if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
-			&l.EndpointID, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens,
+			&l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens,
 			&l.Status, &l.LatencyMs, &l.Error); err != nil {
 			return nil, err
 		}
@@ -552,6 +577,55 @@ func (s *Store) ClearUsageLogs() error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM usage_logs`)
 	return err
+}
+
+// UsageSeriesPoint 是子 Key × 模型 的时间序列点（按小时聚合）。
+type UsageSeriesPoint struct {
+	TS       int64  `json:"ts"`
+	SubKeyID string `json:"subkey_id"`
+	SubKey   string `json:"subkey"`
+	Model    string `json:"model"`
+	Tokens   int64  `json:"tokens"`
+	Requests int64  `json:"requests"`
+}
+
+// usageSeriesMaxRows 限制单次序列查询返回的点数，避免长时间窗 × 多子 Key ×
+// 多模型时序列化出超大响应。
+const usageSeriesMaxRows = 5000
+
+// QueryUsageSeries 聚合 usage_logs，返回子 Key × 模型 的按小时用量序列。
+// 仅统计最近 hours 小时（默认 24）。返回按 (ts, subkey, model) 排序，
+// 最多 usageSeriesMaxRows 行。
+func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	since := nowUnix() - int64(hours)*3600
+	// subkey_name 必须一并出现在 GROUP BY 中：否则 SQLite 会从分组内任取一行的
+	// 值，子 Key 改过名时标签会随机取到新旧名之一。
+	rows, err := s.db.Query(`SELECT (ts/3600)*3600 as bucket,
+		subkey_id, subkey_name, model,
+		SUM(total_tokens), COUNT(*)
+		FROM usage_logs
+		WHERE ts >= ?
+		GROUP BY bucket, subkey_id, subkey_name, model
+		ORDER BY bucket ASC, subkey_name ASC, model ASC
+		LIMIT ?`, since, usageSeriesMaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*UsageSeriesPoint{}
+	for rows.Next() {
+		p := &UsageSeriesPoint{}
+		if err := rows.Scan(&p.TS, &p.SubKeyID, &p.SubKey, &p.Model, &p.Tokens, &p.Requests); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // ─────────────────────────── Settings ───────────────────────────

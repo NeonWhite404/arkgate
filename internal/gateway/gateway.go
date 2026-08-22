@@ -177,14 +177,14 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 	exclude := map[string]bool{}
 
 	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
-		leaf, err := g.bal.Select(modelName, sk.AllowedAccounts, exclude)
+		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude)
 		if err != nil {
 			lastErr = err
 			break
 		}
 		acc, apiKey, derr := g.resolveKey(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, leaf, modelName, 0, 0, derr, start)
+			g.recordAttempt(sk, leaf, modelName, actualModel, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -197,7 +197,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, leaf, modelName, pt, ct, nil, start)
+			g.recordAttempt(sk, leaf, modelName, actualModel, pt, ct, nil, start)
 			// 透传上游真实状态码与 body。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -208,7 +208,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, leaf, modelName, pt, ct, ferr, start)
+		g.recordAttempt(sk, leaf, modelName, actualModel, pt, ct, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -220,14 +220,14 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 // chatStream 流式：单次尝试。绑定 leaf 后转发；上游失败时如果尚未写头，才回错误。
 func (g *Gateway) chatStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
 	start := time.Now()
-	leaf, err := g.bal.Select(modelName, sk.AllowedAccounts, nil)
+	leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, nil)
 	if err != nil {
 		g.writeUpstreamError(w, err)
 		return
 	}
 	_, apiKey, derr := g.resolveKey(leaf)
 	if derr != nil {
-		g.recordAttempt(sk, leaf, modelName, 0, 0, derr, start)
+		g.recordAttempt(sk, leaf, modelName, actualModel, 0, 0, derr, start)
 		g.writeUpstreamError(w, derr)
 		return
 	}
@@ -237,7 +237,7 @@ func (g *Gateway) chatStream(w http.ResponseWriter, r *http.Request, sk *model.S
 	w.Header().Set("Connection", "keep-alive")
 	fl, ok := w.(http.Flusher)
 	if !ok {
-		g.recordAttempt(sk, leaf, modelName, 0, 0, errors.New("无法建立流式响应"), start)
+		g.recordAttempt(sk, leaf, modelName, actualModel, 0, 0, errors.New("无法建立流式响应"), start)
 		writeJSON(w, http.StatusInternalServerError, errBody("server_error", "无法建立流式响应"))
 		return
 	}
@@ -247,7 +247,7 @@ func (g *Gateway) chatStream(w http.ResponseWriter, r *http.Request, sk *model.S
 		// 流已开始，无法更改状态码；用 SSE error 帧收尾。
 		writeSSEError(w, ferr)
 	}
-	g.recordAttempt(sk, leaf, modelName, pt, ct, ferr, start)
+	g.recordAttempt(sk, leaf, modelName, actualModel, pt, ct, ferr, start)
 }
 
 // resolveKey 解析叶节点对应账号的真实 API Key。
@@ -264,7 +264,7 @@ func (g *Gateway) resolveKey(leaf *model.Endpoint) (*model.Account, string, erro
 }
 
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
-func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, modelName string, pt, ct int64, ferr error, start time.Time) {
+func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, requestedModel, actualModel string, pt, ct int64, ferr error, start time.Time) {
 	ok := ferr == nil
 	l := &model.UsageLog{
 		TS:               time.Now().Unix(),
@@ -272,7 +272,9 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, modelNam
 		SubKeyName:       sk.Name,
 		AccountID:        leaf.AccountID,
 		EndpointID:       leaf.ID,
-		Model:            modelName,
+		EP:               leaf.EP, // 真实调用到火山的 ep-xxx
+		RequestedModel:   requestedModel,
+		Model:            actualModel, // 记录真实命中的模型（fallback 后）
 		PromptTokens:     pt,
 		CompletionTokens: ct,
 		TotalTokens:      pt + ct,
@@ -368,6 +370,9 @@ func errText(err error) string {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	if code >= 400 {
+		log.Printf("gateway: error %d: %+v", code, v)
+	}
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("gateway: write json: %v", err)
 	}

@@ -94,7 +94,8 @@
           '<div class="stat-row">' +
             stat('账号总数', d.account_total, 'ic-blue', '🏛') +
             stat('启用中', d.account_active, 'ic-green', '✅') +
-            stat('熔断中', d.account_circuit, 'ic-red', '⏳') +
+            // 账号本身不参与熔断（只有元组/叶节点会熔断），这里展示元组熔断数。
+            stat('元组熔断', d.endpoint_circuit, 'ic-red', '⏳') +
             stat('模型目录', d.model_count, 'ic-purple', '🧩') +
             stat('子 Key', d.subkey_count, 'ic-orange', '🔑') +
             stat('总请求', totalReq, 'ic-blue', '⚡') +
@@ -104,17 +105,21 @@
             '<div class="table-wrap"><table><thead><tr>' +
             '<th>账号</th><th>状态</th><th>权重</th><th>请求</th><th>成功</th><th>失败</th><th>Token</th><th>最后使用</th>' +
             '</tr></thead><tbody>' + (accs.length ? accs.map(function (a) {
-              var circuit = a.Runtime && a.Runtime.CircuitOpenUntil > Date.now() / 1e6 ? " (熔断)" : "";
-              return "<tr><td>" + esc(a.name) + "</td><td>" + statusTag(a.status) + circuit +
+              return "<tr><td>" + esc(a.name) + "</td><td>" + statusTag(a.status) +
                 "</td><td>" + esc(a.weight) + "</td><td>" + a.total_requests +
                 "</td><td class='v' style='color:rgb(var(--green-6))'>" + a.success_requests +
                 "</td><td class='v' style='color:rgb(var(--red-6))'>" + a.fail_requests +
                 "</td><td>" + fmtTokens(a.total_tokens) + "</td><td>" + fmtTime(a.last_used_at) + "</td></tr>";
             }).join("") : '<tr><td colspan="8" class="empty">暂无账号，请先添加</td></tr>') +
             "</tbody></table></div></div>" +
+          '<div class="card"><div class="card-head"><div class="card-title">各子 Key × 模型用量（最近 24 小时，按小时）</div></div>' +
+            '<div id="usage-chart" class="chart-wrap"></div></div>' +
         "</div>"
       ));
       bindDark(root);
+      req("GET", "/api/usage/series?hours=24").then(function (series) {
+        renderUsageChart(root.querySelector("#usage-chart"), series || []);
+      }).catch(function () {});
     }).catch(function (e) { root.innerHTML = ""; });
   });
 
@@ -131,6 +136,102 @@
       document.documentElement.setAttribute("data-theme", next);
       localStorage.setItem("arkgate_theme", next);
     });
+  }
+
+  // 渲染子 Key × 模型用量柱状图（SVG，无外部依赖）
+  function renderUsageChart(container, series) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!series || !series.length) {
+      container.innerHTML = '<div class="empty">暂无用量数据</div>';
+      return;
+    }
+    // 归并同 ts 的子 Key×模型点；收集子 Key 列表与时间点
+    var byTs = {};
+    var subs = {};
+    var models = {};
+    series.forEach(function (p) {
+      var t = p.ts;
+      if (!byTs[t]) byTs[t] = {};
+      var key = p.subkey || p.subkey_id;
+      var m = p.model || "—";
+      if (!byTs[t][key]) byTs[t][key] = {};
+      if (!byTs[t][key][m]) byTs[t][key][m] = 0;
+      byTs[t][key][m] += (p.tokens || 0);
+      subs[key] = true;
+      models[m] = true;
+    });
+    var tsList = Object.keys(byTs).map(function (x) { return parseInt(x, 10); }).sort(function (a, b) { return a - b; });
+    var subList = Object.keys(subs).sort();
+    var modelList = Object.keys(models).sort();
+
+    // 每子 Key 每模型一个系列；颜色按模型轮换
+    var colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
+    var mColor = {};
+    modelList.forEach(function (m, i) { mColor[m] = colors[i % colors.length]; });
+
+    // 构建 SVG：横轴时间，纵轴 token 数（每小时）
+    var W = 820, H = 240, padL = 48, padR = 12, padT = 12, padB = 28;
+    // maxV 必须是「同一时刻所有子 Key × 所有模型」的总和，因为下面把它们
+    // 堆叠在同一根柱子上；若只取单个子 Key 的小计，多子 Key 时柱子会超出画布。
+    var maxV = 0;
+    tsList.forEach(function (t) {
+      var stackTotal = 0;
+      subList.forEach(function (sk) {
+        modelList.forEach(function (m) {
+          stackTotal += (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0;
+        });
+      });
+      if (stackTotal > maxV) maxV = stackTotal;
+    });
+    if (maxV <= 0) maxV = 1;
+
+    function xOf(i) { return padL + (tsList.length > 1 ? (i * (W - padL - padR) / (tsList.length - 1)) : (W - padL - padR) / 2); }
+
+    var svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
+    // 网格与 Y 轴
+    for (var g = 0; g <= 4; g++) {
+      var y = padT + (H - padT - padB) * (g / 4);
+      svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
+    }
+    // 每小时柱：按子 Key 垂直堆叠
+    var barW = Math.max(2, Math.floor((W - padL - padR) / Math.max(1, tsList.length)) - 2);
+    var plotH = H - padT - padB;
+    tsList.forEach(function (t, i) {
+      var x = xOf(i) - barW / 2;
+      var yBase = H - padB;
+      // 按「累计值」换算每段的 y，而不是各段独立取整后相减：
+      // 后者每段最多差 0.5px，多段叠加会累积成可见误差并顶出画布上沿。
+      var acc = 0;
+      subList.forEach(function (sk) {
+        modelList.forEach(function (m) {
+          var v = (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0;
+          if (v <= 0) return;
+          acc += v;
+          var y = (H - padB) - Math.round(plotH * (acc / maxV));
+          // 注意变量名不要用 h —— 会遮蔽全局的 h() DOM 构造函数。
+          var barH = Math.max(1, yBase - y);
+          svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + barH + '" fill="' + mColor[m] + '" opacity="0.9"><title>' + esc(sk) + ' · ' + esc(m) + ': ' + v + '</title></rect>';
+          yBase = y;
+        });
+      });
+    });
+    // X 轴标签（最多 6 个）
+    var step = Math.max(1, Math.floor(tsList.length / 6));
+    for (var k = 0; k < tsList.length; k += step) {
+      var tx = xOf(k);
+      var d = new Date(tsList[k] * 1000);
+      var hh = (d.getHours() < 10 ? "0" : "") + d.getHours();
+      svg += '<text x="' + tx + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + hh + '</text>';
+    }
+    svg += '</svg>';
+
+    // 图例：模型颜色
+    var leg = '<div class="chart-legend">' + modelList.map(function (m) {
+      return '<span class="leg-item"><span class="leg-swatch" style="background:' + mColor[m] + '"></span>' + esc(m) + '</span>';
+    }).join("") + '</div>';
+
+    container.innerHTML = svg + leg;
   }
 
   // ── 账号 ──
@@ -241,14 +342,16 @@
               '<div class="page-sub">把可读性差的 ep-xxx… 接入点映射为易读模型名；下游用它调用，网关调用火山时自动换回 ep-。每个账号的接入点天然不同，因此映射按「账号 × 模型」维护。</div>' +
               '<div class="toolbar"><button class="btn btn-primary" id="add-model">+ 新建模型</button>' +
               '<button class="btn btn-outline" id="add-ep">+ 添加映射</button><div class="spacer"></div></div>' +
-              '<div class="card"><div class="card-head"><div class="card-title">模型目录</div></div>' +
-              '<div class="table-wrap"><table><thead><tr><th>模型名</th><th>显示名</th><th>描述</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+              '<div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链）</div></div>' +
+              '<div class="table-wrap"><table><thead><tr><th>模型名</th><th>显示名</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
               (models.length ? models.map(function (m) {
-                return "<tr><td class='mono'>" + esc(m.name) + "</td><td>" + esc(m.display) + "</td><td>" + esc(m.description) +
-                  "</td><td>" + (m.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">停用</span>') +
+                return "<tr><td class='mono'>" + esc(m.name) + "</td><td>" + esc(m.display) + "</td>" +
+                  "<td class='mono'>" + esc((m.fallback && m.fallback.length ? m.fallback.join(" → ") : "—")) + "</td><td>" + esc(m.description) +
+                  "<td>" + (m.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">停用</span>') +
                   "</td><td><div class='row-actions'>" +
+                  '<button class="btn btn-outline btn-sm" data-edit-model="' + esc(m.name) + '">编辑</button>' +
                   '<button class="btn btn-danger btn-sm" data-del-model="' + esc(m.name) + '">删除</button></div></td></tr>';
-              }).join("") : '<tr><td colspan="5" class="empty">暂无模型</td></tr>') +
+              }).join("") : '<tr><td colspan="6" class="empty">暂无模型</td></tr>') +
               "</tbody></table></div></div>" +
               '<div class="card"><div class="card-head"><div class="card-title">接入点映射（元组级流控）</div></div>' +
               '<div class="table-wrap"><table><thead><tr><th>账号</th><th>模型名</th><th>真实接入点 (ep-)</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
@@ -270,6 +373,7 @@
               '<div class="modal-body">' +
               '<div class="form-item"><label>模型名（下游调用用，唯一）<span class="req">*</span></label><input id="m-name" placeholder="例如 doubao-seed-1-6"/></div>' +
               '<div class="form-item"><label>显示名</label><input id="m-display" placeholder="豆包 Seed 1.6"/></div>' +
+              '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；当本模型在所有账号都不可用时启用）</label><input id="m-fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>' +
               '<div class="form-item"><label>描述</label><input id="m-desc"/></div>' +
               '</div><div class="modal-foot"><button class="btn btn-outline" id="m-cancel">取消</button><button class="btn btn-primary" id="m-save">保存</button></div></div></div>'
             );
@@ -280,7 +384,10 @@
             modal.querySelector("#m-save").onclick = function () {
               var name = modal.querySelector("#m-name").value.trim();
               if (!name) { toast("请输入模型名", false); return; }
-              req("POST", "/api/models", { name: name, display: modal.querySelector("#m-display").value.trim() || name, description: modal.querySelector("#m-desc").value.trim() })
+              var fallback = modal.querySelector("#m-fallback").value.split(",")
+                .map(function (s) { return s.trim(); })
+                .filter(function (s) { return s.length > 0; });
+              req("POST", "/api/models", { name: name, display: modal.querySelector("#m-display").value.trim() || name, description: modal.querySelector("#m-desc").value.trim(), fallback: fallback })
                 .then(function () { toast("已保存"); close(); renderModels(); });
             };
           };
@@ -361,6 +468,39 @@
               });
             };
           });
+	          root.querySelectorAll("[data-edit-model]").forEach(function (b) {
+	            b.onclick = function () {
+	              var name = b.getAttribute("data-edit-model");
+	              req("GET", "/api/models").then(function (models) {
+	                var m = models.find(function (x) { return x.name === name; });
+	                if (!m) return;
+	                var modal = h(
+	                  '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>编辑模型</h3><button class="modal-close">×</button></div>' +
+	                  '<div class="modal-body">' +
+	                  '<div class="form-item"><label>显示名</label><input id="x-display" value="' + esc(m.display) + '"/></div>' +
+	                  '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试）</label><input id="x-fallback" value="' + esc((m.fallback && m.fallback.length ? m.fallback.join(", ") : "")) + '"/></div>' +
+	                  '<div class="form-item"><label>描述</label><input id="x-desc" value="' + esc(m.description || "") + '"/></div>' +
+	                  '<div class="form-item"><label>状态</label><select id="x-enabled"><option value="true"' + (m.enabled ? " selected" : "") + '>启用</option><option value="false"' + (!m.enabled ? " selected" : "") + '>停用</option></select></div>' +
+	                  '</div><div class="modal-foot"><button class="btn btn-outline" id="x-cancel">取消</button><button class="btn btn-primary" id="x-save">保存</button></div></div></div>'
+	                );
+	                document.body.appendChild(modal);
+	                function close() { modal.remove(); }
+	                modal.querySelector(".modal-close").onclick = close;
+	                modal.querySelector("#x-cancel").onclick = close;
+	                modal.querySelector("#x-save").onclick = function () {
+	                  var fallback = modal.querySelector("#x-fallback").value.split(",")
+	                    .map(function (s) { return s.trim(); })
+	                    .filter(function (s) { return s.length > 0; });
+	                  req("PUT", "/api/models/" + name, {
+	                    display: modal.querySelector("#x-display").value.trim() || name,
+	                    description: modal.querySelector("#x-desc").value.trim(),
+	                    fallback: fallback,
+	                    enabled: modal.querySelector("#x-enabled").value === "true",
+	                  }).then(function () { toast("已保存"); close(); renderModels(); });
+	                };
+	              });
+	            };
+	          });
 
           root.querySelectorAll("[data-del-model]").forEach(function (b) {
             b.onclick = function () {
@@ -397,7 +537,7 @@
                 "<td>" + (s.allowed_models && s.allowed_models.length ? s.allowed_models.join(", ") : "全部") + "</td>" +
                 "<td>" + s.total_requests + "</td><td>" + fmtTokens(s.total_tokens) + "</td>" +
                 "<td><div class='row-actions'>" +
-                '<button class="btn btn-outline btn-sm" data-edit="' + esc(s.id) + '" data-now=\'' + JSON.stringify({ enabled: s.enabled, name: s.name }).replace(/'/g, "&#39;") + '\'>编辑</button>' +
+                '<button class="btn btn-outline btn-sm" data-edit="' + esc(s.id) + '">编辑</button>' +
                 '<button class="btn btn-danger btn-sm" data-del="' + esc(s.id) + '">删除</button>' +
                 "</div></td></tr>";
             }).join("") : '<tr><td colspan="7" class="empty">暂无子 Key</td></tr>') +
@@ -499,14 +639,19 @@
             '<div class="toolbar"><button class="btn btn-outline" id="refresh">刷新</button>' +
             '<button class="btn btn-danger" id="clear">清空日志</button><div class="spacer"></div></div>' +
             '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>时间</th><th>子 Key</th><th>账号</th><th>模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>耗时</th><th>状态</th><th>错误</th>' +
+            '<th>时间</th><th>子 Key</th><th>账号</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>耗时</th><th>状态</th><th>错误</th>' +
             '</tr></thead><tbody>' + (logs.length ? logs.map(function (l) {
+              var fellBack = l.requested_model && l.requested_model !== l.model;
+              var modelCell = fellBack
+                ? '<span class="mono">' + esc(l.requested_model) + '</span> <span class="tag tag-orange" title="fallback">↓</span>'
+                : '<span class="mono">' + esc(l.requested_model || l.model) + '</span>';
+              var realCell = '<span class="mono">' + esc(l.model) + '</span>';
               return "<tr><td>" + fmtTime(l.ts) + "</td><td>" + esc(l.subkey_name || l.subkey_id) +
-                "</td><td>" + esc(l.account_name || l.account_id) + "</td><td class='mono'>" + esc(l.model) +
+                "</td><td>" + esc(l.account_name || l.account_id) + "</td><td>" + modelCell + "</td><td>" + realCell +
                 "</td><td>" + l.prompt_tokens + "</td><td>" + l.completion_tokens + "</td><td>" + l.total_tokens +
                 "</td><td>" + l.latency_ms + "ms</td><td>" + (l.status === "ok" ? '<span class="tag tag-green">OK</span>' : '<span class="tag tag-red">ERR</span>') +
                 "</td><td style='max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)' title='" + esc(l.error) + "'>" + esc(l.error) + "</td></tr>";
-            }).join("") : '<tr><td colspan="10" class="empty">暂无日志</td></tr>') +
+            }).join("") : '<tr><td colspan="11" class="empty">暂无日志</td></tr>') +
             "</tbody></table></div></div>" +
           "</div>"
         ));
@@ -542,7 +687,7 @@
             '    "model": "doubao-seed-1-6",\n' +
             '    "messages": [{"role":"user","content":"你好"}],\n' +
             '    "stream": false\n' +
-            '  }\''
+            '  }'
           ) + "</pre></div>" +
           '<div class="card"><div class="card-head"><div class="card-title">环境变量</div></div>' +
           '<div class="kv"><span class="k">ARKGATE_ADDR</span><span class="v mono">监听地址（默认 0.0.0.0:8002）</span></div>' +

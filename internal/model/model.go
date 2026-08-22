@@ -52,12 +52,15 @@ type Account struct {
 }
 
 // Model 易读模型名目录（下游看到的名字，例如 doubao-seed-1-6）。
+// Fallback 是该模型在所有账号都不可用时的有序 fallback 链：
+// 请求该模型 → 若所有 {账号, ep} 元组均不可用 → 按顺序尝试 Fallback 里的模型。
 type Model struct {
-	Name        string `json:"name"`
-	Display     string `json:"display"`
-	Description string `json:"description"`
-	Enabled     bool   `json:"enabled"`
-	CreatedAt   int64  `json:"created_at"`
+	Name        string   `json:"name"`
+	Display     string   `json:"display"`
+	Description string   `json:"description"`
+	Enabled     bool     `json:"enabled"`
+	Fallback    []string `json:"fallback"`
+	CreatedAt   int64    `json:"created_at"`
 }
 
 // Endpoint 是树上的叶节点：账号（父）× 真实接入点 ep-xxx，服务某个易读模型名。
@@ -158,7 +161,9 @@ type UsageLog struct {
 	AccountID        string `json:"account_id"`
 	AccountName      string `json:"account_name"`
 	EndpointID       string `json:"endpoint_id"`
-	Model            string `json:"model"` // 易读名
+	EP               string `json:"ep"`              // 真实调用到火山的 ep-xxx（或 Model ID）
+	RequestedModel   string `json:"requested_model"` // 客户端请求的模型名
+	Model            string `json:"model"`           // 实际路由到的模型名（fallback 后）
 	PromptTokens     int64  `json:"prompt_tokens"`
 	CompletionTokens int64  `json:"completion_tokens"`
 	TotalTokens      int64  `json:"total_tokens"`
