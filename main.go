@@ -24,6 +24,7 @@ import (
 	"arkgate/internal/balancer"
 	"arkgate/internal/config"
 	"arkgate/internal/gateway"
+	"arkgate/internal/portal"
 	"arkgate/internal/secure"
 	"arkgate/internal/store"
 )
@@ -45,11 +46,12 @@ func main() {
 		log.Fatalf("初始化加密失败: %v", err)
 	}
 
-	bal := balancer.New(st)
+	bal := balancer.New(st, cfg.SessionTTL)
 	defer bal.Close()
 
 	gw := gateway.New(cfg, st, box, bal)
 	adm := admin.New(st, box, bal)
+	pt := portal.New(st, bal)
 
 	// 首次运行自动生成管理令牌。
 	if tok, created := adm.EnsureAdminToken(); created {
@@ -61,6 +63,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// 门户挂载在 /api/portal/ 下；admin 的 /api/ 前缀更宽，但 ServeMux 按最长前缀
+	// 匹配，portal 精确接管自己的子树，其余仍归 admin。
+	mux.Handle("/api/portal/", pt.Handler())
 	mux.Handle("/api/", adm.Handler())
 	mux.Handle("/v1/", gw.Handler())
 	mux.Handle("/", spaHandler())
@@ -141,6 +146,9 @@ func spaHandler() http.Handler {
 		if data, err := fs.ReadFile(sub, p); err == nil {
 			ct := contentType(p)
 			w.Header().Set("Content-Type", ct)
+			// 前端内嵌进二进制、随版本整体更新：禁止缓存，避免升级后浏览器
+			// 还拿旧 app.js/style.css 造成「改了没生效」。
+			w.Header().Set("Cache-Control", "no-cache")
 			_, _ = w.Write(data)
 			return
 		}

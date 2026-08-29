@@ -186,6 +186,61 @@ input::placeholder, textarea::placeholder { color: var(--color-text-3); }
 .kv .v { font-variant-numeric: tabular-nums; }
 .code-copy { cursor: pointer; font-family: ui-monospace, Menlo, monospace; }
 
+/* 登录双模式（管理端 / 子 Key 门户） */
+.login-tabs { display: flex; gap: 4px; background: var(--color-fill-1); padding: 4px; border-radius: 8px; margin-bottom: 20px; }
+.login-tabs .lt { flex: 1; text-align: center; padding: 8px 0; border-radius: 6px; cursor: pointer;
+  color: var(--color-text-2); font-size: 13px; user-select: none; }
+.login-tabs .lt.active { background: var(--color-bg-1); color: rgb(var(--primary-6));
+  font-weight: 600; box-shadow: var(--shadow-card); }
+
+/* 进度条（门户限额） */
+.progress { height: 8px; background: var(--color-fill-1); border-radius: 4px; overflow: hidden; }
+.progress .bar { height: 100%; border-radius: 4px; background: rgb(var(--primary-6)); transition: width .3s; }
+.progress .bar.warn { background: rgb(var(--orange-6)); }
+.progress .bar.danger { background: rgb(var(--red-6)); }
+
+/* chips（可用模型） */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { padding: 2px 10px; border-radius: 12px; background: rgba(var(--primary-6), .1);
+  color: rgb(var(--primary-6)); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+
+/* 门户顶栏 */
+.portal-bar { display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 24px; background: var(--color-bg-1); border-bottom: 1px solid var(--color-border-2); }
+.portal-bar .logo { font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+.portal-bar .logo .dot { width: 20px; height: 20px; border-radius: 6px;
+  background: linear-gradient(135deg, rgb(var(--primary-6)), #4080ff); }
+
+/* 复选框组（子 Key 白名单） */
+.cb-group { max-height: 120px; overflow: auto; border: 1px solid var(--color-border-2);
+  border-radius: 6px; padding: 8px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.cb-group label { display: inline-flex; gap: 4px; align-items: center;
+  font-size: 13px; color: var(--color-text-2); }
+.cb-group input[type="checkbox"] { width: auto; }
+
+/* 成本列（等宽数字） */
+.cost { font-variant-numeric: tabular-nums; }
+
+/* 图表图例 */
+.chart-wrap { width: 100%; overflow-x: auto; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+.leg-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--color-text-2); }
+.leg-swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+/* 总览：页头行 + 图表网格 */
+.page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.chart-grid .wide { grid-column: 1 / -1; }
+@media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+
+/* 水平条形（分布图） */
+.hbars { display: flex; flex-direction: column; gap: 10px; }
+.hbar-row { display: grid; grid-template-columns: minmax(80px, 160px) 1fr 64px; align-items: center; gap: 10px; }
+.hbar-label { font-size: 12px; color: var(--color-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar-track { height: 14px; background: var(--color-fill-1); border-radius: 4px; overflow: hidden; }
+.hbar-fill { height: 100%; border-radius: 4px; background: rgb(var(--primary-6)); min-width: 2px; }
+.hbar-val { font-size: 12px; color: var(--color-text-3); text-align: right; font-variant-numeric: tabular-nums; }
+
 @media (max-width: 768px) {
   .sidebar { display: none; }
   .form-row, .form-row.three { grid-template-columns: 1fr; }

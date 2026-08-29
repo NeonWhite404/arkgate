@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"arkgate/internal/model"
 
@@ -38,7 +39,8 @@ func TestStoreBasics(t *testing.T) {
 		t.Fatal("CreatedAt should be defaulted")
 	}
 
-	m := &model.Model{Name: "img", Type: model.ModelTypeImage, Display: "图像", Enabled: true, Fallback: []string{}}
+	m := &model.Model{Name: "img", Type: model.ModelTypeImage, Display: "图像", Enabled: true,
+		Fallback: []string{}, PriceImage: 0.5, PriceInput: 1.5, PriceOutput: 2.5}
 	if err := s.UpsertModel(m); err != nil {
 		t.Fatalf("upsert model: %v", err)
 	}
@@ -48,6 +50,9 @@ func TestStoreBasics(t *testing.T) {
 	}
 	if gm.Type != model.ModelTypeImage {
 		t.Fatalf("model type = %q", gm.Type)
+	}
+	if gm.PriceImage != 0.5 || gm.PriceInput != 1.5 || gm.PriceOutput != 2.5 {
+		t.Fatalf("model prices roundtrip: %+v", gm)
 	}
 
 	ep := &model.Endpoint{ID: "e1", AccountID: "a1", Model: "img", EP: "doubao-seedream-4-0", Enabled: true, Weight: 3}
@@ -77,7 +82,7 @@ func TestStoreBasics(t *testing.T) {
 	if err := s.AddUsageLog(&model.UsageLog{
 		SubKeyID: "s1", AccountID: "a1", Provider: "custom", EndpointID: "e1",
 		RequestedModel: "img", Model: "img", EP: "doubao-seedream-4-0",
-		Modality: model.ModelTypeImage, ImageCount: 2, Status: "ok",
+		Modality: model.ModelTypeImage, ImageCount: 2, Cost: 1.0, Status: "ok",
 	}); err != nil {
 		t.Fatalf("add log: %v", err)
 	}
@@ -88,12 +93,15 @@ func TestStoreBasics(t *testing.T) {
 	if logs[0].Provider != "custom" || logs[0].Modality != model.ModelTypeImage || logs[0].ImageCount != 2 {
 		t.Fatalf("log roundtrip: %+v", logs[0])
 	}
+	if logs[0].Cost != 1.0 {
+		t.Fatalf("log cost = %v", logs[0].Cost)
+	}
 
-	// 日限额累计：两次 +3/+2 → tokens=5, images=2, requests=2。
-	if err := s.AddDailyUsage("s1", 3, 1, 1); err != nil {
+	// 日限额累计：两次 +3/+2 → tokens=5, images=2, requests=2, cost=0.75。
+	if err := s.AddDailyUsage("s1", 3, 1, 1, 0.25); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
-	if err := s.AddDailyUsage("s1", 2, 1, 1); err != nil {
+	if err := s.AddDailyUsage("s1", 2, 1, 1, 0.5); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	du, err := s.GetDailyUsage("s1")
@@ -102,6 +110,9 @@ func TestStoreBasics(t *testing.T) {
 	}
 	if du.Tokens != 5 || du.Images != 2 || du.Requests != 2 {
 		t.Fatalf("daily = %+v", du)
+	}
+	if diff := du.Cost - 0.75; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("daily cost = %v", du.Cost)
 	}
 	if empty, err := s.GetDailyUsage("nope"); err != nil || empty.Tokens != 0 {
 		t.Fatalf("missing subkey daily should be zero: %+v %v", empty, err)
@@ -269,5 +280,83 @@ func TestMigrateFromLegacySchema(t *testing.T) {
 	// 旧库可继续正常写入。
 	if err := s.UpsertModel(&model.Model{Name: "new", Type: model.ModelTypeImage, Enabled: true}); err != nil {
 		t.Fatalf("write after migrate: %v", err)
+	}
+}
+
+// TestSubKeyScopedQueries 锁定门户数据面：按子 Key 的统计与日志聚合，
+// 日志列收窄（不含账号/供应商/接入点），SumCost 全局成本聚合。
+func TestSubKeyScopedQueries(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().Unix()
+	for i, sk := range []string{"s1", "s1", "s2"} {
+		if err := s.AddUsageLog(&model.UsageLog{
+			TS: now - int64(i)*10, SubKeyID: sk, SubKeyName: "name-" + sk,
+			AccountID: "a1", AccountName: "账号甲", Provider: "ark", EndpointID: "e1", EP: "ep-1",
+			RequestedModel: "m", Model: "m", Modality: model.ModelTypeText,
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
+			Cost: 0.25, Status: "ok", LatencyMs: 42,
+		}); err != nil {
+			t.Fatalf("add log: %v", err)
+		}
+	}
+	// 一条失败日志（s1）。
+	if err := s.AddUsageLog(&model.UsageLog{
+		TS: now, SubKeyID: "s1", RequestedModel: "m", Model: "m",
+		Modality: model.ModelTypeText, Status: "error", Error: "boom",
+	}); err != nil {
+		t.Fatalf("add fail log: %v", err)
+	}
+
+	st, err := s.SubKeyLogStats("s1", 0)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.Requests != 3 || st.Success != 2 || st.Tokens != 300 {
+		t.Fatalf("s1 stats: %+v", st)
+	}
+	if diff := st.Cost - 0.5; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("s1 cost = %v", st.Cost)
+	}
+
+	// 时间窗过滤：只统计最近 5 秒内的两条（fail + 最新 ok），旧 ok 与 s2 被排除。
+	st2, err := s.SubKeyLogStats("s1", now-5)
+	if err != nil {
+		t.Fatalf("stats window: %v", err)
+	}
+	if st2.Requests != 2 || st2.Success != 1 || st2.Tokens != 150 {
+		t.Fatalf("s1 windowed stats: %+v", st2)
+	}
+
+	logs, err := s.ListUsageLogsBySubKey("s1", 100)
+	if err != nil || len(logs) != 3 {
+		t.Fatalf("s1 logs = %d (%v)", len(logs), err)
+	}
+	for _, l := range logs {
+		if l.AccountID != "" || l.AccountName != "" || l.Provider != "" || l.EndpointID != "" || l.EP != "" || l.SubKeyID != "" {
+			t.Fatalf("portal log must be sanitized, got %+v", l)
+		}
+		if l.Cost != 0.25 && l.Status != "error" {
+			t.Fatalf("log fields: %+v", l)
+		}
+	}
+	if logs[0].RequestedModel != "m" {
+		t.Fatalf("portal log fields: %+v", logs[0])
+	}
+
+	total, last24h, err := s.SumCost()
+	if err != nil {
+		t.Fatalf("sum cost: %v", err)
+	}
+	if diff := total - 0.75; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("total cost = %v", total)
+	}
+	if last24h <= 0 {
+		t.Fatalf("24h cost = %v", last24h)
 	}
 }

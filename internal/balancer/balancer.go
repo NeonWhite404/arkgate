@@ -66,9 +66,14 @@ type Balancer struct {
 	endpoints map[string]*model.Endpoint   // endpointID -> endpoint（叶节点）
 	modelApps map[string][]*model.Endpoint // 易读名 -> 该模型下全部叶子
 	defs      map[string]provider.Def      // accountID -> 供应商定义（Refresh 时解析缓存）
+	prices    map[string][3]float64        // 易读名 -> [输入,输出,图像] 单价（含停用模型，供成本核算）
 
 	wrrMu    sync.Mutex
 	wrrState map[string]*wrrState
+
+	sessMu    sync.Mutex
+	sessions  map[string]sessEntry // 粘性会话：stickyKey -> 命中叶节点
+	sessionTTL time.Duration
 
 	logCh  chan *model.UsageLog
 	statCh chan statOp
@@ -84,6 +89,12 @@ type wrrState struct {
 	total   int
 }
 
+// sessEntry 粘性会话条目：记住上次命中的叶节点与时间。
+type sessEntry struct {
+	endpointID string
+	ts         time.Time
+}
+
 type statOp struct {
 	accountID  string
 	endpointID string
@@ -92,21 +103,25 @@ type statOp struct {
 	prompt     int64
 	completion int64
 	images     int64
+	cost       float64
 }
 
-// New 构造 Balancer 并启动后台消费者。
-func New(st *store.Store) *Balancer {
+// New 构造 Balancer 并启动后台消费者。sessionTTL 为会话粘性时长（0 = 关闭）。
+func New(st *store.Store, sessionTTL time.Duration) *Balancer {
 	b := &Balancer{
-		accounts:  map[string]*model.Account{},
-		models:    map[string]*model.Model{},
-		endpoints: map[string]*model.Endpoint{},
-		modelApps: map[string][]*model.Endpoint{},
-		defs:      map[string]provider.Def{},
-		wrrState:  map[string]*wrrState{},
-		logCh:     make(chan *model.UsageLog, 4096),
-		statCh:    make(chan statOp, 4096),
-		done:      make(chan struct{}),
-		store:     st,
+		accounts:   map[string]*model.Account{},
+		models:     map[string]*model.Model{},
+		endpoints:  map[string]*model.Endpoint{},
+		modelApps:  map[string][]*model.Endpoint{},
+		defs:       map[string]provider.Def{},
+		prices:     map[string][3]float64{},
+		wrrState:   map[string]*wrrState{},
+		sessions:   map[string]sessEntry{},
+		sessionTTL: sessionTTL,
+		logCh:      make(chan *model.UsageLog, 4096),
+		statCh:     make(chan statOp, 4096),
+		done:       make(chan struct{}),
+		store:      st,
 	}
 	b.Refresh()
 	b.wg.Add(1)
@@ -149,9 +164,9 @@ func (b *Balancer) applyStat(op statOp) {
 	}
 	if op.images > 0 {
 		_ = b.store.AccumulateImages(op.accountID, op.endpointID, op.subkeyID, op.images)
-		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, op.images, 1)
+		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, op.images, 1, op.cost)
 	} else {
-		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, 0, 1)
+		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, 0, 1, op.cost)
 	}
 	// 落库的同时同步内存副本：Snapshot* 读的是 b.accounts / b.endpoints，
 	// 若只写 DB，管理 UI 会一直显示上次 Refresh 时的陈旧统计。
@@ -216,12 +231,15 @@ func (b *Balancer) Refresh() {
 	epMap := map[string]*model.Endpoint{}
 	modelApps := map[string][]*model.Endpoint{}
 	defMap := map[string]provider.Def{}
+	priceMap := map[string][3]float64{}
 
 	for _, a := range accounts {
 		accMap[a.ID] = a
 		defMap[a.ID] = resolveDef(a)
 	}
 	for _, m := range modelsList {
+		// 价格索引包含停用模型：日志里的历史用量仍要按当时定价折算。
+		priceMap[m.Name] = [3]float64{m.PriceInput, m.PriceOutput, m.PriceImage}
 		if m.Enabled {
 			modMap[m.Name] = m
 		}
@@ -251,7 +269,19 @@ func (b *Balancer) Refresh() {
 	b.endpoints = epMap
 	b.modelApps = modelApps
 	b.defs = defMap
+	b.prices = priceMap
 	b.mu.Unlock()
+
+	// 清理指向已不存在叶子的粘性会话（TTL 过期在读侧惰性淘汰）。
+	if b.sessionTTL > 0 {
+		b.sessMu.Lock()
+		for k, s := range b.sessions {
+			if _, ok := epMap[s.endpointID]; !ok {
+				delete(b.sessions, k)
+			}
+		}
+		b.sessMu.Unlock()
+	}
 }
 
 // resolveDef 解析账号的供应商定义；未注册的 id 回落为「仅 chat」兜底，
@@ -310,8 +340,10 @@ func (b *Balancer) accountSupports(accountID string, api API) bool {
 
 // Select 按「平滑加权轮询 + 熔断 + 限流 + 能力过滤」选出一个可用叶节点。
 //
-// modelName 为下游请求里的易读模型名。
-func (b *Balancer) Select(modelName string, allowed []string, exclude map[string]bool, api API) (ep *model.Endpoint, err error) {
+// modelName 为下游请求里的易读模型名；stickyKey 为粘性会话标识（一般为子 Key ID，
+// 空 = 不启用粘性）。粘性命中时直接复用上次的叶节点（仍要求其在可用候选中），
+// 且不扰动 WRR 计数；未命中时正常 WRR 选举并记住结果。
+func (b *Balancer) Select(modelName string, allowed []string, exclude map[string]bool, api API, stickyKey string) (ep *model.Endpoint, err error) {
 	cands, poolKey := b.usableEndpoints(modelName, allowed, exclude, api)
 	if len(cands) == 0 {
 		if b.hasAnyEndpoint(modelName, allowed, api) {
@@ -324,6 +356,16 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 			return nil, ErrNoAccount
 		}
 		return nil, ErrNoEndpoint
+	}
+
+	// 会话粘性：同 Key + 模型的后续请求在 TTL 内固定到同一叶子，提升上游
+	// prompt cache 命中率。粘性命中同样要做并发/RPM 占位。
+	if stickyKey != "" && b.sessionTTL > 0 {
+		if pinned := b.sessionPick(stickyKey+"|"+modelName, cands); pinned != nil {
+			atomic.AddInt32(&pinned.Runtime.Concurrency, 1)
+			pinned.Runtime.RPM.Add(1)
+			return pinned, nil
+		}
 	}
 
 	state := b.getWrrState(poolKey, cands)
@@ -346,10 +388,43 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 	}
 	state.current[picked.ID] -= state.total
 
+	// 仅在「全新请求」的首次选举上记录粘性会话；重试路径 stickyKey 为空，
+	// 不会把失败叶子的接替者错误地钉成新会话。
+	if stickyKey != "" && b.sessionTTL > 0 {
+		b.sessionPut(stickyKey+"|"+modelName, picked.ID)
+	}
+
 	atomic.AddInt32(&picked.Runtime.Concurrency, 1)
 	picked.Runtime.RPM.Add(1)
 
 	return picked, nil
+}
+
+// sessionPick 查询粘性会话：TTL 内且目标叶在候选集中才命中（读时惰性淘汰过期项）。
+func (b *Balancer) sessionPick(key string, cands []*model.Endpoint) *model.Endpoint {
+	b.sessMu.Lock()
+	s, ok := b.sessions[key]
+	if ok && time.Since(s.ts) > b.sessionTTL {
+		delete(b.sessions, key)
+		ok = false
+	}
+	b.sessMu.Unlock()
+	if !ok {
+		return nil
+	}
+	for _, e := range cands {
+		if e.ID == s.endpointID {
+			return e
+		}
+	}
+	return nil
+}
+
+// sessionPut 记录粘性会话。
+func (b *Balancer) sessionPut(key, endpointID string) {
+	b.sessMu.Lock()
+	b.sessions[key] = sessEntry{endpointID: endpointID, ts: time.Now()}
+	b.sessMu.Unlock()
 }
 
 // FallbackChain 解析某易读模型名的有序 fallback 链。
@@ -406,7 +481,7 @@ func (b *Balancer) FallbackChain(modelName string) []string {
 //
 // 链上全部失败时，返回信息量最大的错误（如「全被限流/熔断」优先于「没有映射」），
 // 而不是链上最后一个模型的失败原因。
-func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowedModels []string, exclude map[string]bool, api API) (*model.Endpoint, string, error) {
+func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowedModels []string, exclude map[string]bool, api API, stickyKey string) (*model.Endpoint, string, error) {
 	allowModel := setOf(allowedModels)
 	chain := b.FallbackChain(modelName)
 	var bestErr error
@@ -414,7 +489,7 @@ func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowed
 		if len(allowModel) > 0 && !allowModel[name] {
 			continue // 子 Key 未授权的 fallback 目标，跳过
 		}
-		ep, err := b.Select(name, allowedAccounts, exclude, api)
+		ep, err := b.Select(name, allowedAccounts, exclude, api, stickyKey)
 		if err == nil {
 			return ep, name, nil
 		}
@@ -612,6 +687,7 @@ func (b *Balancer) TPMAdd(e *model.Endpoint, units int64) {
 
 // Record 上报一次请求结果：驱动叶节点熔断 + 账号/叶/子Key 统计 + 写日志。
 // 图像张数从 l.ImageCount 读取（0 表示文本请求）。
+// 成本按实际命中的模型名（l.Model，fallback 后）折算并写回 l.Cost。
 // 走阻塞投递（背压），保证统计不丢，避免 SubKey 日限额被绕过。
 func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
 	if ep != nil && ep.Runtime != nil {
@@ -635,6 +711,9 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
 		completion: l.CompletionTokens,
 		images:     l.ImageCount,
 	}
+	// 成本核算：即使请求失败（tokens 全 0）结果也是 0，无需分支。
+	op.cost = b.computeCost(l.Model, l.PromptTokens, l.CompletionTokens, l.ImageCount)
+	l.Cost = op.cost
 	// 阻塞投递，保证不丢。
 	if b.statCh != nil {
 		b.statCh <- op
@@ -642,6 +721,18 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
 	if b.logCh != nil {
 		b.logCh <- l
 	}
+}
+
+// computeCost 按模型定价折算一次请求的成本：
+// 输入/输出单价为 $ / 1M tokens，图像单价为 $ / 张；未定价模型返回 0。
+func (b *Balancer) computeCost(modelName string, pt, ct, images int64) float64 {
+	b.mu.RLock()
+	p, ok := b.prices[modelName]
+	b.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return float64(pt)/1e6*p[0] + float64(ct)/1e6*p[1] + float64(images)*p[2]
 }
 
 func nowPlusCooldown(fails int32) int64 {
@@ -721,20 +812,16 @@ func (b *Balancer) SnapshotModelNames() []string {
 	return out
 }
 
-// EndpointUsable 判断叶节点是否可用（未熔断、未禁用、账号可用）。
-func (b *Balancer) EndpointUsable(e *model.Endpoint) bool {
-	if e == nil || !e.Enabled {
-		return false
-	}
+// CircuitOpen 按 ID 判断叶节点是否熔断中。SnapshotEndpoints 返回的副本已清空
+// Runtime，不能直接喂给「按对象判可用」一类的函数（会把所有启用端点误判为熔断）。
+func (b *Balancer) CircuitOpen(id string) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if acc, ok := b.accounts[e.AccountID]; !ok || acc.Status != model.AccountActive {
+	e := b.endpoints[id]
+	if e == nil || e.Runtime == nil {
 		return false
 	}
-	if e.Runtime == nil {
-		return false
-	}
-	return atomic.LoadInt64(&e.Runtime.CircuitOpenUntil) <= time.Now().UnixNano()
+	return atomic.LoadInt64(&e.Runtime.CircuitOpenUntil) > time.Now().UnixNano()
 }
 
 // AccountActive 判断账号是否启用。

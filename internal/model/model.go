@@ -72,6 +72,8 @@ type Account struct {
 // Type 区分文本/图像：图像模型只能被 /v1/images/generations 调用，反之亦然。
 // Fallback 是该模型在所有账号都不可用时的有序 fallback 链（仅限同 Type）：
 // 请求该模型 → 若所有 {账号, 模型标识} 元组均不可用 → 按顺序尝试 Fallback 里的模型。
+// 价格字段用于成本核算：文本模型填 input/output（每百万 token 单价），
+// 图像模型填 image（每张单价）；0 表示未定价（成本计 0）。
 type Model struct {
 	Name        string   `json:"name"`
 	Type        string   `json:"type"` // text | image（默认 text）
@@ -80,6 +82,10 @@ type Model struct {
 	Enabled     bool     `json:"enabled"`
 	Fallback    []string `json:"fallback"`
 	CreatedAt   int64    `json:"created_at"`
+
+	PriceInput  float64 `json:"price_input"`  // 输入 token 单价：$ / 1M tokens
+	PriceOutput float64 `json:"price_output"` // 输出 token 单价：$ / 1M tokens
+	PriceImage  float64 `json:"price_image"`  // 图像单价：$ / 张
 }
 
 // Endpoint 是树上的叶节点：账号（父）× 上游模型标识 EP，服务某个易读模型名。
@@ -191,6 +197,7 @@ type UsageLog struct {
 	CompletionTokens int64  `json:"completion_tokens"`
 	TotalTokens      int64  `json:"total_tokens"`
 	ImageCount       int64  `json:"image_count"`
+	Cost             float64 `json:"cost"` // 本次请求成本（按模型定价折算；未定价为 0）
 	Status           string `json:"status"` // ok | error
 	LatencyMs        int64  `json:"latency_ms"`
 	Error            string `json:"error"`

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"testing"
+	"time"
 
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
@@ -15,7 +16,9 @@ func newTestBalancer() *Balancer {
 		endpoints: map[string]*model.Endpoint{},
 		modelApps: map[string][]*model.Endpoint{},
 		defs:      map[string]provider.Def{},
+		prices:    map[string][3]float64{},
 		wrrState:  map[string]*wrrState{},
+		sessions:  map[string]sessEntry{},
 	}
 }
 
@@ -56,7 +59,7 @@ func TestSelectWeightedRoundRobin(t *testing.T) {
 
 	counts := map[string]int{}
 	for i := 0; i < 4; i++ {
-		e, err := b.Select("m", nil, nil, APIChat)
+		e, err := b.Select("m", nil, nil, APIChat, "")
 		if err != nil {
 			t.Fatalf("select: %v", err)
 		}
@@ -71,11 +74,11 @@ func TestSelectWeightedRoundRobin(t *testing.T) {
 func TestSelectNoEndpoint(t *testing.T) {
 	b := newTestBalancer()
 	b.seed([]*model.Account{mkAcc("a1", 1)}, nil, []*model.Model{{Name: "known", Enabled: true}})
-	_, err := b.Select("unknown-model", nil, nil, APIChat)
+	_, err := b.Select("unknown-model", nil, nil, APIChat, "")
 	if err != ErrNoEndpoint {
 		t.Fatalf("want ErrNoEndpoint for unknown model with no mappings, got %v", err)
 	}
-	_, err = b.Select("known", nil, nil, APIChat)
+	_, err = b.Select("known", nil, nil, APIChat, "")
 	if err != ErrNoAccount {
 		t.Fatalf("want ErrNoAccount for known model with no endpoints, got %v", err)
 	}
@@ -91,7 +94,7 @@ func TestSelectRespectAllThrottled(t *testing.T) {
 	b.endpoints["e1"].Runtime.CircuitOpenUntil = 1 << 62
 	b.mu.Unlock()
 
-	_, err := b.Select("m", nil, nil, APIChat)
+	_, err := b.Select("m", nil, nil, APIChat, "")
 	if err != ErrAllThrottled {
 		t.Fatalf("want ErrAllThrottled, got %v", err)
 	}
@@ -132,7 +135,7 @@ func TestTupleThrottlingExcludesSingleEndpoint(t *testing.T) {
 	b.mu.Unlock()
 
 	for i := 0; i < 4; i++ {
-		e, err := b.Select("m", nil, nil, APIChat)
+		e, err := b.Select("m", nil, nil, APIChat, "")
 		if err != nil {
 			t.Fatalf("select should still succeed via e2: %v", err)
 		}
@@ -157,12 +160,12 @@ func TestCapabilityFiltering(t *testing.T) {
 	}, []*model.Model{{Name: "m", Enabled: true}})
 
 	// chat：两个账号都可用。
-	if e, err := b.Select("m", nil, nil, APIChat); err != nil || e == nil {
+	if e, err := b.Select("m", nil, nil, APIChat, ""); err != nil || e == nil {
 		t.Fatalf("chat should select, got %v/%v", e, err)
 	}
 	// responses/images：只有 ark 账号可用。
 	for _, api := range []API{APIResponses, APIImages} {
-		e, err := b.Select("m", nil, nil, api)
+		e, err := b.Select("m", nil, nil, api, "")
 		if err != nil || e.AccountID != "a2" {
 			t.Fatalf("api %d: want ark leaf, got %v/%v", api, e, err)
 		}
@@ -176,14 +179,14 @@ func TestCapabilityFiltering(t *testing.T) {
 	b.mu.Unlock()
 
 	// images：a1/a2 都有能力 → 排除 a2 的叶子后应命中 a1（覆盖生效）。
-	e, err := b.Select("m", nil, map[string]bool{"e2": true}, APIImages)
+	e, err := b.Select("m", nil, map[string]bool{"e2": true}, APIImages, "")
 	if err != nil || e.AccountID != "a1" {
 		t.Fatalf("custom with CapImages=1 should serve images, got %v/%v", e, err)
 	}
 	b.Release(e)
 
 	// responses：ark 被强制关闭、custom 原生不支持 → 无可用账号。
-	if _, err := b.Select("m", nil, nil, APIResponses); err != ErrNoCapable {
+	if _, err := b.Select("m", nil, nil, APIResponses, ""); err != ErrNoCapable {
 		t.Fatalf("ark with CapResponses=-1 should yield ErrNoCapable, got %v", err)
 	}
 }
@@ -199,7 +202,7 @@ func TestNoCapableVsAllThrottled(t *testing.T) {
 	}, []*model.Model{{Name: "m", Enabled: true}})
 
 	// 能力不符 → ErrNoCapable（不是 ErrAllThrottled）。
-	if _, err := b.Select("m", nil, nil, APIImages); err != ErrNoCapable {
+	if _, err := b.Select("m", nil, nil, APIImages, ""); err != ErrNoCapable {
 		t.Fatalf("want ErrNoCapable, got %v", err)
 	}
 
@@ -208,7 +211,7 @@ func TestNoCapableVsAllThrottled(t *testing.T) {
 	b.accounts["a1"].CapImages = 1
 	b.endpoints["e1"].Runtime.CircuitOpenUntil = 1 << 62
 	b.mu.Unlock()
-	if _, err := b.Select("m", nil, nil, APIImages); err != ErrAllThrottled {
+	if _, err := b.Select("m", nil, nil, APIImages, ""); err != ErrAllThrottled {
 		t.Fatalf("want ErrAllThrottled, got %v", err)
 	}
 }
@@ -223,7 +226,7 @@ func TestTPMLimitThrottles(t *testing.T) {
 
 	// 喂 101 单位后，TPM 窗口超限，Select 应返回 ErrAllThrottled。
 	b.TPMAdd(e, 101)
-	_, err := b.Select("m", nil, nil, APIChat)
+	_, err := b.Select("m", nil, nil, APIChat, "")
 	if err != ErrAllThrottled {
 		t.Fatalf("want ErrAllThrottled for TPM exhausted, got %v", err)
 	}
@@ -330,7 +333,7 @@ func TestSelectWithFallback(t *testing.T) {
 	b.endpoints["e1"].Runtime.CircuitOpenUntil = 1 << 62 // 熔断 m 的唯一元组
 	b.mu.Unlock()
 
-	ep, actual, err := b.SelectWithFallback("m", nil, nil, nil, APIChat)
+	ep, actual, err := b.SelectWithFallback("m", nil, nil, nil, APIChat, "")
 	if err != nil {
 		t.Fatalf("select with fallback: %v", err)
 	}
@@ -352,7 +355,7 @@ func TestSelectWithFallbackNoCapable(t *testing.T) {
 		{Name: "m", Type: model.ModelTypeImage, Enabled: true, Fallback: []string{"m2"}},
 		{Name: "m2", Type: model.ModelTypeImage, Enabled: true},
 	})
-	_, _, err := b.SelectWithFallback("m", nil, nil, nil, APIImages)
+	_, _, err := b.SelectWithFallback("m", nil, nil, nil, APIImages, "")
 	if err != ErrNoCapable {
 		t.Fatalf("want ErrNoCapable, got %v", err)
 	}
@@ -403,4 +406,84 @@ func TestAccumulateInMemoryUpdatesSnapshot(t *testing.T) {
 func TestAccumulateInMemoryUnknownIDs(t *testing.T) {
 	b := newTestBalancer()
 	b.accumulateInMemory(statOp{accountID: "nope", endpointID: "nope", ok: true, prompt: 1})
+}
+
+// TestSessionSticky 锁定会话粘性语义：同一 stickyKey + 模型在 TTL 内固定到
+// 同一叶子；粘性目标不可用时退回正常选举；TTL=0 时不粘。
+func TestSessionSticky(t *testing.T) {
+	b := newTestBalancer()
+	b.sessionTTL = time.Minute
+	b.seed([]*model.Account{mkAcc("a1", 1), mkAcc("a2", 1)}, []*model.Endpoint{
+		mkEP("e1", "a1", "m", "ep-1", 1),
+		mkEP("e2", "a2", "m", "ep-2", 1),
+	}, []*model.Model{{Name: "m", Enabled: true}})
+
+	e1, err := b.Select("m", nil, nil, APIChat, "sk-1")
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	b.Release(e1)
+	for i := 0; i < 3; i++ {
+		e, err := b.Select("m", nil, nil, APIChat, "sk-1")
+		if err != nil {
+			t.Fatalf("sticky select: %v", err)
+		}
+		if e.ID != e1.ID {
+			t.Fatalf("sticky session must pin leaf %s, got %s", e1.ID, e.ID)
+		}
+		b.Release(e)
+	}
+
+	// 粘性目标熔断后应退回候选集里的另一片叶子。
+	b.mu.Lock()
+	b.endpoints[e1.ID].Runtime.CircuitOpenUntil = 1 << 62
+	b.mu.Unlock()
+	e2, err := b.Select("m", nil, nil, APIChat, "sk-1")
+	if err != nil {
+		t.Fatalf("fallback select: %v", err)
+	}
+	if e2.ID == e1.ID {
+		t.Fatal("pinned leaf is circuit-open, must pick another")
+	}
+	b.Release(e2)
+
+	// TTL=0（关闭）时不粘：两次选举允许落在不同叶子（不强制，但会话表不写入）。
+	b2 := newTestBalancer()
+	b2.sessionTTL = 0
+	b2.seed([]*model.Account{mkAcc("a1", 1), mkAcc("a2", 1)}, []*model.Endpoint{
+		mkEP("e1", "a1", "m", "ep-1", 1),
+		mkEP("e2", "a2", "m", "ep-2", 1),
+	}, []*model.Model{{Name: "m", Enabled: true}})
+	if _, err := b2.Select("m", nil, nil, APIChat, "sk-1"); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if len(b2.sessions) != 0 {
+		t.Fatalf("sessionTTL=0 must not record sessions, got %d", len(b2.sessions))
+	}
+}
+
+// TestComputeCost 锁定成本核算公式：输入/输出 $/1M tokens、图像 $/张；
+// 未定价模型为 0；Record 会把成本写回日志。
+func TestComputeCost(t *testing.T) {
+	b := newTestBalancer()
+	b.prices["m"] = [3]float64{2, 8, 0.5} // 输入 $2/M、输出 $8/M、图像 $0.5/张
+
+	got := b.computeCost("m", 1_000_000, 500_000, 2)
+	if diff := got - (2 + 4 + 1); diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("want cost 7, got %v", got)
+	}
+	if got := b.computeCost("unknown-model", 1_000_000, 0, 0); got != 0 {
+		t.Fatalf("unpriced model must cost 0, got %v", got)
+	}
+
+	// Record 应把成本写回日志（statOp 同步携带）。
+	b.statCh = make(chan statOp, 8)
+	b.logCh = make(chan *model.UsageLog, 8)
+	l := &model.UsageLog{Model: "m", PromptTokens: 2_000_000}
+	b.Record(l, nil, true)
+	if l.Cost != 4 {
+		t.Fatalf("Record must stamp cost on log, got %v", l.Cost)
+	}
+	<-b.statCh
+	<-b.logCh
 }

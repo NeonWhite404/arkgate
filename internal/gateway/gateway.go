@@ -10,6 +10,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -250,9 +251,9 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		// 流式：一旦开始写首字节就无法重试，因此采用「预隔离」策略——
-		// 先绑定 leaf 与真实 Key，若后续失败只写终止帧，不再做跨叶子的第二次尝试。
-		g.streamOnce(w, r, sk, body, modelName, balancer.APIChat)
+		// 流式：首字节之前未向客户端写过数据，失败可换叶子重试；
+		// 首字节到手后才提交 SSE 响应头，之后单次尝试到流结束。
+		g.streamForward(w, r, sk, body, modelName, balancer.APIChat)
 		return
 	}
 	g.chatNonStream(w, r, sk, body, modelName)
@@ -265,9 +266,18 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 	exclude := map[string]bool{}
 
 	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIChat)
+		// 粘性会话只在全新请求的首次选举上生效；重试路径为空，避免钉错。
+		sticky := ""
+		if attempt == 0 {
+			sticky = sk.ID
+		}
+		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIChat, sticky)
 		if err != nil {
-			lastErr = err
+			// 已有具体尝试失败（上游错误/超时）时保留它：排除集导致的全忙错误
+			// 只是重试的副产品，不如真实失败原因有信息量。
+			if lastErr == nil {
+				lastErr = err
+			}
 			break
 		}
 		ri, derr := g.resolveRoute(leaf)
@@ -332,7 +342,7 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		g.streamOnce(w, r, sk, body, modelName, balancer.APIResponses)
+		g.streamForward(w, r, sk, body, modelName, balancer.APIResponses)
 		return
 	}
 	g.responsesNonStream(w, r, sk, body, modelName)
@@ -345,9 +355,15 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 	exclude := map[string]bool{}
 
 	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIResponses)
+		sticky := ""
+		if attempt == 0 {
+			sticky = sk.ID
+		}
+		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIResponses, sticky)
 		if err != nil {
-			lastErr = err
+			if lastErr == nil {
+				lastErr = err
+			}
 			break
 		}
 		ri, derr := g.resolveRoute(leaf)
@@ -420,7 +436,7 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		g.streamOnce(w, r, sk, body, modelName, balancer.APIImages)
+		g.streamForward(w, r, sk, body, modelName, balancer.APIImages)
 		return
 	}
 	g.imagesNonStream(w, r, sk, body, modelName)
@@ -433,9 +449,15 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 	exclude := map[string]bool{}
 
 	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIImages)
+		sticky := ""
+		if attempt == 0 {
+			sticky = sk.ID
+		}
+		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIImages, sticky)
 		if err != nil {
-			lastErr = err
+			if lastErr == nil {
+				lastErr = err
+			}
 			break
 		}
 		ri, derr := g.resolveRoute(leaf)
@@ -472,62 +494,108 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 	g.writeUpstreamError(w, lastErr)
 }
 
-// ─────────────────────────── 流式（单次尝试，三类接口共用） ───────────────────────────
+// ─────────────────────────── 流式（三类接口共用） ───────────────────────────
 
-// streamOnce 流式转发：单次尝试。绑定 leaf 后转发；上游失败时如果尚未写头，
-// 才回错误；已写头则以 SSE error 帧收尾。具体子路径由各 Transport 方法内部决定。
-func (g *Gateway) streamOnce(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
+// streamForward 流式转发：首字节之前可跨叶子重试。
+//
+// 每一轮先选叶、解析路由，再经 provider 打开上游流并等待首 token：
+//   - 打开失败（建连失败 / 非 2xx / 首 token 超时）时未向客户端写过任何字节，
+//     记一次失败统计后排除当前叶子，换下一个继续；
+//   - 首字节到手才提交 SSE 响应头并开始 Pump，此后无法重试，流中错误用
+//     SSE error 帧收尾；
+//   - 所有叶子都失败时，以普通 HTTP 错误透传（此时响应头尚未提交）。
+func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
 	modelName string, api balancer.API) {
 
 	start := time.Now()
-	leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, nil, api)
-	if err != nil {
-		g.writeUpstreamError(w, err)
-		return
-	}
-	ri, derr := g.resolveRoute(leaf)
-	if derr != nil {
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, modalityOf(api), 0, 0, 0, derr, start)
-		g.writeUpstreamError(w, derr)
-		return
-	}
+	modality := modalityOf(api)
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
 	fl, ok := w.(http.Flusher)
 	if !ok {
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, modalityOf(api), 0, 0, 0, errors.New("无法建立流式响应"), start)
 		writeJSON(w, http.StatusInternalServerError, errBody("server_error", "无法建立流式响应"))
 		return
 	}
 
-	var (
-		pt, ct, images int64
-		ferr           error
-	)
+	exclude := map[string]bool{}
+	var lastErr error
+	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+		sticky := ""
+		if attempt == 0 {
+			sticky = sk.ID
+		}
+		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, api, sticky)
+		if err != nil {
+			// 同非流式：保留已有的具体失败原因（如首 token 超时），避免被
+			// 排除集导致的全忙错误掩盖。
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
+		ri, derr := g.resolveRoute(leaf)
+		if derr != nil {
+			g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, 0, 0, 0, derr, start)
+			exclude[leaf.ID] = true
+			lastErr = derr
+			continue
+		}
+
+		// 打开上游流：成功 = 已收到首字节；失败时未写过任何客户端字节，可重试。
+		st, oerr := g.openStream(r.Context(), ri.rt, body, leaf.EP, api)
+		if oerr != nil {
+			g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, 0, 0, 0, oerr, start)
+			exclude[leaf.ID] = true
+			lastErr = oerr
+			continue
+		}
+
+		// 首字节到手：提交 SSE 响应头，此后不再跨叶子重试。
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // 防反代缓冲 SSE
+
+		var pt, ct, images int64
+		perr := func() error {
+			switch api {
+			case balancer.APIImages:
+				a, b, e := st.Pump(w)
+				pt, ct = a, b
+				if e == nil {
+					images = provider.ExtractN(body) // 张数按请求 n 计量；失败不计费
+				}
+				return e
+			default:
+				a, b, e := st.Pump(w)
+				pt, ct = a, b
+				return e
+			}
+		}()
+		st.Close()
+		fl.Flush()
+		if perr != nil {
+			// 流已开始，无法更改状态码；用 SSE error 帧收尾。
+			writeSSEError(w, perr)
+		}
+		g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, pt, ct, images, perr, start)
+		return
+	}
+
+	// 所有叶子都失败：响应头未提交，可写正常 HTTP 错误。
+	g.writeUpstreamError(w, lastErr)
+}
+
+// openStream 按目标 API 打开对应的上游流（首 token 超时取自配置，0 = 不限时）。
+func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte, ep string, api balancer.API) (*provider.Stream, error) {
+	timeout := g.cfg.FirstTokenTimeout
 	switch api {
 	case balancer.APIResponses:
-		u, e := g.mgr.ResponsesStream(r.Context(), ri.rt, body, leaf.EP, w)
-		if u != nil {
-			pt, ct = u.PromptTokens, u.CompletionTokens
-		}
-		ferr = e
+		return g.mgr.OpenResponsesStream(ctx, rt, body, ep, timeout)
 	case balancer.APIImages:
-		images, ferr = g.mgr.ImagesStream(r.Context(), ri.rt, body, leaf.EP, w)
-	default: // chat
-		u, e := g.mgr.ChatStream(r.Context(), ri.rt, body, leaf.EP, w)
-		if u != nil {
-			pt, ct = u.PromptTokens, u.CompletionTokens
-		}
-		ferr = e
+		return g.mgr.OpenImagesStream(ctx, rt, body, ep, timeout)
+	default:
+		return g.mgr.OpenChatStream(ctx, rt, body, ep, timeout)
 	}
-	fl.Flush()
-	if ferr != nil {
-		// 流已开始，无法更改状态码；用 SSE error 帧收尾。
-		writeSSEError(w, ferr)
-	}
-	g.recordAttempt(sk, leaf, ri, modelName, actualModel, modalityOf(api), pt, ct, images, ferr, start)
 }
 
 func modalityOf(api balancer.API) string {

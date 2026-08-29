@@ -54,7 +54,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
-const schemaVersion = "2"
+const schemaVersion = "3"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -195,6 +195,12 @@ func (s *Store) migrate() error {
 		`ALTER TABLE usage_logs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_logs ADD COLUMN modality TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_logs ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0`,
+		// —— v3：模型定价 + 成本核算 ——
+		`ALTER TABLE models ADD COLUMN price_input REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE models ADD COLUMN price_output REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE models ADD COLUMN price_image REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN cost REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_daily ADD COLUMN cost REAL NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -329,14 +335,14 @@ func scanModel(rows *sql.Rows) (*model.Model, error) {
 	m := &model.Model{}
 	var fb string
 	if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
-		&m.Type); err != nil {
+		&m.Type, &m.PriceInput, &m.PriceOutput, &m.PriceImage); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(fb), &m.Fallback)
 	return m, nil
 }
 
-const modelCols = `name,display,description,enabled,fallback,created_at,type`
+const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image`
 
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
@@ -365,7 +371,8 @@ func (s *Store) GetModel(name string) (*model.Model, error) {
 	var fb string
 	err := s.db.QueryRow(
 		`SELECT `+modelCols+` FROM models WHERE name=?`, name,
-	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt, &m.Type)
+	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt, &m.Type,
+		&m.PriceInput, &m.PriceOutput, &m.PriceImage)
 	if err != nil {
 		return nil, err
 	}
@@ -380,11 +387,14 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
-	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type)
-		VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,
+			price_input,price_output,price_image)
+		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
 		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
-		type=excluded.type`,
-		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type)
+		type=excluded.type, price_input=excluded.price_input, price_output=excluded.price_output,
+		price_image=excluded.price_image`,
+		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type,
+		m.PriceInput, m.PriceOutput, m.PriceImage)
 	return err
 }
 
@@ -628,24 +638,24 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
 		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
-		 prompt_tokens,completion_tokens,total_tokens,image_count,status,latency_ms,error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
 		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
-		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Status, l.LatencyMs, l.Error)
+		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs, l.Error)
 	return err
 }
 
 const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
 	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
-	status,latency_ms,error`
+	cost,status,latency_ms,error`
 
 func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
 	if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
 		&l.Provider, &l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.Modality,
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
-		&l.Status, &l.LatencyMs, &l.Error); err != nil {
+		&l.Cost, &l.Status, &l.LatencyMs, &l.Error); err != nil {
 		return nil, err
 	}
 	return l, nil
@@ -681,14 +691,25 @@ func (s *Store) ClearUsageLogs() error {
 	return err
 }
 
+// SumCost 返回全部请求成本与最近 24h 成本（管理总览用）。
+func (s *Store) SumCost() (total, last24h float64, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	err = s.db.QueryRow(`SELECT COALESCE(SUM(cost),0),
+		COALESCE(SUM(CASE WHEN ts >= ? THEN cost ELSE 0 END),0) FROM usage_logs`,
+		nowUnix()-86400).Scan(&total, &last24h)
+	return
+}
+
 // UsageSeriesPoint 是子 Key × 模型 的时间序列点（按小时聚合）。
 type UsageSeriesPoint struct {
-	TS       int64  `json:"ts"`
-	SubKeyID string `json:"subkey_id"`
-	SubKey   string `json:"subkey"`
-	Model    string `json:"model"`
-	Tokens   int64  `json:"tokens"`
-	Requests int64  `json:"requests"`
+	TS       int64   `json:"ts"`
+	SubKeyID string  `json:"subkey_id"`
+	SubKey   string  `json:"subkey"`
+	Model    string  `json:"model"`
+	Tokens   int64   `json:"tokens"`
+	Requests int64   `json:"requests"`
+	Cost     float64 `json:"cost"`
 }
 
 // usageSeriesMaxRows 限制单次序列查询返回的点数，避免长时间窗 × 多子 Key ×
@@ -709,7 +730,7 @@ func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
 	// 值，子 Key 改过名时标签会随机取到新旧名之一。
 	rows, err := s.db.Query(`SELECT (ts/3600)*3600 as bucket,
 		subkey_id, subkey_name, model,
-		SUM(total_tokens), COUNT(*)
+		SUM(total_tokens), COUNT(*), SUM(cost)
 		FROM usage_logs
 		WHERE ts >= ?
 		GROUP BY bucket, subkey_id, subkey_name, model
@@ -722,7 +743,7 @@ func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
 	out := []*UsageSeriesPoint{}
 	for rows.Next() {
 		p := &UsageSeriesPoint{}
-		if err := rows.Scan(&p.TS, &p.SubKeyID, &p.SubKey, &p.Model, &p.Tokens, &p.Requests); err != nil {
+		if err := rows.Scan(&p.TS, &p.SubKeyID, &p.SubKey, &p.Model, &p.Tokens, &p.Requests, &p.Cost); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -734,27 +755,28 @@ func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
 
 // DailyUsage 某子 Key 在自然日内的用量。
 type DailyUsage struct {
-	Tokens   int64 `json:"tokens"`
-	Images   int64 `json:"images"`
-	Requests int64 `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	Images   int64   `json:"images"`
+	Requests int64   `json:"requests"`
+	Cost     float64 `json:"cost"`
 }
 
 // today 返回本地时区的自然日（与「当日」直觉一致）。
 func today() string { return time.Now().Format("2006-01-02") }
 
 // AddDailyUsage 异步 consumer 落库时同步累计当日用量行。
-func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64) error {
+func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64, cost float64) error {
 	if subkeyID == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`INSERT INTO usage_daily(day,subkey_id,tokens,images,requests)
-		VALUES(?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO usage_daily(day,subkey_id,tokens,images,requests,cost)
+		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(day,subkey_id) DO UPDATE SET
 			tokens=tokens+excluded.tokens, images=images+excluded.images,
-			requests=requests+excluded.requests`,
-		today(), subkeyID, tokens, images, requests)
+			requests=requests+excluded.requests, cost=cost+excluded.cost`,
+		today(), subkeyID, tokens, images, requests, cost)
 	return err
 }
 
@@ -763,8 +785,8 @@ func (s *Store) GetDailyUsage(subkeyID string) (*DailyUsage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	d := &DailyUsage{}
-	err := s.db.QueryRow(`SELECT tokens,images,requests FROM usage_daily WHERE day=? AND subkey_id=?`,
-		today(), subkeyID).Scan(&d.Tokens, &d.Images, &d.Requests)
+	err := s.db.QueryRow(`SELECT tokens,images,requests,cost FROM usage_daily WHERE day=? AND subkey_id=?`,
+		today(), subkeyID).Scan(&d.Tokens, &d.Images, &d.Requests, &d.Cost)
 	if err == sql.ErrNoRows {
 		return &DailyUsage{}, nil
 	}
@@ -772,6 +794,72 @@ func (s *Store) GetDailyUsage(subkeyID string) (*DailyUsage, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// SubKeyStats 子 Key 自助门户用的请求概况（只含终端用户可见数据）。
+type SubKeyStats struct {
+	Requests int64   `json:"requests"`
+	Success  int64   `json:"success"`
+	Tokens   int64   `json:"tokens"`
+	Images   int64   `json:"images"`
+	Cost     float64 `json:"cost"`
+}
+
+// SubKeyLogStats 统计某子 Key 自 since 起的请求概况（来自 usage_logs，仅本 Key）。
+func (s *Store) SubKeyLogStats(subkeyID string, since int64) (*SubKeyStats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := &SubKeyStats{}
+	err := s.db.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(total_tokens),0),
+			COALESCE(SUM(image_count),0),
+			COALESCE(SUM(cost),0)
+		FROM usage_logs WHERE subkey_id=? AND ts>=?`, subkeyID, since).
+		Scan(&st.Requests, &st.Success, &st.Tokens, &st.Images, &st.Cost)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// ListUsageLogsBySubKey 返回某子 Key 自己的近期日志。
+// 列特意收窄（不含 account/provider/ep 等管理侧字段），供自助门户展示，
+// 保证终端用户拿不到任何超出自身调用视角的数据。
+const subKeyLogCols = `id,ts,requested_model,model,modality,
+	prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error`
+
+func scanSubKeyUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
+	l := &model.UsageLog{}
+	if err := rows.Scan(&l.ID, &l.TS, &l.RequestedModel, &l.Model, &l.Modality,
+		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
+		&l.Cost, &l.Status, &l.LatencyMs, &l.Error); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func (s *Store) ListUsageLogsBySubKey(subkeyID string, limit int) ([]*model.UsageLog, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT `+subKeyLogCols+` FROM usage_logs WHERE subkey_id=? ORDER BY id DESC LIMIT ?`,
+		subkeyID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*model.UsageLog{}
+	for rows.Next() {
+		l, err := scanSubKeyUsageLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // ─────────────────────────── Settings ───────────────────────────

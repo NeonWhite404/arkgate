@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/openai/openai-go"
@@ -94,16 +96,6 @@ func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel
 	return raw, ExtractChatUsage(raw), nil
 }
 
-// ChatStream 转发流式 chat/completions（强制 include_usage），SSE 原样回传。
-func (m *Manager) ChatStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (*TextUsage, error) {
-	body, err := prepareStreamBody(down, upstreamModel)
-	if err != nil {
-		return nil, err
-	}
-	pt, ct, err := m.streamForward(ctx, rt, "chat/completions", body, chatUsageFromChunk, sink)
-	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
-}
-
 // ─────────────────────────── responses ───────────────────────────
 
 // Responses 转发非流式 responses，返回上游原始响应与用量（input/output → prompt/completion）。
@@ -117,17 +109,6 @@ func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstream
 		return nil, nil, err
 	}
 	return raw, ExtractResponsesUsage(raw), nil
-}
-
-// ResponsesStream 转发流式 responses；从 response.completed 事件提取用量。
-// 客户端请求 stream 时才会走此路径，故透传体不再强制补 stream 字段。
-func (m *Manager) ResponsesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (*TextUsage, error) {
-	body, err := prepareBody(down, upstreamModel)
-	if err != nil {
-		return nil, err
-	}
-	pt, ct, err := m.streamForward(ctx, rt, "responses", body, responsesUsageFromEvent, sink)
-	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
 }
 
 // ─────────────────────────── images/generations ───────────────────────────
@@ -145,54 +126,46 @@ func (m *Manager) Images(ctx context.Context, rt Route, down []byte, upstreamMod
 	return raw, ExtractImageUsage(raw), nil
 }
 
-// ImagesStream 转发流式 images/generations（partial images）。无 usage 事件，
-// 张数按请求里的 n 计量；失败返回 0（部分图片可能已送达，但按失败不计费）。
-func (m *Manager) ImagesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (int64, error) {
-	body, err := prepareBody(down, upstreamModel)
-	if err != nil {
-		return 0, err
-	}
-	if _, _, err := m.streamForward(ctx, rt, "images/generations", body, nil, sink); err != nil {
-		return 0, err
-	}
-	return ExtractN(down), nil
+// ─────────────────────────── 流式转发（唯一自研 HTTP） ───────────────────────────
+//
+// 流式被拆成两段，让「首字节之前」的失败可以安全换叶子重试：
+//  1. openStream：建连 + 等响应头 + 等首个数据行（首 token）。此阶段失败时
+//     未向客户端写过任何字节，网关可排除当前叶子换下一个重试。
+//  2. Stream.Pump：首字节到手后由网关提交 SSE 响应头，再把整条流写给 sink。
+//     一旦开始 Pump 就无法重试（客户端已收到数据）。
+
+// ErrFirstToken 表示流式请求在产出任何字节前失败（首 token 超时等），
+// 未向客户端写过数据，调用方可安全重试。
+var ErrFirstToken = errors.New("上游首字节超时")
+
+// Stream 是一条已打开（已收到首字节）的上游流式响应。
+type Stream struct {
+	resp   *http.Response
+	rdr    *bufio.Reader
+	first  []byte // openStream 已读出的首个数据行
+	sniff  func(payload []byte) (pt, ct int64, ok bool)
+	cancel context.CancelFunc // 首 token 超时场景下创建的子 ctx（可能为 nil）
 }
 
-// ─────────────────────────── 流式转发（唯一自研 HTTP） ───────────────────────────
-
-// streamForward 用共享连接池做 SSE 字节级转发：逐行写给 sink，
-// sniff（可为 nil）用于从 data: 载荷里提取用量。
-func (m *Manager) streamForward(ctx context.Context, rt Route, path string, body []byte,
-	sniff func(payload []byte) (pt, ct int64, ok bool), sink io.Writer) (pt, ct int64, err error) {
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(rt.BaseURL, "/")+"/"+path, bytes.NewReader(body))
-	if err != nil {
-		return 0, 0, err
+// Close 关闭流并释放底层资源。
+func (s *Stream) Close() {
+	if s == nil {
+		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+rt.Key)
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := m.httpc.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return 0, 0, errors.New("upstream timeout")
-		}
-		return 0, 0, err
+	if s.resp != nil && s.resp.Body != nil {
+		s.resp.Body.Close()
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return 0, 0, &HTTPError{Code: resp.StatusCode, Body: respBody}
+	if s.cancel != nil {
+		s.cancel()
 	}
+}
 
-	reader := bufio.NewReader(resp.Body)
+// Pump 把整条流写给 sink（含 openStream 已读出的首行），返回从流中提取的用量。
+func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
+	line := s.first
 	for {
-		line, rerr := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			if p, c, ok := sniffDataLine(line, sniff); ok {
+			if p, c, ok := sniffDataLine(line, s.sniff); ok {
 				pt += p
 				ct += c
 			}
@@ -200,14 +173,158 @@ func (m *Manager) streamForward(ctx context.Context, rt Route, path string, body
 				return pt, ct, werr
 			}
 		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				break
+		line, err = s.rdr.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return pt, ct, nil
 			}
-			return pt, ct, rerr
+			return pt, ct, err
 		}
 	}
-	return pt, ct, nil
+}
+
+// openStream 发起流式请求并等待响应头 + 首个数据行（首 token）。
+// firstTokenTimeout > 0 时，该时长内未收到任何字节即取消请求并返回 ErrFirstToken
+// 包装错误。非 2xx 返回 HTTPError（错误体原样保留）。
+func (m *Manager) openStream(ctx context.Context, rt Route, path string, body []byte,
+	firstTokenTimeout time.Duration, sniff func(payload []byte) (int64, int64, bool)) (_ *Stream, err error) {
+
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	var fired atomic.Bool
+	var timer *time.Timer
+	if firstTokenTimeout > 0 {
+		reqCtx, cancel = context.WithCancel(ctx)
+		defer func() {
+			if err != nil {
+				cancel() // 失败路径释放子 ctx；成功路径由 Stream.Close 负责
+			}
+		}()
+		timer = time.AfterFunc(firstTokenTimeout, func() {
+			// CAS 抢占：只有抢到的一方才能取消请求；首字节到手后主流程
+			// 也会 CAS 置位，使迟到的定时器回调变成 no-op。
+			if fired.CompareAndSwap(false, true) {
+				cancel()
+			}
+		})
+		defer timer.Stop()
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost,
+		strings.TrimRight(rt.BaseURL, "/")+"/"+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+rt.Key)
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := m.httpc.Do(req)
+	if err != nil {
+		if timer != nil && fired.Load() {
+			return nil, fmt.Errorf("%w（等待 %s 无输出）", ErrFirstToken, firstTokenTimeout)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.New("upstream timeout")
+		}
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &HTTPError{Code: resp.StatusCode, Body: respBody}
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	first, rerr := reader.ReadBytes('\n')
+	if rerr != nil && len(first) == 0 {
+		// 一个字节都没拿到：按「首 token 前失败」处理（可重试）。
+		resp.Body.Close()
+		if timer != nil && fired.Load() {
+			return nil, fmt.Errorf("%w（等待 %s 无输出）", ErrFirstToken, firstTokenTimeout)
+		}
+		return nil, fmt.Errorf("上游未返回任何数据: %w", rerr)
+	}
+	if timer != nil {
+		// 首字节已到手。CAS 失败说明定时器恰好同时触发并已取消请求——
+		// 宁可放弃这条已到手的流（极小概率窗口），也不让它中途被取消。
+		if !fired.CompareAndSwap(false, true) {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w（首字节与超时同时到达）", ErrFirstToken)
+		}
+		timer.Stop()
+	}
+	return &Stream{resp: resp, rdr: reader, first: first, sniff: sniff, cancel: cancel}, nil
+}
+
+// ─────────────────────────── 流式打开（网关用） ───────────────────────────
+
+// OpenChatStream 打开 chat/completions 流（强制 stream + include_usage）。
+// 返回成功即已收到首字节；失败时未向客户端写过任何字节，可换叶子重试。
+func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
+	body, err := prepareStreamBody(down, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	return m.openStream(ctx, rt, "chat/completions", body, firstTokenTimeout, chatUsageFromChunk)
+}
+
+// OpenResponsesStream 打开 responses 流（从 response.completed 提取用量）。
+func (m *Manager) OpenResponsesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
+	body, err := prepareBody(down, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	return m.openStream(ctx, rt, "responses", body, firstTokenTimeout, responsesUsageFromEvent)
+}
+
+// OpenImagesStream 打开 images/generations 流（partial images）。无 usage 事件。
+func (m *Manager) OpenImagesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
+	body, err := prepareBody(down, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
+	return m.openStream(ctx, rt, "images/generations", body, firstTokenTimeout, nil)
+}
+
+// ─────────────────────────── 流式便捷封装（打开 + 一次泵完） ───────────────────────────
+
+// ChatStream 转发流式 chat/completions（强制 include_usage），SSE 原样回传。
+func (m *Manager) ChatStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (*TextUsage, error) {
+	st, err := m.OpenChatStream(ctx, rt, down, upstreamModel, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	pt, ct, err := st.Pump(sink)
+	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
+}
+
+// ResponsesStream 转发流式 responses；从 response.completed 事件提取用量。
+// 客户端请求 stream 时才会走此路径，故透传体不再强制补 stream 字段。
+func (m *Manager) ResponsesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (*TextUsage, error) {
+	st, err := m.OpenResponsesStream(ctx, rt, down, upstreamModel, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	pt, ct, err := st.Pump(sink)
+	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
+}
+
+// ImagesStream 转发流式 images/generations（partial images）。无 usage 事件，
+// 张数按请求里的 n 计量；失败返回 0（部分图片可能已送达，但按失败不计费）。
+func (m *Manager) ImagesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, sink io.Writer) (int64, error) {
+	st, err := m.OpenImagesStream(ctx, rt, down, upstreamModel, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer st.Close()
+	if _, _, err := st.Pump(sink); err != nil {
+		return 0, err
+	}
+	return ExtractN(down), nil
 }
 
 // sniffDataLine 判断一行 SSE 是否携带 data: 载荷，并交给 sniff 提取用量。

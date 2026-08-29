@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -239,4 +240,54 @@ func mustDef(t *testing.T, id string) Def {
 		t.Fatalf("provider %s not registered", id)
 	}
 	return d
+}
+
+// TestOpenStreamFirstTokenTimeout：上游建连后迟迟不出首字节时，
+// openStream 必须在超时后返回 ErrFirstToken（可重试），且不向 sink 写任何字节。
+func TestOpenStreamFirstTokenTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // 挂住：不写响应头也不写字节
+	}))
+	defer func() { close(release); srv.Close() }()
+
+	m := NewManager(time.Second)
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+
+	start := time.Now()
+	st, err := m.OpenChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", 150*time.Millisecond)
+	if err == nil {
+		st.Close()
+		t.Fatal("want first-token timeout error")
+	}
+	if !errors.Is(err, ErrFirstToken) {
+		t.Fatalf("want ErrFirstToken, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("timeout not enforced timely: %v", time.Since(start))
+	}
+
+	// 对照组：正常出字节的上游，短超时也能打开并泵完整流。
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n")
+	}))
+	defer okSrv.Close()
+	rt2 := Route{Def: mustDef(t, "ark"), BaseURL: okSrv.URL, Key: "k"}
+	st2, err := m.OpenChatStream(context.Background(), rt2, []byte(`{"model":"m","stream":true}`), "ep-1", 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("open ok stream: %v", err)
+	}
+	var sink strings.Builder
+	pt, ct, perr := st2.Pump(&sink)
+	st2.Close()
+	if perr != nil {
+		t.Fatalf("pump: %v", perr)
+	}
+	if pt != 1 || ct != 2 {
+		t.Fatalf("pump usage = %d/%d", pt, ct)
+	}
+	if !strings.Contains(sink.String(), "[DONE]") {
+		t.Fatal("stream bytes missing")
+	}
 }

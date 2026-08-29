@@ -494,6 +494,16 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		if raw, ok := probe["fallback"]; ok {
 			existing.Fallback = stringSlice(raw)
 		}
+		// 价格字段（成本核算）：0 表示未定价。
+		if v, ok := probe["price_input"]; ok {
+			existing.PriceInput = floatField(v)
+		}
+		if v, ok := probe["price_output"]; ok {
+			existing.PriceOutput = floatField(v)
+		}
+		if v, ok := probe["price_image"]; ok {
+			existing.PriceImage = floatField(v)
+		}
 		et := existing.Type
 		if et == "" {
 			et = model.ModelTypeText
@@ -797,16 +807,19 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 			disabled++
 		}
 	}
-	// 元组级健康度：启用数 / 熔断数。
+	// 元组级健康度：启用数 / 熔断数（熔断按 ID 查内存运行态，
+	// 快照副本不带 Runtime，不能直接判可用性）。
 	var epEnabled, epCircuit int64
 	for _, e := range eps {
 		if e.Enabled {
 			epEnabled++
 		}
-		if !a.bal.EndpointUsable(e) && e.Enabled {
+		if e.Enabled && a.bal.CircuitOpen(e.ID) {
 			epCircuit++
 		}
 	}
+	// 成本核算（来自 usage_logs.cost 聚合）。
+	totalCost, cost24h, _ := a.store.SumCost()
 	writeJSON(w, 200, map[string]any{
 		"account_total":    len(accs),
 		"account_active":   active,
@@ -818,6 +831,8 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"subkey_count":     len(subs),
 		"total_requests":   totalReq,
 		"total_tokens":     totalTokens,
+		"total_cost":       totalCost,
+		"cost_24h":         cost24h,
 		"accounts":         accs,
 		"endpoints":        eps,
 	})
@@ -890,6 +905,21 @@ func intField(v any) int {
 	case json.Number:
 		i, _ := n.Int64()
 		return int(i)
+	default:
+		return 0
+	}
+}
+
+// floatField 把 JSON 解码得到的数字安全转 float64（价格字段用）。
+func floatField(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
 	default:
 		return 0
 	}

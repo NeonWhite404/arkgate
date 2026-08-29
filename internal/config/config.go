@@ -27,6 +27,15 @@ type Config struct {
 	RequestTimeout      time.Duration
 	DefaultCircuitMax   time.Duration
 	MaxRetriesAvailable int
+
+	// 流式请求「首字节超时」：上游建连后在该时长内未产出任何字节（含 SSE 首行）
+	// 即视为该叶子失败，换下一个叶子重试（首字节前未向客户端写过任何数据，可安全重试）。
+	// 0 表示关闭。默认 30s。
+	FirstTokenTimeout time.Duration
+
+	// 会话粘性 TTL：同一子 Key + 模型在该时长内的后续请求固定路由到同一叶节点
+	// （利于上游 prompt cache 命中）。0 表示关闭。默认 5min。
+	SessionTTL time.Duration
 }
 
 // Load 从环境变量加载配置，未设置的项回落到默认值。
@@ -40,7 +49,23 @@ func Load() *Config {
 	Conf.DefaultCircuitMax = 60 * time.Second
 	Conf.MaxRetriesAvailable = 3
 
+	Conf.FirstTokenTimeout = getDurationSec("ARKGATE_FIRST_TOKEN_TIMEOUT", 30*time.Second)
+	Conf.SessionTTL = getDurationSec("ARKGATE_SESSION_TTL", 5*time.Minute)
+
 	return Conf
+}
+
+// getDurationSec 读取以秒为单位的时长环境变量（支持小数）；0 或负值返回 0（关闭）。
+func getDurationSec(k string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return time.Duration(f * float64(time.Second))
 }
 
 func getenv(k, def string) string {

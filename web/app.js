@@ -1,855 +1,1085 @@
-/* ArkGate 前端 —— 无框架单页应用，模仿 Arco 设计语言 */
-(function () {
-  "use strict";
+/* ArkGate 前端 —— Vue 3（vendor 全局构建，免 Node 构建；Arco 风格沿用 style.css）
+ *
+ * 结构：LoginPage（管理端 / 子 Key 门户双模式登录）
+ *      ├─ AdminShell（侧边栏 + 六个管理页：总览/账号/模型映射/子Key/日志/使用说明）
+ *      └─ PortalPage（子 Key 自助门户：限额进度、用量、成功率、脱敏调用记录）
+ */
+"use strict";
 
-  var token = localStorage.getItem("arkgate_token") || "";
+const { createApp, reactive } = Vue;
 
-  function h(html) {
-    var t = document.createElement("template");
-    t.innerHTML = html.trim();
-    return t.content.firstElementChild;
+// ── 全局登录态 ──
+const state = {
+  adminToken: localStorage.getItem("arkgate_token") || "",
+  subKey: localStorage.getItem("arkgate_sk") || "",
+};
+
+// ── 工具 ──
+function fmtTokens(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+function fmtTime(unix) {
+  if (!unix) return "-";
+  const d = new Date(unix * 1000);
+  const p = (n) => (n < 10 ? "0" : "") + n;
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function fmtCost(c) {
+  c = Number(c || 0);
+  if (c === 0) return "$0";
+  if (c >= 1) return "$" + c.toFixed(2);
+  return "$" + c.toFixed(4);
+}
+function fmtInt(v) {
+  v = Number(v || 0);
+  return v >= 100 ? fmtTokens(v) : String(Math.round(v));
+}
+function fmtPct(x) {
+  return Number(x || 0).toFixed(1) + "%";
+}
+
+// ── Toast ──
+const toasts = reactive([]);
+let toastSeq = 0;
+function toast(msg, ok = true) {
+  const id = ++toastSeq;
+  toasts.push({ id, msg, ok });
+  setTimeout(() => {
+    const i = toasts.findIndex((t) => t.id === id);
+    if (i >= 0) toasts.splice(i, 1);
+  }, 2600);
+}
+
+// ── API 封装 ──
+// opts.key 显式指定鉴权 Key（门户调用传子 Key）；缺省用管理令牌。
+function req(method, path, body, opts = {}) {
+  const key = opts.key !== undefined ? opts.key : state.adminToken;
+  return fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", ...(key ? { Authorization: "Bearer " + key } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then((r) =>
+    r.json().catch(() => ({})).then((d) => {
+      if (!r.ok) {
+        const m = d.detail || (d.error && d.error.message) || r.status + " error";
+        const e = new Error(typeof m === "string" ? m : JSON.stringify(m));
+        e.status = r.status;
+        if (r.status === 401 && window.__arkgateOn401) window.__arkgateOn401(path);
+        throw e;
+      }
+      if (d === null || d === undefined) return [];
+      return d;
+    })
+  );
+}
+
+// ── 复选框组（子 Key 白名单） ──
+// options 项为字符串（值=标签）或 {v, l}（值与显示分开，如账号 id → 名称）。
+const CheckGroup = {
+  props: { options: Array, modelValue: Array },
+  emits: ["update:modelValue"],
+  computed: {
+    items() {
+      return (this.options || []).map((o) => (typeof o === "string" ? { v: o, l: o } : o));
+    },
+    checked() { return new Set(this.modelValue || []); },
+  },
+  methods: {
+    toggle(v, on) {
+      const s = new Set(this.modelValue || []);
+      if (on) s.add(v); else s.delete(v);
+      this.$emit("update:modelValue", Array.from(s));
+    },
+  },
+  template: `
+    <div class="cb-group">
+      <label v-for="o in items" :key="o.v"><input type="checkbox" :checked="checked.has(o.v)" @change="toggle(o.v, $event.target.checked)"/>{{ o.l }}</label>
+      <span v-if="!items.length" class="tag tag-gray">暂无可选项</span>
+    </div>`,
+};
+
+// ── 能力三态选择 ──
+const capOptions = [
+  { v: 0, label: "继承供应商默认" },
+  { v: 1, label: "强制可用" },
+  { v: -1, label: "强制禁用" },
+];
+
+// ── 登录页（双模式） ──
+const LoginPage = {
+  emits: ["admin", "portal"],
+  data() {
+    return { tab: "admin", token: "", key: "", initialized: true, busy: false };
+  },
+  mounted() {
+    req("GET", "/api/auth/status", null, { key: "" })
+      .then((d) => { this.initialized = !!d.initialized; })
+      .catch(() => {});
+  },
+  methods: {
+    submitAdmin() {
+      const tok = this.token.trim();
+      if (!tok) { toast("请输入令牌", false); return; }
+      this.busy = true;
+      const p = this.initialized
+        ? req("POST", "/api/auth/login", { token: tok }, { key: "" })
+        : req("POST", "/api/auth/setup", { token: tok }, { key: "" });
+      p.then(() => { this.$emit("admin", tok); })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.busy = false; });
+    },
+    submitPortal() {
+      const k = this.key.trim();
+      if (!k) { toast("请输入子 Key", false); return; }
+      this.busy = true;
+      // 用输入的子 Key 请求门户概览，成功即视为登录成功。
+      req("POST", "/api/portal/overview", null, { key: k })
+        .then(() => { this.$emit("portal", k); })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.busy = false; });
+    },
+  },
+  template: `
+  <div class="login-wrap"><div class="login-card">
+    <div class="logo"><span class="dot" style="width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,rgb(var(--primary-6)),#4080ff)"></span>ArkGate</div>
+    <div class="sub">多供应商多账号负载均衡 · OpenAI 兼容网关</div>
+    <div class="login-tabs">
+      <div class="lt" :class="{active: tab==='admin'}" @click="tab='admin'">管理端</div>
+      <div class="lt" :class="{active: tab==='portal'}" @click="tab='portal'">子 Key 用户</div>
+    </div>
+    <template v-if="tab==='admin'">
+      <div class="form-item"><label>访问令牌</label>
+        <input v-model="token" :placeholder="initialized ? '访问令牌' : '首次使用，请设置访问令牌（至少 6 位）'" @keyup.enter="submitAdmin"/></div>
+      <button class="btn btn-primary" style="width:100%" :disabled="busy" @click="submitAdmin">{{ initialized ? '登录' : '初始化' }}</button>
+    </template>
+    <template v-else>
+      <div class="form-item"><label>子 API Key</label>
+        <input v-model="key" placeholder="sk-xxx" @keyup.enter="submitPortal"/></div>
+      <button class="btn btn-primary" style="width:100%" :disabled="busy" @click="submitPortal">查询我的用量</button>
+      <div class="form-item" style="margin-top:12px;font-size:12px;color:var(--color-text-3)">
+        仅可查看该 Key 自身的用量与调用记录。</div>
+    </template>
+  </div></div>`,
+};
+
+// ── 通用表格空态/标签 ──
+function statusTag(s) {
+  return s === "active" ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">禁用</span>';
+}
+
+// ── 总览（以统计图表为主） ──
+const OverviewPage = {
+  data() { return { o: null, series: [] }; },
+  computed: {
+    // 按小时聚合：tokens / cost / requests 三条趋势共用一套时间桶。
+    hourly() {
+      const byTs = {};
+      for (const p of this.series) {
+        if (!byTs[p.ts]) byTs[p.ts] = { t: p.ts, tokens: 0, cost: 0, requests: 0 };
+        byTs[p.ts].tokens += p.tokens || 0;
+        byTs[p.ts].cost += p.cost || 0;
+        byTs[p.ts].requests += p.requests || 0;
+      }
+      return Object.values(byTs).sort((a, b) => a.t - b.t);
+    },
+    // 模型 / 子 Key 分布（tokens 降序，颜色与趋势图中的模型色一致）。
+    modelColors() {
+      const models = [...new Set(this.series.map((p) => p.model || "—"))].sort();
+      const colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
+      const map = {};
+      models.forEach((m, i) => { map[m] = colors[i % colors.length]; });
+      return map;
+    },
+    modelDist() {
+      const byModel = {};
+      for (const p of this.series) {
+        const m = p.model || "—";
+        byModel[m] = (byModel[m] || 0) + (p.tokens || 0);
+      }
+      return Object.entries(byModel)
+        .map(([label, value]) => ({ label, value, color: this.modelColors[label] }))
+        .sort((a, b) => b.value - a.value);
+    },
+    subkeyDist() {
+      const bySk = {};
+      for (const p of this.series) {
+        const k = p.subkey || p.subkey_id || "—";
+        bySk[k] = (bySk[k] || 0) + (p.tokens || 0);
+      }
+      return Object.entries(bySk)
+        .map(([label, value]) => ({ label, value, color: "rgb(var(--primary-6))" }))
+        .sort((a, b) => b.value - a.value);
+    },
+    tokenChartHtml() { return renderStackedTokenChart(this.series); },
+    costChartHtml() { return renderBarChart(this.hourly, (p) => p.cost, "#f59e0b", fmtCost); },
+    reqChartHtml() { return renderBarChart(this.hourly, (p) => p.requests, "#3b82f6", fmtInt); },
+  },
+  mounted() { this.load(); },
+  template: `
+  <div class="page">
+    <div class="page-head">
+      <div class="page-title" style="margin:0">总览 <span class="tag tag-green" style="margin-left:8px"><span class="pulse" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:rgb(var(--green-6));margin-right:4px"></span>运行中</span></div>
+      <div class="row-actions">
+        <button class="btn btn-outline btn-sm" @click="load">↻ 刷新</button>
+        <button class="btn btn-outline btn-sm" @click="toggleDark">🌓</button>
+      </div>
+    </div>
+    <div class="stat-row" v-if="o">
+      <div class="stat-card"><div class="ic ic-blue">🏛</div><div class="body"><div class="v">{{ o.account_active }}<span style="font-size:13px;color:var(--color-text-3)">/{{ o.account_total }}</span></div><div class="l">启用账号</div></div></div>
+      <div class="stat-card"><div class="ic ic-red">⏳</div><div class="body"><div class="v">{{ o.endpoint_circuit }}</div><div class="l">元组熔断</div></div></div>
+      <div class="stat-card"><div class="ic ic-purple">🧩</div><div class="body"><div class="v">{{ o.model_count }}</div><div class="l">模型</div></div></div>
+      <div class="stat-card"><div class="ic ic-orange">🔑</div><div class="body"><div class="v">{{ o.subkey_count }}</div><div class="l">子 Key</div></div></div>
+      <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ o.total_requests }}</div><div class="l">总请求</div></div></div>
+      <div class="stat-card"><div class="ic ic-green">⬤</div><div class="body"><div class="v">{{ fmtTokens(o.total_tokens) }}</div><div class="l">总 Token</div></div></div>
+      <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(o.total_cost) }}</div><div class="l">总成本（24h {{ fmtCost(o.cost_24h) }}）</div></div></div>
+    </div>
+
+    <div class="chart-grid" v-if="o">
+      <div class="card wide"><div class="card-head"><div class="card-title">Token 用量趋势（24h，按子 Key × 模型堆叠）</div></div>
+        <div class="chart-wrap" v-html="tokenChartHtml"></div></div>
+      <div class="card"><div class="card-head"><div class="card-title">成本趋势（24h）</div></div>
+        <div class="chart-wrap" v-html="costChartHtml"></div></div>
+      <div class="card"><div class="card-head"><div class="card-title">请求趋势（24h）</div></div>
+        <div class="chart-wrap" v-html="reqChartHtml"></div></div>
+      <div class="card"><div class="card-head"><div class="card-title">模型分布（24h Tokens）</div></div>
+        <div class="hbars"><div class="hbar-row" v-for="it in modelDist" :key="it.label">
+          <span class="hbar-label" :title="it.label">{{ it.label }}</span>
+          <div class="hbar-track"><div class="hbar-fill" :style="{width: hbarPct(it.value, modelDist) + '%', background: it.color}"></div></div>
+          <span class="hbar-val">{{ fmtTokens(it.value) }}</span>
+        </div><div v-if="!modelDist.length" class="empty">暂无数据</div></div></div>
+      <div class="card"><div class="card-head"><div class="card-title">子 Key 分布（24h Tokens）</div></div>
+        <div class="hbars"><div class="hbar-row" v-for="it in subkeyDist" :key="it.label">
+          <span class="hbar-label" :title="it.label">{{ it.label }}</span>
+          <div class="hbar-track"><div class="hbar-fill" :style="{width: hbarPct(it.value, subkeyDist) + '%'}"></div></div>
+          <span class="hbar-val">{{ fmtTokens(it.value) }}</span>
+        </div><div v-if="!subkeyDist.length" class="empty">暂无数据</div></div></div>
+    </div>
+  </div>`,
+  methods: {
+    hbarPct(v, list) {
+      const max = Math.max(...list.map((x) => x.value), 1);
+      return Math.max(2, (v / max) * 100);
+    },
+    load() {
+      req("GET", "/api/overview").then((d) => { this.o = d; }).catch((e) => toast(e.message, false));
+      req("GET", "/api/usage/series?hours=24").then((s) => { this.series = s || []; }).catch(() => {});
+    },
+  },
+};
+
+// 深/浅色切换（挂到 globalProperties 供模板调用）。
+function toggleDark() {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  localStorage.setItem("arkgate_theme", next);
+}
+
+// Token 用量趋势：子 Key × 模型按小时堆叠柱状图（SVG 字符串）。
+function renderStackedTokenChart(series) {
+  if (!series || !series.length) return '<div class="empty">暂无用量数据</div>';
+  const byTs = {}; const subs = {}; const models = {};
+  series.forEach((p) => {
+    const t = p.ts;
+    if (!byTs[t]) byTs[t] = {};
+    const key = p.subkey || p.subkey_id;
+    const m = p.model || "—";
+    if (!byTs[t][key]) byTs[t][key] = {};
+    if (!byTs[t][key][m]) byTs[t][key][m] = 0;
+    byTs[t][key][m] += p.tokens || 0;
+    subs[key] = true; models[m] = true;
+  });
+  const tsList = Object.keys(byTs).map((x) => parseInt(x, 10)).sort((a, b) => a - b);
+  const subList = Object.keys(subs).sort();
+  const modelList = Object.keys(models).sort();
+  const colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
+  const mColor = {};
+  modelList.forEach((m, i) => { mColor[m] = colors[i % colors.length]; });
+
+  const W = 820, H = 240, padL = 48, padR = 12, padT = 12, padB = 28;
+  let maxV = 0;
+  tsList.forEach((t) => {
+    let stackTotal = 0;
+    subList.forEach((sk) => modelList.forEach((m) => { stackTotal += (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0; }));
+    if (stackTotal > maxV) maxV = stackTotal;
+  });
+  if (maxV <= 0) maxV = 1;
+  const xOf = (i) => padL + (tsList.length > 1 ? (i * (W - padL - padR) / (tsList.length - 1)) : (W - padL - padR) / 2);
+
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + (H - padT - padB) * (g / 4);
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
   }
-
-  function esc(s) {
-    return String(s == null ? "" : s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  const barW = Math.max(2, Math.min(Math.floor((W - padL - padR) / Math.max(1, tsList.length)) - 2, Math.floor((W - padL - padR) / 3)));
+  const plotH = H - padT - padB;
+  tsList.forEach((t, i) => {
+    const x = xOf(i) - barW / 2;
+    let yBase = H - padB;
+    let acc = 0;
+    subList.forEach((sk) => modelList.forEach((m) => {
+      const v = (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0;
+      if (v <= 0) return;
+      acc += v;
+      const y = (H - padB) - Math.round(plotH * (acc / maxV));
+      const barH = Math.max(1, yBase - y);
+      svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + barH + '" fill="' + mColor[m] + '" opacity="0.9"><title>' + sk + ' · ' + m + ': ' + v + '</title></rect>';
+      yBase = y;
+    }));
+  });
+  const step = Math.max(1, Math.floor(tsList.length / 6));
+  for (let k = 0; k < tsList.length; k += step) {
+    const d = new Date(tsList[k] * 1000);
+    const hh = (d.getHours() < 10 ? "0" : "") + d.getHours();
+    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + hh + '</text>';
   }
+  svg += "</svg>";
+  const leg = '<div class="chart-legend">' + modelList.map((m) =>
+    '<span class="leg-item"><span class="leg-swatch" style="background:' + mColor[m] + '"></span>' + m + "</span>").join("") + "</div>";
+  return svg + leg;
+}
 
-  function toast(msg, ok) {
-    var t = h('<div class="toast ' + (ok ? "ok" : "err") + '">' + esc(msg) + "</div>");
-    document.body.appendChild(t);
-    setTimeout(function () { t.remove(); }, 2600);
-  }
+// 通用单系列柱状图：points [{t, ...}]，取值与格式化由调用方注入（成本/请求趋势共用）。
+function renderBarChart(points, pick, color, format) {
+  if (!points || !points.length) return '<div class="empty">暂无数据</div>';
+  const W = 400, H = 190, padL = 44, padR = 8, padT = 10, padB = 24;
+  const vals = points.map(pick);
+  const maxV = Math.max(...vals, 1);
+  const plotH = H - padT - padB;
+  const n = points.length;
+  // 单桶时柱子收窄到绘图区 1/3，避免撑成整块色条。
+  const barW = Math.max(2, Math.min(Math.floor((W - padL - padR) / n) - 2, Math.floor((W - padL - padR) / 3)));
+  const xOf = (i) => padL + (n > 1 ? (i * (W - padL - padR) / (n - 1)) : (W - padL - padR) / 2);
 
-  // ── API 封装 ──
-  function req(method, path, body) {
-    return fetch(path, {
-      method: method,
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": token ? "Bearer " + token : "",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    }).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (d) {
-        if (!r.ok) {
-          var m = d.detail || d.error || (r.status + " error");
-          var e = new Error(typeof m === "string" ? m : JSON.stringify(m));
-          e.status = r.status;
-          throw e;
-        }
-        // 后端空列表可能序列化为 null，统一兜底为 []，避免前端 .map/.forEach 崩溃。
-        if (d === null || d === undefined) return [];
-        return d;
-      });
-    });
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
+  for (let g = 0; g <= 3; g++) {
+    const y = padT + plotH * (g / 3);
+    const v = maxV * (1 - g / 3);
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="9" fill="#86909c" text-anchor="end">' + format(v) + '</text>';
   }
+  points.forEach((p, i) => {
+    const v = pick(p);
+    const h = Math.max(v > 0 ? 2 : 0, plotH * (v / maxV));
+    const x = xOf(i) - barW / 2;
+    const y = H - padB - h;
+    svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h + '" rx="2" fill="' + color + '" opacity="0.9"><title>' + hourLabel(p.t) + ' · ' + format(v) + '</title></rect>';
+  });
+  const step = Math.max(1, Math.floor(n / 6));
+  for (let k = 0; k < n; k += step) {
+    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + hourLabel(points[k].t) + '</text>';
+  }
+  svg += "</svg>";
+  return svg;
+}
 
-  function authStatus() { return req("GET", "/api/auth/status"); }
+function hourLabel(ts) {
+  const d = new Date(ts * 1000);
+  return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":00";
+}
 
-  // ── 视图注册 ──
-  var routes = {};
-  function register(name, render, sidebar) {
-    routes[name] = { render: render, sidebar: sidebar !== false };
-  }
-
-  function fmtTokens(n) {
-    n = Number(n || 0);
-    if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
-    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-    return String(n);
-  }
-  function fmtTime(unix) {
-    if (!unix) return "-";
-    var d = new Date(unix * 1000);
-    function p(n) { return (n < 10 ? "0" : "") + n; }
-    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
-  }
-  function statusTag(s) {
-    var map = {
-      "active": '<span class="tag tag-green">启用</span>',
-      "disabled": '<span class="tag tag-gray">禁用</span>',
+// ── 上游账号 ──
+const AccountsPage = {
+  data() {
+    return {
+      accs: [],
+      providers: [],
+      modal: null, // {id|null, form:{...}}
     };
-    return map[s] || '<span class="tag tag-gray">' + esc(s) + "</span>";
-  }
-
-  // ── 总览 ──
-  register("overview", function (root) {
-    req("GET", "/api/overview").then(function (d) {
-      var accs = d.accounts || [];
-      var totalReq = 0, totalTok = 0;
-      accs.forEach(function (a) { totalReq += a.total_requests; totalTok += a.total_tokens; });
-      root.innerHTML = "";
-      root.appendChild(h(
-        '<div class="page">' +
-          '<div class="banner"><div>' +
-            '<div class="badge"><span class="pulse"></span>运行中</div>' +
-            '<h2>ArkGate · 多供应商 LLM 网关</h2>' +
-            '<p>多账号加权轮询 · 熔断 · 限流 · OpenAI 兼容 /v1（chat / responses / images）</p>' +
-          '</div><div class="row-actions">' +
-            '<button class="btn btn-outline" id="btn-dark">🌓 深色</button>' +
-          '</div></div>' +
-          '<div class="stat-row">' +
-            stat('账号总数', d.account_total, 'ic-blue', '🏛') +
-            stat('启用中', d.account_active, 'ic-green', '✅') +
-            // 账号本身不参与熔断（只有元组/叶节点会熔断），这里展示元组熔断数。
-            stat('元组熔断', d.endpoint_circuit, 'ic-red', '⏳') +
-            stat('模型目录', d.model_count, 'ic-purple', '🧩') +
-            stat('子 Key', d.subkey_count, 'ic-orange', '🔑') +
-            stat('总请求', totalReq, 'ic-blue', '⚡') +
-            stat('总 Token', fmtTokens(totalTok), 'ic-green', '⬤') +
-          '</div>' +
-          '<div class="card"><div class="card-head"><div class="card-title">账号状态</div></div>' +
-            '<div class="table-wrap"><table><thead><tr>' +
-            '<th>账号</th><th>供应商</th><th>状态</th><th>权重</th><th>请求</th><th>成功</th><th>失败</th><th>Token</th><th>最后使用</th>' +
-            '</tr></thead><tbody>' + (accs.length ? accs.map(function (a) {
-              return "<tr><td>" + esc(a.name) + "</td><td>" + esc(a.provider || "ark") + "</td><td>" + statusTag(a.status) +
-                "</td><td>" + esc(a.weight) + "</td><td>" + a.total_requests +
-                "</td><td class='v' style='color:rgb(var(--green-6))'>" + a.success_requests +
-                "</td><td class='v' style='color:rgb(var(--red-6))'>" + a.fail_requests +
-                "</td><td>" + fmtTokens(a.total_tokens) + "</td><td>" + fmtTime(a.last_used_at) + "</td></tr>";
-            }).join("") : '<tr><td colspan="9" class="empty">暂无账号，请先添加</td></tr>') +
-            "</tbody></table></div></div>" +
-          '<div class="card"><div class="card-head"><div class="card-title">各子 Key × 模型用量（最近 24 小时，按小时）</div></div>' +
-            '<div id="usage-chart" class="chart-wrap"></div></div>' +
-        "</div>"
-      ));
-      bindDark(root);
-      req("GET", "/api/usage/series?hours=24").then(function (series) {
-        renderUsageChart(root.querySelector("#usage-chart"), series || []);
-      }).catch(function () {});
-    }).catch(function (e) { root.innerHTML = ""; });
-  });
-
-  function stat(label, value, icCls, icGlyph) {
-    return '<div class="stat-card"><div class="ic ' + icCls + '">' + icGlyph + '</div>' +
-      '<div class="body"><div class="v">' + esc(value) + '</div><div class="l">' + esc(label) + '</div></div></div>';
-  }
-
-  function bindDark(root) {
-    var b = root.querySelector("#btn-dark");
-    if (b) b.addEventListener("click", function () {
-      var cur = document.documentElement.getAttribute("data-theme");
-      var next = cur === "dark" ? "" : "dark";
-      document.documentElement.setAttribute("data-theme", next);
-      localStorage.setItem("arkgate_theme", next);
-    });
-  }
-
-  // 渲染子 Key × 模型用量柱状图（SVG，无外部依赖）
-  function renderUsageChart(container, series) {
-    if (!container) return;
-    container.innerHTML = "";
-    if (!series || !series.length) {
-      container.innerHTML = '<div class="empty">暂无用量数据</div>';
-      return;
-    }
-    // 归并同 ts 的子 Key×模型点；收集子 Key 列表与时间点
-    var byTs = {};
-    var subs = {};
-    var models = {};
-    series.forEach(function (p) {
-      var t = p.ts;
-      if (!byTs[t]) byTs[t] = {};
-      var key = p.subkey || p.subkey_id;
-      var m = p.model || "—";
-      if (!byTs[t][key]) byTs[t][key] = {};
-      if (!byTs[t][key][m]) byTs[t][key][m] = 0;
-      byTs[t][key][m] += (p.tokens || 0);
-      subs[key] = true;
-      models[m] = true;
-    });
-    var tsList = Object.keys(byTs).map(function (x) { return parseInt(x, 10); }).sort(function (a, b) { return a - b; });
-    var subList = Object.keys(subs).sort();
-    var modelList = Object.keys(models).sort();
-
-    // 每子 Key 每模型一个系列；颜色按模型轮换
-    var colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
-    var mColor = {};
-    modelList.forEach(function (m, i) { mColor[m] = colors[i % colors.length]; });
-
-    // 构建 SVG：横轴时间，纵轴 token 数（每小时）
-    var W = 820, H = 240, padL = 48, padR = 12, padT = 12, padB = 28;
-    // maxV 必须是「同一时刻所有子 Key × 所有模型」的总和，因为下面把它们
-    // 堆叠在同一根柱子上；若只取单个子 Key 的小计，多子 Key 时柱子会超出画布。
-    var maxV = 0;
-    tsList.forEach(function (t) {
-      var stackTotal = 0;
-      subList.forEach(function (sk) {
-        modelList.forEach(function (m) {
-          stackTotal += (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0;
-        });
-      });
-      if (stackTotal > maxV) maxV = stackTotal;
-    });
-    if (maxV <= 0) maxV = 1;
-
-    function xOf(i) { return padL + (tsList.length > 1 ? (i * (W - padL - padR) / (tsList.length - 1)) : (W - padL - padR) / 2); }
-
-    var svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">';
-    // 网格与 Y 轴
-    for (var g = 0; g <= 4; g++) {
-      var y = padT + (H - padT - padB) * (g / 4);
-      svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
-    }
-    // 每小时柱：按子 Key 垂直堆叠
-    var barW = Math.max(2, Math.floor((W - padL - padR) / Math.max(1, tsList.length)) - 2);
-    var plotH = H - padT - padB;
-    tsList.forEach(function (t, i) {
-      var x = xOf(i) - barW / 2;
-      var yBase = H - padB;
-      // 按「累计值」换算每段的 y，而不是各段独立取整后相减：
-      // 后者每段最多差 0.5px，多段叠加会累积成可见误差并顶出画布上沿。
-      var acc = 0;
-      subList.forEach(function (sk) {
-        modelList.forEach(function (m) {
-          var v = (byTs[t] && byTs[t][sk] && byTs[t][sk][m]) || 0;
-          if (v <= 0) return;
-          acc += v;
-          var y = (H - padB) - Math.round(plotH * (acc / maxV));
-          // 注意变量名不要用 h —— 会遮蔽全局的 h() DOM 构造函数。
-          var barH = Math.max(1, yBase - y);
-          svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + barH + '" fill="' + mColor[m] + '" opacity="0.9"><title>' + esc(sk) + ' · ' + esc(m) + ': ' + v + '</title></rect>';
-          yBase = y;
-        });
-      });
-    });
-    // X 轴标签（最多 6 个）
-    var step = Math.max(1, Math.floor(tsList.length / 6));
-    for (var k = 0; k < tsList.length; k += step) {
-      var tx = xOf(k);
-      var d = new Date(tsList[k] * 1000);
-      var hh = (d.getHours() < 10 ? "0" : "") + d.getHours();
-      svg += '<text x="' + tx + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + hh + '</text>';
-    }
-    svg += '</svg>';
-
-    // 图例：模型颜色
-    var leg = '<div class="chart-legend">' + modelList.map(function (m) {
-      return '<span class="leg-item"><span class="leg-swatch" style="background:' + mColor[m] + '"></span>' + esc(m) + '</span>';
-    }).join("") + '</div>';
-
-    container.innerHTML = svg + leg;
-  }
-
-  // ── 账号 ──
-  register("accounts", function (root) {
-    function load() {
-      req("GET", "/api/accounts").then(function (accs) {
-        root.innerHTML = "";
-        root.appendChild(h(
-          '<div class="page">' +
-            '<div class="page-title">上游账号</div><div class="page-sub">每个账号对应一个供应商（火山方舟 / OpenAI / 自定义 OpenAI 兼容）的 API Key，网关会在请求时动态替换。Key 为任意字符串，网关不做格式假设。</div>' +
-            '<div class="toolbar"><button class="btn btn-primary" id="add">+ 添加账号</button><div class="spacer"></div></div>' +
-            '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>名称</th><th>供应商</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th>Token</th><th>图像</th><th>操作</th>' +
-            '</tr></thead><tbody>' + (accs.length ? accs.map(function (a) {
-              return "<tr><td><strong>" + esc(a.name) + "</strong></td><td>" + esc(a.provider || "ark") + "</td><td class='mono'>" + esc(a.key_hint) +
-                "</td><td>" + statusTag(a.status) + "</td><td>" + esc(a.weight) +
-                "</td><td>" + a.total_requests + "/" + a.success_requests + "/" + a.fail_requests +
-                "</td><td>" + fmtTokens(a.total_tokens) + "</td><td>" + (a.total_images || 0) +
-                "</td><td><div class='row-actions'>" +
-                '<button class="btn btn-outline btn-sm" data-edit="' + esc(a.id) + '">编辑</button>' +
-                '<button class="btn btn-danger btn-sm" data-del="' + esc(a.id) + '">删除</button>' +
-                "</div></td></tr>";
-            }).join("") : '<tr><td colspan="9" class="empty">暂无账号</td></tr>') +
-            "</tbody></table></div></div>" +
-          "</div>"
-        ));
-
-        root.querySelector("#add").onclick = function () { showAccountModal(null, load); };
-        root.querySelectorAll("[data-edit]").forEach(function (b) {
-          b.onclick = function () { showAccountModal(b.getAttribute("data-edit"), load); };
-        });
-        root.querySelectorAll("[data-del]").forEach(function (b) {
-          b.onclick = function () {
-            if (!confirm("确认删除该账号？将同时删除其模型映射。")) return;
-            req("DELETE", "/api/accounts/" + b.getAttribute("data-del")).then(function () { toast("已删除"); load(); });
-          };
-        });
-      });
-    }
-    load();
-  });
-
-  function showAccountModal(id, done) {
-    var isEdit = !!id;
-    Promise.all([req("GET", "/api/providers"), isEdit ? req("GET", "/api/accounts") : Promise.resolve([])]).then(function (rs) {
-      var providers = rs[0] || [];
-      var acc = null;
-      if (isEdit) {
-        acc = (rs[1] || []).find(function (x) { return x.id === id; });
-        if (!acc) return;
-      }
-      var curProvider = acc ? (acc.provider || "ark") : "ark";
-      var popts = providers.map(function (p) {
-        return '<option value="' + esc(p.id) + '"' + (p.id === curProvider ? " selected" : "") + ">" + esc(p.display_name) + "（" + esc(p.id) + "）</option>";
-      }).join("");
-      var title = isEdit ? "编辑账号" : "添加账号";
-      var modal = h(
-        '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>' + title + '</h3>' +
-        '<button class="modal-close">×</button></div><div class="modal-body">' +
-        '<div class="form-item"><label>名称 <span class="req">*</span></label><input id="f-name" placeholder="例如：主账号-北京"/></div>' +
-        '<div class="form-row">' +
-        '<div class="form-item"><label>供应商</label><select id="f-provider">' + popts + "</select></div>" +
-        '<div class="form-item"><label>权重</label><input id="f-weight" type="number" value="1"/></div>' +
-        '<div class="form-item"><label>状态</label><select id="f-status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>' +
-        '</div>' +
-        '<div class="form-item"><label>Base URL</label><input id="f-baseurl" placeholder=""/></div>' +
-        '<div class="form-item"><label>上游 API Key <span class="req">*</span>' + (isEdit ? "（留空表示不修改）" : "") + '</label><input id="f-key" placeholder="任意字符串，网关不做格式假设"/></div>' +
-        '<div class="form-row">' +
-        '<div class="form-item"><label>Responses 能力</label><select id="f-capr">' + capOpts(acc ? acc.cap_responses : 0) + "</select></div>" +
-        '<div class="form-item"><label>图像能力</label><select id="f-capi">' + capOpts(acc ? acc.cap_images : 0) + "</select></div>" +
-        '</div>' +
-        '<div class="form-item"><label style="color:var(--color-text-3)">并发 / RPM / TPM 限额请到「模型映射」按接入点配置；能力覆盖用于纠正自定义供应商的能力声明。</label></div>' +
-        '</div><div class="modal-foot">' +
-        '<button class="btn btn-outline" id="cancel">取消</button>' +
-        '<button class="btn btn-primary" id="save">保存</button>' +
-        '</div></div></div>'
-      );
-      document.body.appendChild(modal);
-      function close() { modal.remove(); }
-      modal.querySelector(".modal-close").onclick = close;
-      modal.querySelector("#cancel").onclick = close;
-      modal.addEventListener("click", function (e) { if (e.target === modal) close(); });
-
-      function syncBasePlaceholder() {
-        var pid = modal.querySelector("#f-provider").value;
-        var def = providers.find(function (x) { return x.id === pid; });
-        modal.querySelector("#f-baseurl").placeholder = def && def.default_base_url
-          ? "留空使用默认：" + def.default_base_url
-          : "必填：该供应商无默认地址（http(s)://…）";
-      }
-      syncBasePlaceholder();
-      modal.querySelector("#f-provider").onchange = syncBasePlaceholder;
-
-      if (acc) {
-        modal.querySelector("#f-name").value = acc.name;
-        modal.querySelector("#f-weight").value = acc.weight;
-        modal.querySelector("#f-status").value = acc.status;
-        modal.querySelector("#f-baseurl").value = acc.base_url || "";
-      }
-
-      modal.querySelector("#save").onclick = function () {
-        var payload = {
-          name: modal.querySelector("#f-name").value.trim(),
-          provider: modal.querySelector("#f-provider").value,
-          base_url: modal.querySelector("#f-baseurl").value.trim(),
-          api_key: modal.querySelector("#f-key").value.trim(),
-          cap_responses: parseInt(modal.querySelector("#f-capr").value, 10),
-          cap_images: parseInt(modal.querySelector("#f-capi").value, 10),
-          weight: parseInt(modal.querySelector("#f-weight").value, 10) || 1,
-          status: modal.querySelector("#f-status").value,
+  },
+  mounted() { this.load(); },
+  methods: {
+    load() {
+      req("GET", "/api/accounts").then((d) => { this.accs = d || []; }).catch((e) => toast(e.message, false));
+    },
+    openModal(id) {
+      const p = req("GET", "/api/providers");
+      const q = id ? req("GET", "/api/accounts") : Promise.resolve([]);
+      Promise.all([p, q]).then((rs) => {
+        this.providers = rs[0] || [];
+        const acc = id ? (rs[1] || []).find((x) => x.id === id) : null;
+        this.modal = {
+          id: id || null,
+          form: acc ? {
+            name: acc.name, provider: acc.provider || "ark", base_url: acc.base_url || "",
+            api_key: "", cap_responses: acc.cap_responses || 0, cap_images: acc.cap_images || 0,
+            weight: acc.weight, status: acc.status,
+          } : {
+            name: "", provider: "ark", base_url: "", api_key: "",
+            cap_responses: 0, cap_images: 0, weight: 1, status: "active",
+          },
         };
-        if (!payload.name) { toast("请输入名称", false); return; }
-        if (!isEdit && !payload.api_key) { toast("请输入 API Key", false); return; }
-        var p = isEdit
-          ? req("PUT", "/api/accounts/" + id, payload)
-          : req("POST", "/api/accounts", payload);
-        p.then(function () { toast("已保存"); close(); done && done(); })
-         .catch(function (e) { toast(e.message, false); });
+      });
+    },
+    providerDef() {
+      return this.providers.find((x) => x.id === (this.modal && this.modal.form.provider));
+    },
+    save() {
+      const f = this.modal.form;
+      if (!f.name.trim()) { toast("请输入名称", false); return; }
+      if (!this.modal.id && !f.api_key.trim()) { toast("请输入 API Key", false); return; }
+      const payload = {
+        name: f.name.trim(), provider: f.provider, base_url: f.base_url.trim(),
+        api_key: f.api_key.trim(), cap_responses: Number(f.cap_responses),
+        cap_images: Number(f.cap_images), weight: Number(f.weight) || 1, status: f.status,
       };
-    });
-  }
+      const p = this.modal.id
+        ? req("PUT", "/api/accounts/" + this.modal.id, payload)
+        : req("POST", "/api/accounts", payload);
+      p.then(() => { toast("已保存"); this.modal = null; this.load(); })
+        .catch((e) => toast(e.message, false));
+    },
+    del(a) {
+      if (!confirm("确认删除该账号？将同时删除其模型映射。")) return;
+      req("DELETE", "/api/accounts/" + a.id).then(() => { toast("已删除"); this.load(); });
+    },
+  },
+  template: `
+  <div class="page">
+    <div class="page-title">上游账号</div>
+    <div class="toolbar"><button class="btn btn-primary" @click="openModal(null)">+ 添加账号</button><div class="spacer"></div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr>
+      <th>名称</th><th>供应商</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th>Token</th><th>图像</th><th>操作</th>
+    </tr></thead><tbody>
+      <tr v-if="!accs.length"><td colspan="9" class="empty">暂无账号</td></tr>
+      <tr v-for="a in accs" :key="a.id">
+        <td><strong>{{ a.name }}</strong></td><td>{{ a.provider || 'ark' }}</td>
+        <td class="mono">{{ a.key_hint }}</td>
+        <td><span :class="a.status==='active' ? 'tag tag-green' : 'tag tag-gray'">{{ a.status==='active' ? '启用' : '禁用' }}</span></td>
+        <td>{{ a.weight }}</td>
+        <td>{{ a.total_requests }}/{{ a.success_requests }}/{{ a.fail_requests }}</td>
+        <td>{{ fmtTokens(a.total_tokens) }}</td><td>{{ a.total_images || 0 }}</td>
+        <td><div class="row-actions">
+          <button class="btn btn-outline btn-sm" @click="openModal(a.id)">编辑</button>
+          <button class="btn btn-danger btn-sm" @click="del(a)">删除</button>
+        </div></td>
+      </tr>
+    </tbody></table></div></div>
 
-  // 能力三态下拉：0 继承 / 1 强制是 / -1 强制否。
-  function capOpts(cur) {
-    cur = Number(cur || 0);
-    function o(v, label) {
-      return '<option value="' + v + '"' + (cur === v ? " selected" : "") + ">" + label + "</option>";
-    }
-    return o(0, "继承供应商默认") + o(1, "强制可用") + o(-1, "强制禁用");
-  }
+    <div v-if="modal" class="modal-mask" @click.self="modal=null">
+      <div class="modal"><div class="modal-head"><h3>{{ modal.id ? '编辑账号' : '添加账号' }}</h3><button class="modal-close" @click="modal=null">×</button></div>
+      <div class="modal-body">
+        <div class="form-item"><label>名称 <span class="req">*</span></label><input v-model="modal.form.name" placeholder="例如：主账号-北京"/></div>
+        <div class="form-row">
+          <div class="form-item"><label>供应商</label>
+            <select v-model="modal.form.provider">
+              <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.display_name }}（{{ p.id }}）</option>
+            </select></div>
+          <div class="form-item"><label>权重</label><input v-model="modal.form.weight" type="number"/></div>
+        </div>
+        <div class="form-row">
+          <div class="form-item"><label>状态</label>
+            <select v-model="modal.form.status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>
+          <div class="form-item"><label>Base URL</label>
+            <input v-model="modal.form.base_url" :placeholder="providerDef() && providerDef().default_base_url ? '留空使用默认：' + providerDef().default_base_url : '必填：该供应商无默认地址（http(s)://…）'"/></div>
+        </div>
+        <div class="form-item"><label>上游 API Key <span class="req">*</span>{{ modal.id ? '（留空表示不修改）' : '' }}</label>
+          <input v-model="modal.form.api_key" placeholder="任意字符串，网关不做格式假设"/></div>
+        <div class="form-row">
+          <div class="form-item"><label>Responses 能力</label>
+            <select v-model="modal.form.cap_responses"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
+          <div class="form-item"><label>图像能力</label>
+            <select v-model="modal.form.cap_images"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
+        </div>
+        <div class="form-item" style="color:var(--color-text-3)">并发 / RPM / TPM 限额请到「模型映射」按接入点配置；能力覆盖用于纠正自定义供应商的能力声明。</div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-outline" @click="modal=null">取消</button>
+        <button class="btn btn-primary" @click="save">保存</button></div>
+      </div></div>
+  </div>`,
+};
 
-  // ── 模型 & 映射 ──
-  register("models", function (root) {
-    renderModels();
-    function renderModels() {
+// ── 模型映射 ──
+const ModelsPage = {
+  data() {
+    return {
+      models: [], accounts: [], eps: [],
+      mModal: null, // 模型弹窗 {name|null, form}
+      eModal: null, // 映射弹窗 {id|null, form}
+    };
+  },
+  mounted() { this.load(); },
+  methods: {
+    load() {
       Promise.all([req("GET", "/api/models"), req("GET", "/api/accounts"), req("GET", "/api/endpoints")])
-        .then(function (rs) {
-          var models = rs[0], accounts = rs[1], eps = rs[2];
-          var accName = {};
-          accounts.forEach(function (a) { accName[a.id] = a.name; });
-
-          root.innerHTML = "";
-          root.appendChild(h(
-            '<div class="page">' +
-              '<div class="page-title">模型映射</div>' +
-              '<div class="page-sub">把上游模型标识（不透明字符串：Ark 的 ep-xxx、OpenAI 的 gpt-4o 等）映射为易读模型名。映射按「账号 × 模型」维护，支持文本与图像两类。</div>' +
-              '<div class="toolbar"><button class="btn btn-primary" id="add-model">+ 新建模型</button>' +
-              '<button class="btn btn-outline" id="add-ep">+ 添加映射</button><div class="spacer"></div></div>' +
-              '<div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>' +
-              '<div class="table-wrap"><table><thead><tr><th>模型名</th><th>类型</th><th>显示名</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
-              (models.length ? models.map(function (m) {
-                var typeTag = m.type === "image"
-                  ? '<span class="tag tag-purple" title="图像生成模型">图像</span>'
-                  : '<span class="tag tag-blue" title="文本对话模型">文本</span>';
-                return "<tr><td class='mono'>" + esc(m.name) + "</td><td>" + typeTag + "</td><td>" + esc(m.display) + "</td>" +
-                  "<td class='mono'>" + esc((m.fallback && m.fallback.length ? m.fallback.join(" → ") : "—")) + "</td><td>" + esc(m.description) +
-                  "<td>" + (m.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">停用</span>') +
-                  "</td><td><div class='row-actions'>" +
-                  '<button class="btn btn-outline btn-sm" data-edit-model="' + esc(m.name) + '">编辑</button>' +
-                  '<button class="btn btn-danger btn-sm" data-del-model="' + esc(m.name) + '">删除</button></div></td></tr>';
-              }).join("") : '<tr><td colspan="7" class="empty">暂无模型</td></tr>') +
-              "</tbody></table></div></div>" +
-              '<div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控）</div></div>' +
-              '<div class="table-wrap"><table><thead><tr><th>账号</th><th>模型名</th><th>上游模型 / 接入点</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
-              (eps.length ? eps.map(function (e) {
-                return "<tr><td>" + esc(e.account_name || e.account_id) + "</td><td class='mono'>" + esc(e.model) +
-                  "</td><td class='mono'>" + esc(e.ep) + "</td><td>" + (e.weight || "继承") +
-                  "</td><td>" + (e.max_concurrency || "不限") + "</td><td>" + (e.rpm_limit || "不限") + "</td><td>" + (e.tpm_limit || "不限") +
-                  "</td><td>" + (e.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">停用</span>') +
-                  "</td><td><div class='row-actions'><button class='btn btn-outline btn-sm' data-edit-ep='" + esc(e.id) + "'>编辑</button>" +
-                  '<button class="btn btn-danger btn-sm" data-del-ep="' + esc(e.id) + '">删除</button></div></td></tr>';
-              }).join("") : '<tr><td colspan="9" class="empty">暂无映射</td></tr>') +
-              "</tbody></table></div></div>" +
-            "</div>"
-          ));
-
-          root.querySelector("#add-model").onclick = function () {
-            var modal = h(
-              '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>新建模型</h3><button class="modal-close">×</button></div>' +
-              '<div class="modal-body">' +
-              '<div class="form-item"><label>模型名（下游调用用，唯一）<span class="req">*</span></label><input id="m-name" placeholder="例如 doubao-seed-1-6"/></div>' +
-              '<div class="form-item"><label>类型</label><select id="m-type"><option value="text">文本（chat / responses）</option><option value="image">图像（images/generations）</option></select></div>' +
-              '<div class="form-item"><label>显示名</label><input id="m-display" placeholder="豆包 Seed 1.6"/></div>' +
-              '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型）</label><input id="m-fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>' +
-              '<div class="form-item"><label>描述</label><input id="m-desc"/></div>' +
-              '</div><div class="modal-foot"><button class="btn btn-outline" id="m-cancel">取消</button><button class="btn btn-primary" id="m-save">保存</button></div></div></div>'
-            );
-            document.body.appendChild(modal);
-            function close() { modal.remove(); }
-            modal.querySelector(".modal-close").onclick = close;
-            modal.querySelector("#m-cancel").onclick = close;
-            modal.querySelector("#m-save").onclick = function () {
-              var name = modal.querySelector("#m-name").value.trim();
-              if (!name) { toast("请输入模型名", false); return; }
-              var fallback = modal.querySelector("#m-fallback").value.split(",")
-                .map(function (s) { return s.trim(); })
-                .filter(function (s) { return s.length > 0; });
-              req("POST", "/api/models", { name: name, type: modal.querySelector("#m-type").value, display: modal.querySelector("#m-display").value.trim() || name, description: modal.querySelector("#m-desc").value.trim(), fallback: fallback })
-                .then(function () { toast("已保存"); close(); renderModels(); })
-                .catch(function (e) { toast(e.message, false); });
-            };
-          };
-
-          root.querySelector("#add-ep").onclick = function () {
-            var opts = accounts.map(function (a) {
-              return '<option value="' + esc(a.id) + '">' + esc(a.name) + "</option>";
-            }).join("");
-            var mopts = models.map(function (m) {
-              return '<option value="' + esc(m.name) + '">' + esc(m.name) + "</option>";
-            }).join("");
-            var modal = h(
-              '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>添加接入点映射</h3><button class="modal-close">×</button></div>' +
-              '<div class="modal-body">' +
-              '<div class="form-item"><label>账号 <span class="req">*</span></label><select id="e-acc">' + opts + "</select></div>" +
-              '<div class="form-item"><label>模型名 <span class="req">*</span></label><select id="e-model">' + mopts + "</select></div>" +
-              '<div class="form-item"><label>上游模型 / 接入点 <span class="req">*</span></label><input id="e-ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/></div>' +
-              '<div class="form-row three">' +
-              '<div class="form-item"><label>权重</label><input id="e-weight" type="number" value="0"/></div>' +
-              '<div class="form-item"><label>并发上限</label><input id="e-conc" type="number" value="0"/></div>' +
-              '<div class="form-item"><label>RPM</label><input id="e-rpm" type="number" value="0"/></div>' +
-              '</div>' +
-              '<div class="form-item"><label>TPM</label><input id="e-tpm" type="number" value="0"/></div>' +
-              '</div><div class="modal-foot"><button class="btn btn-outline" id="e-cancel">取消</button><button class="btn btn-primary" id="e-save">保存</button></div></div></div>'
-            );
-            document.body.appendChild(modal);
-            function close() { modal.remove(); }
-            modal.querySelector(".modal-close").onclick = close;
-            modal.querySelector("#e-cancel").onclick = close;
-            modal.querySelector("#e-save").onclick = function () {
-              var acc = modal.querySelector("#e-acc").value;
-              var model = modal.querySelector("#e-model").value;
-              var ep = modal.querySelector("#e-ep").value.trim();
-              if (!acc || !model || !ep) { toast("请完整填写", false); return; }
-              req("POST", "/api/endpoints", {
-                account_id: acc, model: model, ep: ep,
-                weight: parseInt(modal.querySelector("#e-weight").value, 10) || 0,
-                max_concurrency: parseInt(modal.querySelector("#e-conc").value, 10) || 0,
-                rpm_limit: parseInt(modal.querySelector("#e-rpm").value, 10) || 0,
-                tpm_limit: parseInt(modal.querySelector("#e-tpm").value, 10) || 0,
-              }).then(function () { toast("已保存"); close(); renderModels(); });
-            };
-          };
-
-          root.querySelectorAll("[data-edit-ep]").forEach(function (b) {
-            b.onclick = function () {
-              var id = b.getAttribute("data-edit-ep");
-              req("GET", "/api/endpoints").then(function (eps) {
-                var e = eps.find(function (x) { return x.id === id; });
-                if (!e) return;
-                var modal = h(
-                  '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>编辑接入点映射</h3><button class="modal-close">×</button></div>' +
-                  '<div class="modal-body">' +
-                  '<div class="form-item"><label>上游模型 / 接入点</label><input id="x-ep" value="' + esc(e.ep) + '"/></div>' +
-                  '<div class="form-row three">' +
-                  '<div class="form-item"><label>权重</label><input id="x-weight" type="number" value="' + (e.weight || 0) + '"/></div>' +
-                  '<div class="form-item"><label>并发上限</label><input id="x-conc" type="number" value="' + (e.max_concurrency || 0) + '"/></div>' +
-                  '<div class="form-item"><label>RPM</label><input id="x-rpm" type="number" value="' + (e.rpm_limit || 0) + '"/></div>' +
-                  '</div>' +
-                  '<div class="form-item"><label>TPM</label><input id="x-tpm" type="number" value="' + (e.tpm_limit || 0) + '"/></div>' +
-                  '<div class="form-item"><label>状态</label><select id="x-enabled"><option value="true"' + (e.enabled ? " selected" : "") + '>启用</option><option value="false"' + (!e.enabled ? " selected" : "") + '>停用</option></select></div>' +
-                  '</div><div class="modal-foot"><button class="btn btn-outline" id="x-cancel">取消</button><button class="btn btn-primary" id="x-save">保存</button></div></div></div>'
-                );
-                document.body.appendChild(modal);
-                function close() { modal.remove(); }
-                modal.querySelector(".modal-close").onclick = close;
-                modal.querySelector("#x-cancel").onclick = close;
-                modal.querySelector("#x-save").onclick = function () {
-                  req("PUT", "/api/endpoints/" + id, {
-                    ep: modal.querySelector("#x-ep").value.trim() || e.ep,
-                    weight: parseInt(modal.querySelector("#x-weight").value, 10) || 0,
-                    max_concurrency: parseInt(modal.querySelector("#x-conc").value, 10) || 0,
-                    rpm_limit: parseInt(modal.querySelector("#x-rpm").value, 10) || 0,
-                    tpm_limit: parseInt(modal.querySelector("#x-tpm").value, 10) || 0,
-                    enabled: modal.querySelector("#x-enabled").value === "true",
-                  }).then(function () { toast("已保存"); close(); renderModels(); });
-                };
-              });
-            };
-          });
-	          root.querySelectorAll("[data-edit-model]").forEach(function (b) {
-	            b.onclick = function () {
-	              var name = b.getAttribute("data-edit-model");
-	              req("GET", "/api/models").then(function (models) {
-	                var m = models.find(function (x) { return x.name === name; });
-	                if (!m) return;
-	                var modal = h(
-	                  '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>编辑模型</h3><button class="modal-close">×</button></div>' +
-	                  '<div class="modal-body">' +
-		                  '<div class="form-item"><label>类型</label><select id="x-type"><option value="text"' + (m.type !== "image" ? " selected" : "") + '>文本（chat / responses）</option><option value="image"' + (m.type === "image" ? " selected" : "") + '>图像（images/generations）</option></select></div>' +
-		                  '<div class="form-item"><label>显示名</label><input id="x-display" value="' + esc(m.display) + '"/></div>' +
-	                  '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试）</label><input id="x-fallback" value="' + esc((m.fallback && m.fallback.length ? m.fallback.join(", ") : "")) + '"/></div>' +
-	                  '<div class="form-item"><label>描述</label><input id="x-desc" value="' + esc(m.description || "") + '"/></div>' +
-	                  '<div class="form-item"><label>状态</label><select id="x-enabled"><option value="true"' + (m.enabled ? " selected" : "") + '>启用</option><option value="false"' + (!m.enabled ? " selected" : "") + '>停用</option></select></div>' +
-	                  '</div><div class="modal-foot"><button class="btn btn-outline" id="x-cancel">取消</button><button class="btn btn-primary" id="x-save">保存</button></div></div></div>'
-	                );
-	                document.body.appendChild(modal);
-	                function close() { modal.remove(); }
-	                modal.querySelector(".modal-close").onclick = close;
-	                modal.querySelector("#x-cancel").onclick = close;
-	                modal.querySelector("#x-save").onclick = function () {
-	                  var fallback = modal.querySelector("#x-fallback").value.split(",")
-	                    .map(function (s) { return s.trim(); })
-	                    .filter(function (s) { return s.length > 0; });
-		                  req("PUT", "/api/models/" + name, {
-		                    type: modal.querySelector("#x-type").value,
-		                    display: modal.querySelector("#x-display").value.trim() || name,
-	                    description: modal.querySelector("#x-desc").value.trim(),
-	                    fallback: fallback,
-	                    enabled: modal.querySelector("#x-enabled").value === "true",
-	                  }).then(function () { toast("已保存"); close(); renderModels(); });
-	                };
-	              });
-	            };
-	          });
-
-          root.querySelectorAll("[data-del-model]").forEach(function (b) {
-            b.onclick = function () {
-              if (!confirm("确认删除该模型及其所有映射？")) return;
-              req("DELETE", "/api/models/" + b.getAttribute("data-del-model")).then(function () { toast("已删除"); renderModels(); });
-            };
-          });
-          root.querySelectorAll("[data-del-ep]").forEach(function (b) {
-            b.onclick = function () {
-              if (!confirm("确认删除该映射？")) return;
-              req("DELETE", "/api/endpoints/" + b.getAttribute("data-del-ep")).then(function () { toast("已删除"); renderModels(); });
-            };
-          });
-        });
-    }
-  });
-
-  // ── 子 Key ──
-  register("subkeys", function (root) {
-    function load() {
-      req("GET", "/api/subkeys").then(function (subs) {
-        root.innerHTML = "";
-        root.appendChild(h(
-          '<div class="page">' +
-            '<div class="page-title">子 API Key</div>' +
-            '<div class="page-sub">下发给客户端使用的 OpenAI 兼容 Key（sk-xxx）。真正的供应商 Key 不出网，网关按白名单与限额路由。</div>' +
-            '<div class="toolbar"><button class="btn btn-primary" id="add">+ 新建子 Key</button><div class="spacer"></div></div>' +
-            '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token</th><th>图像</th><th>操作</th>' +
-            '</tr></thead><tbody>' + (subs.length ? subs.map(function (s) {
-              return "<tr><td><strong>" + esc(s.name || s.id) + "</strong></td>" +
-                "<td class='mono'><span class='code-copy' title='点击复制' data-copy='" + esc(s.key) + "'>" + esc(s.key) + "</span></td>" +
-                "<td>" + (s.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">禁用</span>') + "</td>" +
-                "<td>" + (s.allowed_models && s.allowed_models.length ? s.allowed_models.join(", ") : "全部") + "</td>" +
-                "<td>" + s.total_requests + "</td><td>" + fmtTokens(s.total_tokens) + "</td><td>" + (s.total_images || 0) + "</td>" +
-                "<td><div class='row-actions'>" +
-                '<button class="btn btn-outline btn-sm" data-edit="' + esc(s.id) + '">编辑</button>' +
-                '<button class="btn btn-danger btn-sm" data-del="' + esc(s.id) + '">删除</button>' +
-                "</div></td></tr>";
-            }).join("") : '<tr><td colspan="8" class="empty">暂无子 Key</td></tr>') +
-            "</tbody></table></div></div>" +
-          "</div>"
-        ));
-        root.querySelector("#add").onclick = function () { showSubkeyModal(null, load); };
-        root.querySelectorAll("[data-edit]").forEach(function (b) {
-          b.onclick = function () { showSubkeyModal(b.getAttribute("data-edit"), load); };
-        });
-        root.querySelectorAll("[data-del]").forEach(function (b) {
-          b.onclick = function () {
-            if (!confirm("确认删除该子 Key？")) return;
-            req("DELETE", "/api/subkeys/" + b.getAttribute("data-del")).then(function () { toast("已删除"); load(); });
-          };
-        });
-        root.querySelectorAll("[data-copy]").forEach(function (el) {
-          el.onclick = function () {
-            navigator.clipboard.writeText(el.getAttribute("data-copy")).then(function () { toast("已复制"); });
-          };
-        });
-      });
-    }
-    load();
-  });
-
-  function showSubkeyModal(id, done) {
-    var isEdit = !!id;
-    Promise.all([req("GET", "/api/models"), req("GET", "/api/accounts")]).then(function (rs) {
-      var models = rs[0], accounts = rs[1];
-      var mopts = models.map(function (m) { return '<label style="display:inline-flex;gap:4px;margin-right:12px"><input type="checkbox" value="' + esc(m.name) + '">' + esc(m.name) + "</label>"; }).join("");
-      var aopts = accounts.map(function (a) { return '<label style="display:inline-flex;gap:4px;margin-right:12px"><input type="checkbox" value="' + esc(a.id) + '">' + esc(a.name) + "</label>"; }).join("");
-      var modal = h(
-        '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>' + (isEdit ? "编辑子 Key" : "新建子 Key") + '</h3><button class="modal-close">×</button></div>' +
-        '<div class="modal-body">' +
-        '<div class="form-item"><label>名称</label><input id="sk-name" placeholder="例如：给团队的 Key"/></div>' +
-        (isEdit ? "" : '<div class="form-item"><label>自定义 Key（留空自动生成 sk-xxx）</label><input id="sk-key" placeholder="sk-..."/></div>') +
-        '<div class="form-item"><label>可访问模型（不勾选 = 全部）</label><div class="form-item" style="max-height:120px;overflow:auto;border:1px solid var(--color-border-2);border-radius:6px;padding:8px;">' + (mopts || '<span class="tag tag-gray">暂无模型</span>') + "</div></div>" +
-        '<div class="form-item"><label>可访问账号（不勾选 = 全部）</label><div class="form-item" style="max-height:120px;overflow:auto;border:1px solid var(--color-border-2);border-radius:6px;padding:8px;">' + (aopts || '<span class="tag tag-gray">暂无账号</span>') + "</div></div>" +
-        '<div class="form-item"><label>当日 Token 限额（0 = 不限）</label><input id="sk-limit" type="number" value="0"/></div>' +
-        '<div class="form-item"><label>当日图像张数限额（0 = 不限）</label><input id="sk-imglimit" type="number" value="0"/></div>' +
-        '</div><div class="modal-foot"><button class="btn btn-outline" id="sk-cancel">取消</button><button class="btn btn-primary" id="sk-save">保存</button></div></div></div>'
-      );
-      document.body.appendChild(modal);
-      function close() { modal.remove(); }
-      modal.querySelector(".modal-close").onclick = close;
-      modal.querySelector("#sk-cancel").onclick = close;
-      modal.addEventListener("click", function (e) { if (e.target === modal) close(); });
-
-      if (isEdit) {
-        req("GET", "/api/subkeys").then(function (subs) {
-          var s = subs.find(function (x) { return x.id === id; });
-          if (!s) return;
-          modal.querySelector("#sk-name").value = s.name;
-          modal.querySelector("#sk-limit").value = s.daily_limit_tokens;
-          modal.querySelector("#sk-imglimit").value = s.daily_limit_images || 0;
-          modal.querySelectorAll('input[type=checkbox]').forEach(function (cb) {
-            var allowed = (cb.value.length > 12 ? s.allowed_accounts : s.allowed_models) || [];
-            cb.checked = allowed.indexOf(cb.value) >= 0;
-          });
-        });
-      }
-
-      modal.querySelector("#sk-save").onclick = function () {
-        var allowedModels = [], allowedAccounts = [];
-        modal.querySelectorAll('input[type=checkbox]:checked').forEach(function (cb) {
-          // 用名称/ID 长度粗分：账号 id 以 acc_ 开头，模型无此前缀。
-          if (cb.value.indexOf("acc_") === 0) allowedAccounts.push(cb.value);
-          else allowedModels.push(cb.value);
-        });
-        var payload = {
-          name: modal.querySelector("#sk-name").value.trim() || "未命名",
-          allowed_models: allowedModels,
-          allowed_accounts: allowedAccounts,
-          daily_limit_tokens: parseInt(modal.querySelector("#sk-limit").value, 10) || 0,
-          daily_limit_images: parseInt(modal.querySelector("#sk-imglimit").value, 10) || 0,
-        };
-        var keyEl = modal.querySelector("#sk-key");
-        if (keyEl && keyEl.value.trim()) payload.key = keyEl.value.trim();
-        var p;
-        if (isEdit) {
-          p = req("PUT", "/api/subkeys/" + id, { name: payload.name, allowed_models: payload.allowed_models, allowed_accounts: payload.allowed_accounts, daily_limit_tokens: payload.daily_limit_tokens, daily_limit_images: payload.daily_limit_images });
-        } else {
-          p = req("POST", "/api/subkeys", payload);
-        }
-        p.then(function (d) {
-          if (d.key) { toast("已创建，Key：" + d.key); } else { toast("已保存"); }
-          close(); done && done();
-        }).catch(function (e) { toast(e.message, false); });
+        .then((rs) => {
+          this.models = rs[0] || []; this.accounts = rs[1] || []; this.eps = rs[2] || [];
+        })
+        .catch((e) => toast(e.message, false));
+    },
+    accName(id) {
+      const a = this.accounts.find((x) => x.id === id);
+      return (a && a.name) || id;
+    },
+    // ── 模型 ──
+    openModel(m) {
+      this.mModal = m ? {
+        name: m.name,
+        form: { type: m.type || "text", display: m.display, description: m.description || "",
+          fallback: (m.fallback || []).join(", "), enabled: m.enabled,
+          price_input: m.price_input || 0, price_output: m.price_output || 0, price_image: m.price_image || 0 },
+      } : {
+        name: null,
+        form: { type: "text", display: "", description: "", fallback: "", enabled: true,
+          price_input: 0, price_output: 0, price_image: 0 },
       };
-    });
-  }
-
-  // ── 请求日志 ──
-  register("logs", function (root) {
-    function load() {
-      req("GET", "/api/logs?limit=300").then(function (logs) {
-        root.innerHTML = "";
-        root.appendChild(h(
-          '<div class="page">' +
-            '<div class="page-title">请求日志</div><div class="page-sub">子 Key 维度的用量与错误记录（不含上游同步）。</div>' +
-            '<div class="toolbar"><button class="btn btn-outline" id="refresh">刷新</button>' +
-            '<button class="btn btn-danger" id="clear">清空日志</button><div class="spacer"></div></div>' +
-            '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>时间</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>耗时</th><th>状态</th><th>错误</th>' +
-            '</tr></thead><tbody>' + (logs.length ? logs.map(function (l) {
-              var fellBack = l.requested_model && l.requested_model !== l.model;
-              var modelCell = fellBack
-                ? '<span class="mono">' + esc(l.requested_model) + '</span> <span class="tag tag-orange" title="fallback">↓</span>'
-                : '<span class="mono">' + esc(l.requested_model || l.model) + '</span>';
-              var realCell = '<span class="mono">' + esc(l.model) + '</span>';
-              return "<tr><td>" + fmtTime(l.ts) + "</td><td>" + esc(l.subkey_name || l.subkey_id) +
-                "</td><td>" + esc(l.account_name || l.account_id) + "</td><td>" + esc(l.provider || "-") + "</td><td>" + modelCell + "</td><td>" + realCell +
-                "</td><td>" + l.prompt_tokens + "</td><td>" + l.completion_tokens + "</td><td>" + l.total_tokens +
-                "</td><td>" + (l.modality === "image" ? (l.image_count || 0) + " 张" : "—") +
-                "</td><td>" + l.latency_ms + "ms</td><td>" + (l.status === "ok" ? '<span class="tag tag-green">OK</span>' : '<span class="tag tag-red">ERR</span>') +
-                "</td><td style='max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)' title='" + esc(l.error) + "'>" + esc(l.error) + "</td></tr>";
-            }).join("") : '<tr><td colspan="13" class="empty">暂无日志</td></tr>') +
-            "</tbody></table></div></div>" +
-          "</div>"
-        ));
-        root.querySelector("#refresh").onclick = load;
-        root.querySelector("#clear").onclick = function () {
-          if (!confirm("确认清空所有日志？")) return;
-          req("DELETE", "/api/logs").then(function () { toast("已清空"); load(); });
-        };
-      });
-    }
-    load();
-  });
-
-  // ── 设置 ──
-  register("settings", function (root) {
-    req("GET", "/api/overview").then(function (d) {
-      var host = location.origin;
-      root.innerHTML = "";
-      root.appendChild(h(
-        '<div class="page">' +
-          '<div class="page-title">使用说明</div><div class="page-sub">把 ArkGate 当作 OpenAI 兼容端点接入你的客户端。</div>' +
-          '<div class="card"><div class="card-head"><div class="card-title">OpenAI 兼容端点</div></div>' +
-          '<div class="kv"><span class="k">Base URL</span><span class="v mono code-copy" data-copy="' + host + '/v1">' + host + "/v1</span></div>" +
-          '<div class="kv"><span class="k">Chat Completions</span><span class="v mono">POST /v1/chat/completions</span></div>' +
-          '<div class="kv"><span class="k">Responses</span><span class="v mono">POST /v1/responses</span></div>' +
-          '<div class="kv"><span class="k">Images Generations</span><span class="v mono">POST /v1/images/generations</span></div>' +
-          '<div class="kv"><span class="k">模型列表</span><span class="v mono">GET /v1/models</span></div>' +
-          "</div>" +
-          '<div class="card"><div class="card-head"><div class="card-title">调用示例</div></div>' +
-          '<pre style="background:var(--color-fill-1);border-radius:8px;padding:16px;overflow:auto;font-size:12px;font-family:ui-monospace,Menlo,monospace">' + esc(
-            'curl ' + host + '/v1/chat/completions \\\n' +
-            '  -H "Authorization: Bearer sk-你的子Key" \\\n' +
-            '  -H "Content-Type: application/json" \\\n' +
-            '  -d \'{\n' +
-            '    "model": "doubao-seed-1-6",\n' +
-            '    "messages": [{"role":"user","content":"你好"}],\n' +
-            '    "stream": false\n' +
-            '  }'
-          ) + "</pre></div>" +
-          '<div class="card"><div class="card-head"><div class="card-title">环境变量</div></div>' +
-          '<div class="kv"><span class="k">ARKGATE_ADDR</span><span class="v mono">监听地址（默认 0.0.0.0:8002）</span></div>' +
-          '<div class="kv"><span class="k">ARKGATE_DATA_DIR</span><span class="v mono">数据目录（默认可执行文件同级）</span></div>' +
-          "</div>" +
-        "</div>"
-      ));
-      root.querySelectorAll("[data-copy]").forEach(function (el) {
-        el.onclick = function () { navigator.clipboard.writeText(el.getAttribute("data-copy")).then(function () { toast("已复制"); }); };
-      });
-    });
-  });
-
-  // ── 路由与外壳 ──
-  var MENU = [
-    { key: "overview", label: "总览", icon: "📊" },
-    { key: "accounts", label: "上游账号", icon: "🏛" },
-    { key: "models", label: "模型映射", icon: "🧩" },
-    { key: "subkeys", label: "子 Key", icon: "🔑" },
-    { key: "logs", label: "请求日志", icon: "📄" },
-    { key: "settings", label: "使用说明", icon: "⚙️" },
-  ];
-
-  var ctx = { view: "overview", main: null };
-
-  function shell() {
-    var nav = MENU.map(function (m) {
-      return '<div class="nav-item' + (ctx.view === m.key ? " active" : "") + '" data-view="' + m.key + '">' +
-        '<span class="ic">' + m.icon + "</span>" + m.label + "</div>";
-    }).join("");
-    var el = h(
-      '<div class="layout"><aside class="sidebar">' +
-        '<div class="logo"><span class="dot"></span>ArkGate<span class="ver">v1.0</span></div>' +
-        '<div class="nav">' + nav + "</div>" +
-      '</aside><main class="main" id="main"></main></div>'
-    );
-    el.querySelectorAll("[data-view]").forEach(function (n) {
-      n.onclick = function () { go(n.getAttribute("data-view")); };
-    });
-    return el;
-  }
-
-  function go(view) {
-    var r = routes[view];
-    if (!r) view = "overview";
-    ctx.view = view;
-    document.getElementById("app").innerHTML = "";
-    document.getElementById("app").appendChild(shell());
-    ctx.main = document.getElementById("main");
-    routes[view].render(ctx.main);
-  }
-
-  function renderLogin() {
-    authStatus().then(function (d) {
-      var doc = document.getElementById("app");
-      doc.innerHTML = "";
-      doc.appendChild(h(
-        '<div class="login-wrap"><div class="login-card">' +
-          '<div class="logo"><span class="dot"></span>ArkGate</div>' +
-          (d.initialized
-            ? '<div class="sub">请输入访问令牌登录</div>'
-            : '<div class="sub">首次使用，请设置访问令牌（至少 6 位）</div>') +
-          '<div class="form-item"><label>访问令牌</label><input id="login-token" placeholder="访问令牌" autofocus/></div>' +
-          '<button class="btn btn-primary" style="width:100%" id="login-btn">' + (d.initialized ? "登录" : "初始化") + "</button>" +
-          "</div></div>"
-      ));
-      var input = doc.querySelector("#login-token");
-      function submit() {
-        var tok = input.value.trim();
-        if (!tok) { toast("请输入令牌", false); return; }
-        var p = d.initialized
-          ? req("POST", "/api/auth/login", { token: tok })
-          : req("POST", "/api/auth/setup", { token: tok });
-        p.then(function (r) {
-          token = tok;
-          localStorage.setItem("arkgate_token", tok);
-          go("overview");
-        }).catch(function (e) { toast(e.message, false); });
+    },
+    saveModel() {
+      const f = this.mModal.form;
+      const name = this.mModal.name;
+      const fallback = f.fallback.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      const payload = {
+        type: f.type, display: f.display.trim() || name, description: f.description.trim(),
+        fallback, enabled: f.enabled,
+        price_input: Number(f.price_input) || 0, price_output: Number(f.price_output) || 0,
+        price_image: Number(f.price_image) || 0,
+      };
+      if (!name) {
+        if (!f.name0 || !f.name0.trim()) { toast("请输入模型名", false); return; }
       }
-      doc.querySelector("#login-btn").onclick = submit;
-      input.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
-    });
-  }
+      const p = name
+        ? req("PUT", "/api/models/" + name, payload)
+        : req("POST", "/api/models", { ...payload, name: (f.name0 || "").trim() });
+      p.then(() => { toast("已保存"); this.mModal = null; this.load(); })
+        .catch((e) => toast(e.message, false));
+    },
+    delModel(m) {
+      if (!confirm("确认删除该模型及其所有映射？")) return;
+      req("DELETE", "/api/models/" + m.name).then(() => { toast("已删除"); this.load(); });
+    },
+    // ── 映射 ──
+    openEp(e) {
+      this.eModal = e ? {
+        id: e.id,
+        form: { account_id: e.account_id, model: e.model, ep: e.ep, enabled: e.enabled,
+          weight: e.weight || 0, max_concurrency: e.max_concurrency || 0,
+          rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0 },
+      } : {
+        id: null,
+        form: { account_id: this.accounts.length ? this.accounts[0].id : "", model: this.models.length ? this.models[0].name : "",
+          ep: "", enabled: true, weight: 0, max_concurrency: 0, rpm_limit: 0, tpm_limit: 0 },
+      };
+    },
+    saveEp() {
+      const f = this.eModal.form;
+      if (!f.account_id || !f.model || !f.ep.trim()) { toast("请完整填写", false); return; }
+      const payload = { account_id: f.account_id, model: f.model, ep: f.ep.trim(), enabled: f.enabled,
+        weight: Number(f.weight) || 0, max_concurrency: Number(f.max_concurrency) || 0,
+        rpm_limit: Number(f.rpm_limit) || 0, tpm_limit: Number(f.tpm_limit) || 0 };
+      const p = this.eModal.id
+        ? req("PUT", "/api/endpoints/" + this.eModal.id, payload)
+        : req("POST", "/api/endpoints", payload);
+      p.then(() => { toast("已保存"); this.eModal = null; this.load(); })
+        .catch((e) => toast(e.message, false));
+    },
+    delEp(e) {
+      if (!confirm("确认删除该映射？")) return;
+      req("DELETE", "/api/endpoints/" + e.id).then(() => { toast("已删除"); this.load(); });
+    },
+  },
+  template: `
+  <div class="page">
+    <div class="page-title">模型映射</div>
+    <div class="toolbar">
+      <button class="btn btn-primary" @click="openModel(null)">+ 新建模型</button>
+      <button class="btn btn-outline" @click="openEp(null)">+ 添加映射</button>
+      <div class="spacer"></div>
+    </div>
+    <div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>
+      <div class="table-wrap"><table><thead><tr>
+        <th>模型名</th><th>类型</th><th>显示名</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody>
+        <tr v-if="!models.length"><td colspan="8" class="empty">暂无模型</td></tr>
+        <tr v-for="m in models" :key="m.name">
+          <td class="mono">{{ m.name }}</td>
+          <td><span :class="m.type==='image' ? 'tag tag-purple' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : '文本' }}</span></td>
+          <td>{{ m.display }}</td>
+          <td class="cost">
+            <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
+            <template v-else-if="m.price_input || m.price_output">{{ fmtCost(m.price_input) }} / {{ fmtCost(m.price_output) }} per 1M</template>
+            <span v-else class="tag tag-gray">未定价</span>
+          </td>
+          <td class="mono">{{ (m.fallback && m.fallback.length) ? m.fallback.join(' → ') : '—' }}</td>
+          <td>{{ m.description }}</td>
+          <td><span :class="m.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ m.enabled ? '启用' : '停用' }}</span></td>
+          <td><div class="row-actions">
+            <button class="btn btn-outline btn-sm" @click="openModel(m)">编辑</button>
+            <button class="btn btn-danger btn-sm" @click="delModel(m)">删除</button>
+          </div></td>
+        </tr>
+      </tbody></table></div></div>
+    <div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控）</div></div>
+      <div class="table-wrap"><table><thead><tr>
+        <th>账号</th><th>模型名</th><th>上游模型 / 接入点</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody>
+        <tr v-if="!eps.length"><td colspan="9" class="empty">暂无映射</td></tr>
+        <tr v-for="e in eps" :key="e.id">
+          <td>{{ accName(e.account_id) }}</td><td class="mono">{{ e.model }}</td><td class="mono">{{ e.ep }}</td>
+          <td>{{ e.weight || '继承' }}</td><td>{{ e.max_concurrency || '不限' }}</td>
+          <td>{{ e.rpm_limit || '不限' }}</td><td>{{ e.tpm_limit || '不限' }}</td>
+          <td><span :class="e.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ e.enabled ? '启用' : '停用' }}</span></td>
+          <td><div class="row-actions">
+            <button class="btn btn-outline btn-sm" @click="openEp(e)">编辑</button>
+            <button class="btn btn-danger btn-sm" @click="delEp(e)">删除</button>
+          </div></td>
+        </tr>
+      </tbody></table></div></div>
 
-  function boot() {
-    var theme = localStorage.getItem("arkgate_theme");
+    <!-- 模型弹窗 -->
+    <div v-if="mModal" class="modal-mask" @click.self="mModal=null">
+      <div class="modal"><div class="modal-head"><h3>{{ mModal.name ? '编辑模型' : '新建模型' }}</h3><button class="modal-close" @click="mModal=null">×</button></div>
+      <div class="modal-body">
+        <div class="form-item"><label>模型名（下游调用用，唯一）<span class="req" v-if="!mModal.name">*</span></label>
+          <input v-if="!mModal.name" v-model="mModal.form.name0" placeholder="例如 doubao-seed-1-6"/>
+          <input v-else :value="mModal.name" disabled/></div>
+        <div class="form-item"><label>类型</label>
+          <select v-model="mModal.form.type">
+            <option value="text">文本（chat / responses）</option>
+            <option value="image">图像（images/generations）</option>
+          </select></div>
+        <div class="form-item"><label>显示名</label><input v-model="mModal.form.display"/></div>
+        <div class="form-row three" v-if="mModal.form.type==='image'">
+          <div class="form-item"><label>图像单价（$ / 张）</label><input v-model="mModal.form.price_image" type="number" step="0.0001"/></div>
+        </div>
+        <div class="form-row" v-else>
+          <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model="mModal.form.price_input" type="number" step="0.0001"/></div>
+          <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model="mModal.form.price_output" type="number" step="0.0001"/></div>
+        </div>
+        <div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型）</label>
+          <input v-model="mModal.form.fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>
+        <div class="form-item"><label>描述</label><input v-model="mModal.form.description"/></div>
+        <div class="form-item"><label>状态</label>
+          <select v-model="mModal.form.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-outline" @click="mModal=null">取消</button>
+        <button class="btn btn-primary" @click="saveModel">保存</button></div>
+      </div></div>
+
+    <!-- 映射弹窗 -->
+    <div v-if="eModal" class="modal-mask" @click.self="eModal=null">
+      <div class="modal"><div class="modal-head"><h3>{{ eModal.id ? '编辑接入点映射' : '添加接入点映射' }}</h3><button class="modal-close" @click="eModal=null">×</button></div>
+      <div class="modal-body">
+        <div class="form-item"><label>账号 <span class="req">*</span></label>
+          <select v-model="eModal.form.account_id"><option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }}</option></select></div>
+        <div class="form-item"><label>模型名 <span class="req">*</span></label>
+          <select v-model="eModal.form.model"><option v-for="m in models" :key="m.name" :value="m.name">{{ m.name }}</option></select></div>
+        <div class="form-item"><label>上游模型 / 接入点 <span class="req">*</span></label>
+          <input v-model="eModal.form.ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/></div>
+        <div class="form-row three">
+          <div class="form-item"><label>权重</label><input v-model="eModal.form.weight" type="number"/></div>
+          <div class="form-item"><label>并发上限</label><input v-model="eModal.form.max_concurrency" type="number"/></div>
+          <div class="form-item"><label>RPM</label><input v-model="eModal.form.rpm_limit" type="number"/></div>
+        </div>
+        <div class="form-item"><label>TPM</label><input v-model="eModal.form.tpm_limit" type="number"/></div>
+        <div class="form-item"><label>状态</label>
+          <select v-model="eModal.form.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-outline" @click="eModal=null">取消</button>
+        <button class="btn btn-primary" @click="saveEp">保存</button></div>
+      </div></div>
+  </div>`,
+};
+
+// ── 子 Key ──
+const SubKeysPage = {
+  components: { CheckGroup },
+  data() {
+    return { subs: [], models: [], accounts: [], modal: null };
+  },
+  mounted() { this.load(); },
+  methods: {
+    load() {
+      Promise.all([req("GET", "/api/subkeys"), req("GET", "/api/models"), req("GET", "/api/accounts")])
+        .then((rs) => { this.subs = rs[0] || []; this.models = rs[1] || []; this.accounts = rs[2] || []; })
+        .catch((e) => toast(e.message, false));
+    },
+    openModal(id) {
+      this.modal = {
+        id,
+        form: { name: "", key: "", allowed_models: [], allowed_accounts: [],
+          daily_limit_tokens: 0, daily_limit_images: 0 },
+      };
+      if (id) {
+        req("GET", "/api/subkeys").then((subs) => {
+          const s = (subs || []).find((x) => x.id === id);
+          if (s) {
+            this.modal.form.name = s.name;
+            this.modal.form.allowed_models = s.allowed_models || [];
+            this.modal.form.allowed_accounts = s.allowed_accounts || [];
+            this.modal.form.daily_limit_tokens = s.daily_limit_tokens;
+            this.modal.form.daily_limit_images = s.daily_limit_images || 0;
+          }
+        });
+      }
+    },
+    save() {
+      const f = this.modal.form;
+      const payload = {
+        name: f.name.trim() || "未命名",
+        allowed_models: f.allowed_models,
+        allowed_accounts: f.allowed_accounts,
+        daily_limit_tokens: Number(f.daily_limit_tokens) || 0,
+        daily_limit_images: Number(f.daily_limit_images) || 0,
+      };
+      let p;
+      if (this.modal.id) {
+        p = req("PUT", "/api/subkeys/" + this.modal.id, payload);
+      } else {
+        if (f.key.trim()) payload.key = f.key.trim();
+        p = req("POST", "/api/subkeys", payload);
+      }
+      p.then((d) => {
+        toast(d && d.key ? "已创建，Key：" + d.key : "已保存");
+        this.modal = null; this.load();
+      }).catch((e) => toast(e.message, false));
+    },
+    del(s) {
+      if (!confirm("确认删除该子 Key？")) return;
+      req("DELETE", "/api/subkeys/" + s.id).then(() => { toast("已删除"); this.load(); });
+    },
+    copy(text) {
+      navigator.clipboard.writeText(text).then(() => toast("已复制"));
+    },
+  },
+  template: `
+  <div class="page">
+    <div class="page-title">子 API Key</div>
+    <div class="toolbar"><button class="btn btn-primary" @click="openModal(null)">+ 新建子 Key</button><div class="spacer"></div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr>
+      <th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token</th><th>图像</th><th>操作</th>
+    </tr></thead><tbody>
+      <tr v-if="!subs.length"><td colspan="8" class="empty">暂无子 Key</td></tr>
+      <tr v-for="s in subs" :key="s.id">
+        <td><strong>{{ s.name || s.id }}</strong></td>
+        <td class="mono"><span class="code-copy" title="点击复制" @click="copy(s.key)">{{ s.key }}</span></td>
+        <td><span :class="s.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ s.enabled ? '启用' : '禁用' }}</span></td>
+        <td>{{ (s.allowed_models && s.allowed_models.length) ? s.allowed_models.join(', ') : '全部' }}</td>
+        <td>{{ s.total_requests }}</td><td>{{ fmtTokens(s.total_tokens) }}</td><td>{{ s.total_images || 0 }}</td>
+        <td><div class="row-actions">
+          <button class="btn btn-outline btn-sm" @click="openModal(s.id)">编辑</button>
+          <button class="btn btn-danger btn-sm" @click="del(s)">删除</button>
+        </div></td>
+      </tr>
+    </tbody></table></div></div>
+
+    <div v-if="modal" class="modal-mask" @click.self="modal=null">
+      <div class="modal"><div class="modal-head"><h3>{{ modal.id ? '编辑子 Key' : '新建子 Key' }}</h3><button class="modal-close" @click="modal=null">×</button></div>
+      <div class="modal-body">
+        <div class="form-item"><label>名称</label><input v-model="modal.form.name" placeholder="例如：给团队的 Key"/></div>
+        <div class="form-item" v-if="!modal.id"><label>自定义 Key（留空自动生成 sk-xxx）</label><input v-model="modal.form.key" placeholder="sk-..."/></div>
+        <div class="form-item"><label>可访问模型（不勾选 = 全部）</label>
+          <CheckGroup :options="models.map(m => ({v: m.name, l: m.name}))" v-model="modal.form.allowed_models"/></div>
+        <div class="form-item"><label>可访问账号（不勾选 = 全部）</label>
+          <CheckGroup :options="accounts.map(a => ({v: a.id, l: a.name}))" v-model="modal.form.allowed_accounts"/></div>
+        <div class="form-item"><label>当日 Token 限额（0 = 不限）</label><input v-model="modal.form.daily_limit_tokens" type="number"/></div>
+        <div class="form-item"><label>当日图像张数限额（0 = 不限）</label><input v-model="modal.form.daily_limit_images" type="number"/></div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-outline" @click="modal=null">取消</button>
+        <button class="btn btn-primary" @click="save">保存</button></div>
+      </div></div>
+  </div>`,
+};
+
+// ── 请求日志 ──
+const LogsPage = {
+  data() { return { logs: [] }; },
+  mounted() { this.load(); },
+  methods: {
+    load() {
+      req("GET", "/api/logs?limit=300").then((d) => { this.logs = d || []; }).catch((e) => toast(e.message, false));
+    },
+    clear() {
+      if (!confirm("确认清空所有日志？")) return;
+      req("DELETE", "/api/logs").then(() => { toast("已清空"); this.load(); });
+    },
+  },
+  template: `
+  <div class="page">
+    <div class="page-title">请求日志</div>
+    <div class="toolbar">
+      <button class="btn btn-outline" @click="load">刷新</button>
+      <button class="btn btn-danger" @click="clear">清空日志</button>
+      <div class="spacer"></div>
+    </div>
+    <div class="card"><div class="table-wrap"><table><thead><tr>
+      <th>时间</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
+    </tr></thead><tbody>
+      <tr v-if="!logs.length"><td colspan="14" class="empty">暂无日志</td></tr>
+      <tr v-for="l in logs" :key="l.id">
+        <td>{{ fmtTime(l.ts) }}</td>
+        <td>{{ l.subkey_name || l.subkey_id }}</td>
+        <td>{{ l.account_name || l.account_id }}</td>
+        <td>{{ l.provider || '-' }}</td>
+        <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="fallback">↓</span></td>
+        <td class="mono">{{ l.model }}</td>
+        <td>{{ l.prompt_tokens }}</td><td>{{ l.completion_tokens }}</td><td>{{ l.total_tokens }}</td>
+        <td>{{ l.modality === 'image' ? (l.image_count || 0) + ' 张' : '—' }}</td>
+        <td class="cost">{{ fmtCost(l.cost) }}</td>
+        <td>{{ l.latency_ms }}ms</td>
+        <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
+      </tr>
+    </tbody></table></div></div>
+  </div>`,
+};
+
+// ── 使用说明 ──
+const HelpPage = {
+  data() { return { host: location.origin }; },
+  methods: { copy(text) { navigator.clipboard.writeText(text).then(() => toast("已复制")); } },
+  template: `
+  <div class="page">
+    <div class="page-title">使用说明</div>
+    <div class="page-sub">把 ArkGate 当作 OpenAI 兼容端点接入你的客户端。</div>
+    <div class="card"><div class="card-head"><div class="card-title">OpenAI 兼容端点</div></div>
+      <div class="kv"><span class="k">Base URL</span><span class="v mono code-copy" @click="copy(host + '/v1')">{{ host }}/v1</span></div>
+      <div class="kv"><span class="k">Chat Completions</span><span class="v mono">POST /v1/chat/completions</span></div>
+      <div class="kv"><span class="k">Responses</span><span class="v mono">POST /v1/responses</span></div>
+      <div class="kv"><span class="k">Images Generations</span><span class="v mono">POST /v1/images/generations</span></div>
+      <div class="kv"><span class="k">模型列表</span><span class="v mono">GET /v1/models</span></div>
+      <div class="kv"><span class="k">子 Key 自助门户</span><span class="v mono">POST /api/portal/overview（Bearer sk-xxx）</span></div>
+    </div>
+    <div class="card"><div class="card-head"><div class="card-title">调用示例</div></div>
+      <pre style="background:var(--color-fill-1);border-radius:8px;padding:16px;overflow:auto;font-size:12px;font-family:ui-monospace,Menlo,monospace">{{ example }}</pre></div>
+    <div class="card"><div class="card-head"><div class="card-title">环境变量</div></div>
+      <div class="kv"><span class="k">ARKGATE_ADDR</span><span class="v mono">监听地址（默认 0.0.0.0:8002）</span></div>
+      <div class="kv"><span class="k">ARKGATE_DATA_DIR</span><span class="v mono">数据目录（默认可执行文件同级）</span></div>
+      <div class="kv"><span class="k">ARKGATE_FIRST_TOKEN_TIMEOUT</span><span class="v mono">流式首字节超时秒数（默认 30，0 关闭；超时换下一叶子重试）</span></div>
+      <div class="kv"><span class="k">ARKGATE_SESSION_TTL</span><span class="v mono">会话粘性 TTL 秒数（默认 300，0 关闭；同子 Key+模型固定路由，利于 prompt cache）</span></div>
+    </div>
+  </div>`,
+  computed: {
+    example() {
+      return "curl " + this.host + "/v1/chat/completions \\\n" +
+        '  -H "Authorization: Bearer sk-你的子Key" \\\n' +
+        '  -H "Content-Type: application/json" \\\n' +
+        "  -d '{\n" +
+        '    "model": "doubao-seed-1-6",\n' +
+        '    "messages": [{"role":"user","content":"你好"}],\n' +
+        '    "stream": false\n' +
+        "  }";
+    },
+  },
+};
+
+// ── 管理端外壳 ──
+const MENU = [
+  { key: "overview", label: "总览", icon: "📊", comp: "OverviewPage" },
+  { key: "accounts", label: "上游账号", icon: "🏛", comp: "AccountsPage" },
+  { key: "models", label: "模型映射", icon: "🧩", comp: "ModelsPage" },
+  { key: "subkeys", label: "子 Key", icon: "🔑", comp: "SubKeysPage" },
+  { key: "logs", label: "请求日志", icon: "📄", comp: "LogsPage" },
+  { key: "settings", label: "使用说明", icon: "⚙️", comp: "HelpPage" },
+];
+
+const AdminShell = {
+  emits: ["logout"],
+  data() { return { view: "overview" }; },
+  methods: {
+    logout() {
+      state.adminToken = "";
+      localStorage.removeItem("arkgate_token");
+      this.$emit("logout");
+    },
+  },
+  template: `
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="logo"><span class="dot"></span>ArkGate<span class="ver">v1.1</span></div>
+      <div class="nav">
+        <div v-for="m in menu" :key="m.key" class="nav-item" :class="{active: view===m.key}" @click="view=m.key">
+          <span class="ic">{{ m.icon }}</span>{{ m.label }}
+        </div>
+      </div>
+      <div style="padding:12px">
+        <button class="btn btn-outline" style="width:100%" @click="logout">退出登录</button>
+      </div>
+    </aside>
+    <main class="main">
+      <component :is="current"></component>
+    </main>
+  </div>`,
+  computed: {
+    menu() { return MENU; },
+    current() {
+      const m = MENU.find((x) => x.key === this.view) || MENU[0];
+      return m.comp;
+    },
+  },
+};
+
+// ── 子 Key 自助门户 ──
+const PortalPage = {
+  emits: ["logout"],
+  data() { return { d: null, busy: false }; },
+  computed: {
+    tokenProgress() {
+      if (!this.d || !this.d.daily_limit_tokens) return null;
+      const p = (this.d.today.tokens / this.d.daily_limit_tokens) * 100;
+      return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
+    },
+    imageProgress() {
+      if (!this.d || !this.d.daily_limit_images) return null;
+      const p = (this.d.today.images / this.d.daily_limit_images) * 100;
+      return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
+    },
+  },
+  mounted() { this.load(); },
+  methods: {
+    load() {
+      this.busy = true;
+      req("GET", "/api/portal/overview", null, { key: state.subKey })
+        .then((d) => { this.d = d; })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.busy = false; });
+    },
+    logout() {
+      state.subKey = "";
+      localStorage.removeItem("arkgate_sk");
+      this.$emit("logout");
+    },
+  },
+  template: `
+  <div>
+    <div class="portal-bar">
+      <div class="logo"><span class="dot"></span>ArkGate 用量门户</div>
+      <div class="row-actions">
+        <span class="tag tag-blue">{{ d && d.name ? d.name : '我的 Key' }}</span>
+        <button class="btn btn-outline btn-sm" @click="load" :disabled="busy">↻ 刷新</button>
+        <button class="btn btn-outline btn-sm" @click="toggleDark">🌓</button>
+        <button class="btn btn-outline btn-sm" @click="logout">退出</button>
+      </div>
+    </div>
+    <div class="page" v-if="d">
+      <div class="stat-row">
+        <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">今日 Tokens</div></div></div>
+        <div class="stat-card"><div class="ic ic-green">⚡</div><div class="body"><div class="v">{{ d.today.requests }}</div><div class="l">今日请求数</div></div></div>
+        <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">今日图像（张）</div></div></div>
+        <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">今日成本</div></div></div>
+        <div class="stat-card"><div class="ic ic-green">✅</div><div class="body"><div class="v">{{ fmtPct(d.success_rate_7d) }}</div><div class="l">7 天成功率</div></div></div>
+      </div>
+
+      <div class="card" v-if="d.daily_limit_tokens || d.daily_limit_images">
+        <div class="card-head"><div class="card-title">今日限额</div></div>
+        <template v-if="d.daily_limit_tokens">
+          <div class="kv"><span class="k">Token 限额</span><span class="v">{{ d.today.tokens }} / {{ fmtTokens(d.daily_limit_tokens) }}</span></div>
+          <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="tokenProgress.cls" :style="{width: tokenProgress.pct + '%'}"></div></div>
+        </template>
+        <template v-if="d.daily_limit_images">
+          <div class="kv"><span class="k">图像张数限额</span><span class="v">{{ d.today.images }} / {{ d.daily_limit_images }}</span></div>
+          <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="imageProgress.cls" :style="{width: imageProgress.pct + '%'}"></div></div>
+        </template>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">累计（自开通以来）与最近 7 天</div></div>
+        <div class="table-wrap"><table><thead><tr><th>范围</th><th>请求</th><th>成功</th><th>Tokens</th><th>图像</th><th>成本</th></tr></thead><tbody>
+          <tr><td>最近 7 天</td><td>{{ d.week.requests }}</td><td>{{ d.week.success }}</td><td>{{ fmtTokens(d.week.tokens) }}</td><td>{{ d.week.images }}</td><td class="cost">{{ fmtCost(d.week.cost) }}</td></tr>
+          <tr><td>累计</td><td>{{ d.total.requests }}</td><td>{{ d.total.success }}</td><td>{{ fmtTokens(d.total.tokens) }}</td><td>{{ d.total.images }}</td><td class="cost">{{ fmtCost(d.total.cost) }}</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">可用模型</div></div>
+        <div class="chips"><span class="chip" v-for="m in d.models" :key="m">{{ m }}</span></div>
+        <div v-if="!d.models.length" class="empty">暂无可用模型</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">最近调用（最多 100 条）</div></div>
+        <div class="table-wrap"><table><thead><tr>
+          <th>时间</th><th>模型</th><th>模态</th><th>输入</th><th>输出</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
+        </tr></thead><tbody>
+          <tr v-if="!d.logs.length"><td colspan="10" class="empty">暂无调用记录</td></tr>
+          <tr v-for="l in d.logs" :key="l.id">
+            <td>{{ fmtTime(l.ts) }}</td>
+            <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="fallback">↓</span></td>
+            <td>{{ l.modality === 'image' ? '图像' : '文本' }}</td>
+            <td>{{ l.prompt_tokens }}</td><td>{{ l.completion_tokens }}</td>
+            <td>{{ l.image_count || '—' }}</td>
+            <td class="cost">{{ fmtCost(l.cost) }}</td>
+            <td>{{ l.latency_ms }}ms</td>
+            <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
+          </tr>
+        </tbody></table></div>
+      </div>
+    </div>
+  </div>`,
+};
+
+// ── 根组件 ──
+const App = {
+  components: { LoginPage, AdminShell, PortalPage },
+  data() { return { mode: "loading" }; },
+  methods: {
+    onAdmin(tok) {
+      state.adminToken = tok;
+      localStorage.setItem("arkgate_token", tok);
+      this.mode = "admin";
+    },
+    onPortal(sk) {
+      state.subKey = sk;
+      localStorage.setItem("arkgate_sk", sk);
+      this.mode = "portal";
+    },
+    logoutAdmin() { state.adminToken = ""; localStorage.removeItem("arkgate_token"); this.mode = "login"; },
+    logoutPortal() { state.subKey = ""; localStorage.removeItem("arkgate_sk"); this.mode = "login"; },
+  },
+  mounted() {
+    const theme = localStorage.getItem("arkgate_theme");
     if (theme) document.documentElement.setAttribute("data-theme", theme);
-    // 未初始化时用 auth/status 判断；有 token 时直接进，由 API 401 兜底。
-    if (!token) {
-      renderLogin();
-      return;
-    }
-    req("GET", "/api/auth/status").then(function (d) {
-      if (!d.initialized) { renderLogin(); return; }
-      req("GET", "/api/overview").then(function () { go("overview"); })
-        .catch(function () { go("overview"); });
-    }).catch(function () { renderLogin(); });
-  }
-
-  // 全局 401 兜底。
-  var _origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    return _origFetch(input, init).then(function (r) {
-      if (r.status === 401 && (String(input).indexOf("/api/") >= 0) && token) {
-        localStorage.removeItem("arkgate_token");
-        token = "";
-        renderLogin();
+    // 401 统一兜底：门户会话与管理会话分别退回登录页。
+    window.__arkgateOn401 = (path) => {
+      if (path && path.indexOf("/api/portal/") === 0) {
+        if (state.subKey) this.logoutPortal();
+      } else if (state.adminToken) {
+        this.logoutAdmin();
       }
-      return r;
+    };
+    // 已有门户会话优先恢复（子 Key 用户通常不持有管理令牌）。
+    const bootPortal = state.subKey
+      ? req("POST", "/api/portal/overview", null, { key: state.subKey }).then(() => true).catch(() => false)
+      : Promise.resolve(false);
+    bootPortal.then((ok) => {
+      if (ok) { this.mode = "portal"; return; }
+      localStorage.removeItem("arkgate_sk");
+      if (state.adminToken) {
+        req("GET", "/api/auth/status", null, { key: state.adminToken })
+          .then((d) => {
+            if (!d.initialized) { this.logoutAdmin(); this.mode = "login"; return; }
+            this.mode = "admin";
+          })
+          .catch(() => { this.mode = "login"; });
+        return;
+      }
+      this.mode = "login";
     });
-  };
+  },
+  template: `
+    <LoginPage v-if="mode==='login'" @admin="onAdmin" @portal="onPortal"/>
+    <AdminShell v-else-if="mode==='admin'" @logout="logoutAdmin"/>
+    <PortalPage v-else-if="mode==='portal'" @logout="logoutPortal"/>
+    <div v-else class="login-wrap"><div class="login-card sub">加载中…</div></div>`,
+};
 
-  document.addEventListener("DOMContentLoaded", boot);
-})();
+const app = createApp(App);
+// 模板表达式只能访问组件实例与全局属性：把工具函数/常量挂到 globalProperties，
+// 模板里的 {{ fmtTokens(..) }}、@click="toggleDark"、v-for="o in capOptions" 才可见。
+app.config.globalProperties.fmtTokens = fmtTokens;
+app.config.globalProperties.fmtTime = fmtTime;
+app.config.globalProperties.fmtCost = fmtCost;
+app.config.globalProperties.fmtPct = fmtPct;
+app.config.globalProperties.toggleDark = toggleDark;
+app.config.globalProperties.capOptions = capOptions;
+app.component("OverviewPage", OverviewPage)
+  .component("AccountsPage", AccountsPage)
+  .component("ModelsPage", ModelsPage)
+  .component("SubKeysPage", SubKeysPage)
+  .component("LogsPage", LogsPage)
+  .component("HelpPage", HelpPage)
+  .mount("#app");
