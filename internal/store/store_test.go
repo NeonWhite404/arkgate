@@ -283,6 +283,114 @@ func TestMigrateFromLegacySchema(t *testing.T) {
 	}
 }
 
+// TestQueryUsage 锁定用量分析聚合：小时/天分桶（本地时区）、维度 facet、
+// 实体过滤、成功计数。
+func TestQueryUsage(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().Unix()
+	mk := func(ts int64, name, sub, acc string, pt, ct int64, ok bool, cost float64) {
+		st := "ok"
+		if !ok {
+			st = "error"
+		}
+		l := modelLog(ts, name, sub, acc, pt, ct, st, cost)
+		if err := s.AddUsageLog(&l); err != nil {
+			t.Fatalf("add log: %v", err)
+		}
+	}
+	mk(now-3600, "m1", "s1", "a1", 100, 50, true, 0.10)
+	mk(now-60, "m2", "s2", "a1", 10, 0, false, 0)
+	mk(now-30, "m1", "s1", "a2", 200, 25, true, 0.20)
+
+	q := UsageQuery{From: now - 86400, To: now, Granularity: "hour"}
+	res, err := s.QueryUsage(q)
+	if err != nil {
+		t.Fatalf("query hour: %v", err)
+	}
+	if res.Summary.Requests != 3 || res.Summary.Success != 2 {
+		t.Fatalf("summary: %+v", res.Summary)
+	}
+	if res.Summary.TotalTokens != 385 || res.Summary.PromptTokens != 310 || res.Summary.CompletionTokens != 75 {
+		t.Fatalf("summary tokens: %+v", res.Summary)
+	}
+	if diff := res.Summary.Cost - 0.30; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("summary cost: %v", res.Summary.Cost)
+	}
+	// 小时桶：now-3600 与 now-30/now-60 至少分属两桶（跨整点时为三桶）。
+	if len(res.Series) < 2 {
+		t.Fatalf("hour series buckets = %d, want >= 2", len(res.Series))
+	}
+	var gotTok int64
+	for _, b := range res.Series {
+		gotTok += b.PromptTokens + b.CompletionTokens
+	}
+	if gotTok != 385 {
+		t.Fatalf("series tokens sum = %d", gotTok)
+
+	}
+	// 天桶：三个时间点落在的不同本地自然日数量。
+	daySet := map[string]bool{}
+	for _, ts := range []int64{now - 3600, now - 60, now - 30} {
+		daySet[time.Unix(ts, 0).Format("2006-01-02")] = true
+	}
+	resD, err := s.QueryUsage(UsageQuery{From: now - 86400, To: now, Granularity: "day"})
+	if err != nil {
+		t.Fatalf("query day: %v", err)
+	}
+	if len(resD.Series) != len(daySet) {
+		t.Fatalf("day buckets = %d, want %d", len(resD.Series), len(daySet))
+	}
+
+	// 模型维度 facet + 实体过滤。
+	resM, err := s.QueryUsage(UsageQuery{From: now - 86400, To: now, Granularity: "day", Dim: "model"})
+	if err != nil {
+		t.Fatalf("query dim: %v", err)
+	}
+	if len(resM.Facets) != 2 {
+		t.Fatalf("model facets = %d, want 2", len(resM.Facets))
+	}
+	if resM.Facets[0].Key != "m1" { // 按 tokens 降序：m1(375) > m2(10)
+		t.Fatalf("facet order: %+v", resM.Facets)
+	}
+	resF, err := s.QueryUsage(UsageQuery{From: now - 86400, To: now, Dim: "subkey", Entity: "s1"})
+	if err != nil {
+		t.Fatalf("query entity: %v", err)
+	}
+	if resF.Summary.Requests != 2 || resF.Summary.Success != 2 || resF.Summary.TotalTokens != 375 {
+		t.Fatalf("entity summary: %+v", resF.Summary)
+	}
+	if len(resF.Facets) == 0 || resF.Facets[0].Key != "s1" {
+		t.Fatalf("entity facets: %+v", resF.Facets)
+	}
+
+	// 非法参数回落：gran/dim 未知时不报错、dim 被清空。
+	resBad, err := s.QueryUsage(UsageQuery{From: now - 86400, To: now, Granularity: "week", Dim: "hack"})
+	if err != nil {
+		t.Fatalf("query bad: %v", err)
+	}
+	if len(resBad.Series) == 0 || len(resBad.Facets) != 0 {
+		t.Fatalf("bad params result: series=%d facets=%d", len(resBad.Series), len(resBad.Facets))
+	}
+}
+
+// modelLog 仅为 TestQueryUsage 服务的构造辅助（返回一条日志）。
+func modelLog(ts int64, name, sub, acc string, pt, ct int64, status string, cost float64) model.UsageLog {
+	return model.UsageLog{
+		TS: ts, SubKeyID: sub, SubKeyName: sub + "-name",
+		AccountID: acc, AccountName: acc + "-name", Provider: "ark",
+		EndpointID: "e-" + acc, EP: "ep-" + acc,
+		RequestedModel: name, Model: name, Modality: "text",
+		PromptTokens: pt, CompletionTokens: ct, TotalTokens: pt + ct,
+		Cost: cost, Status: status,
+	}
+}
+
 // TestSubKeyScopedQueries 锁定门户数据面：按子 Key 的统计与日志聚合，
 // 日志列收窄（不含账号/供应商/接入点），SumCost 全局成本聚合。
 func TestSubKeyScopedQueries(t *testing.T) {

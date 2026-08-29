@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -860,6 +861,177 @@ func (s *Store) ListUsageLogsBySubKey(subkeyID string, limit int) ([]*model.Usag
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+// ─────────────────────────── 用量分析（交互式聚合查询） ───────────────────────────
+
+// UsageQuery 用量分析查询参数。Dim 为空表示只看总量；Entity 为该维度下的键过滤。
+type UsageQuery struct {
+	From, To    int64  // unix 秒闭区间 [From, To]
+	Granularity string // day | hour（其它值回落 day）
+	Dim         string // "" | model | subkey | account | endpoint | provider
+	Entity      string // Dim 的过滤键（facet.Key）
+}
+
+// UsageTotals 聚合总量（成功/失败计数来自 status='ok'）。
+type UsageTotals struct {
+	Requests         int64   `json:"requests"`
+	Success          int64   `json:"success"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Images           int64   `json:"images"`
+	Cost             float64 `json:"cost"`
+}
+
+// UsageBucket 单个时间桶的聚合。
+type UsageBucket struct {
+	Bucket           int64   `json:"bucket"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	Requests         int64   `json:"requests"`
+	Success          int64   `json:"success"`
+	Images           int64   `json:"images"`
+	Cost             float64 `json:"cost"`
+}
+
+// UsageFacet 维度下实体的小计行（供下拉/表格选择实体）。
+type UsageFacet struct {
+	Key              string  `json:"key"`
+	Label            string  `json:"label"`
+	Requests         int64   `json:"requests"`
+	Success          int64   `json:"success"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	Images           int64   `json:"images"`
+	Cost             float64 `json:"cost"`
+}
+
+// UsageQueryResult 一次查询的完整结果：总量 + 时序 + 维度实体列表。
+type UsageQueryResult struct {
+	Summary UsageTotals    `json:"summary"`
+	Series  []*UsageBucket `json:"series"`
+	Facets  []*UsageFacet  `json:"facets"`
+}
+
+// usageDims 分析维度 → (过滤键列, 展示名列)。
+var usageDims = map[string][2]string{
+	"model":    {"model", "model"},
+	"subkey":   {"subkey_id", "subkey_name"},
+	"account":  {"account_id", "account_name"},
+	"endpoint": {"endpoint_id", "ep"},
+	"provider": {"provider", "provider"},
+}
+
+// usageQueryMaxSpan 限制查询区间上限，防止把整张日志表拖进聚合。
+const usageQueryMaxSpan = 92 * 86400
+
+// usageBucketExpr 时间桶表达式：小时桶按 UTC 整点；天桶按本地时区自然日。
+// 时区偏移以整型常量直接内进 SQL（SELECT 与 GROUP BY 会重复出现该表达式，
+// 不能用占位符），值来自 time.Zone，无注入面。
+func usageBucketExpr(gran string) string {
+	if gran == "hour" {
+		return "(ts/3600)*3600"
+	}
+	_, off := time.Now().Zone()
+	return "((ts+" + strconv.Itoa(int(off)) + ")/86400)*86400-" + strconv.Itoa(int(off))
+}
+
+// QueryUsage 聚合 usage_logs 返回总量、按时间粒度的时序，以及维度实体小计。
+// 结果三部分共用同一 WHERE（区间 + 可选实体过滤），前端据此做交互式下钻。
+func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
+	now := nowUnix()
+	if q.To <= 0 || q.To > now {
+		q.To = now
+	}
+	if q.From <= 0 || q.From > q.To {
+		q.From = q.To - 7*86400 + 1
+	}
+	if q.To-q.From > usageQueryMaxSpan {
+		q.From = q.To - usageQueryMaxSpan
+	}
+	if q.Granularity != "hour" && q.Granularity != "day" {
+		q.Granularity = "day"
+	}
+	dim, dimOK := usageDims[q.Dim]
+	if !dimOK {
+		q.Dim, q.Entity = "", ""
+	}
+
+	where := "ts >= ? AND ts <= ?"
+	whereArgs := []any{q.From, q.To}
+	if q.Entity != "" {
+		where += " AND " + dim[0] + " = ?"
+		whereArgs = append(whereArgs, q.Entity)
+	}
+
+	res := &UsageQueryResult{Series: []*UsageBucket{}, Facets: []*UsageFacet{}}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 1) 总量。
+	row := s.db.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+			COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
+		FROM usage_logs WHERE `+where, whereArgs...)
+	if err := row.Scan(&res.Summary.Requests, &res.Summary.Success,
+		&res.Summary.PromptTokens, &res.Summary.CompletionTokens,
+		&res.Summary.TotalTokens, &res.Summary.Images, &res.Summary.Cost); err != nil {
+		return nil, err
+	}
+
+	// 2) 时序。
+	bucketExpr := usageBucketExpr(q.Granularity)
+	rows, err := s.db.Query(`SELECT `+bucketExpr+`,
+			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+			COUNT(*), COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
+		FROM usage_logs WHERE `+where+` GROUP BY `+bucketExpr+` ORDER BY 1 ASC`, whereArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		b := &UsageBucket{}
+		if err := rows.Scan(&b.Bucket, &b.PromptTokens, &b.CompletionTokens,
+			&b.Requests, &b.Success, &b.Images, &b.Cost); err != nil {
+			return nil, err
+		}
+		res.Series = append(res.Series, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 3) 维度实体小计（供前端实体下拉/表格）。
+	if dimOK {
+		frows, err := s.db.Query(`SELECT `+dim[0]+`, `+dim[1]+`,
+				COUNT(*), COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
+				COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+				COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
+			FROM usage_logs WHERE ts >= ? AND ts <= ?
+			GROUP BY `+dim[0]+`, `+dim[1]+`
+			ORDER BY SUM(total_tokens) DESC, SUM(image_count) DESC
+			LIMIT 200`, q.From, q.To)
+		if err != nil {
+			return nil, err
+		}
+		defer frows.Close()
+		for frows.Next() {
+			f := &UsageFacet{}
+			if err := frows.Scan(&f.Key, &f.Label, &f.Requests, &f.Success,
+				&f.PromptTokens, &f.CompletionTokens, &f.TotalTokens, &f.Images, &f.Cost); err != nil {
+				return nil, err
+			}
+			res.Facets = append(res.Facets, f)
+		}
+		if err := frows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
 }
 
 // ─────────────────────────── Settings ───────────────────────────

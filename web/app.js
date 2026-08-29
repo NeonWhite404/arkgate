@@ -38,6 +38,15 @@ function fmtInt(v) {
   v = Number(v || 0);
   return v >= 100 ? fmtTokens(v) : String(Math.round(v));
 }
+function dayLabel(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n) => (n < 10 ? "0" : "") + n;
+  return p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+function toDateInput(d) {
+  const p = (n) => (n < 10 ? "0" : "") + n;
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
 function fmtPct(x) {
   return Number(x || 0).toFixed(1) + "%";
 }
@@ -344,8 +353,12 @@ function renderStackedTokenChart(series) {
 }
 
 // 通用单系列柱状图：points [{t, ...}]，取值与格式化由调用方注入（成本/请求趋势共用）。
-function renderBarChart(points, pick, color, format) {
+// labelFn 缺省用小时标签；天粒度图表传 dayLabel。
+function renderBarChart(points, pick, color, format, labelFn) {
+  labelFn = labelFn || hourLabel;
   if (!points || !points.length) return '<div class="empty">暂无数据</div>';
+  // 时间字段兼容两种形态：总览 hourly 用 .t，用量分析桶用 .bucket。
+  const tf = (p) => (p.t !== undefined ? p.t : p.bucket);
   const W = 400, H = 190, padL = 44, padR = 8, padT = 10, padB = 24;
   const vals = points.map(pick);
   const maxV = Math.max(...vals, 1);
@@ -367,14 +380,67 @@ function renderBarChart(points, pick, color, format) {
     const h = Math.max(v > 0 ? 2 : 0, plotH * (v / maxV));
     const x = xOf(i) - barW / 2;
     const y = H - padB - h;
-    svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h + '" rx="2" fill="' + color + '" opacity="0.9"><title>' + hourLabel(p.t) + ' · ' + format(v) + '</title></rect>';
+    svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h + '" rx="2" fill="' + color + '" opacity="0.9"><title>' + labelFn(tf(p)) + ' · ' + format(v) + '</title></rect>';
   });
   const step = Math.max(1, Math.floor(n / 6));
   for (let k = 0; k < n; k += step) {
-    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + hourLabel(points[k].t) + '</text>';
+    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + labelFn(tf(points[k])) + '</text>';
   }
   svg += "</svg>";
   return svg;
+}
+
+// 双系列堆叠柱状图（用量分析：输入/输出 tokens 按时间桶堆叠）。
+function renderStackedBarChart(points, pickA, pickB, colorA, colorB, nameA, nameB, fmt, labelFn) {
+  if (!points || !points.length) return '<div class="empty">暂无数据</div>';
+  const W = 820, H = 240, padL = 56, padR = 12, padT = 12, padB = 28;
+  const plotH = H - padT - padB;
+  const n = points.length;
+  const maxV = Math.max(...points.map((p) => pickA(p) + pickB(p)), 1);
+  const barW = Math.max(2, Math.min(Math.floor((W - padL - padR) / n) - 2, Math.floor((W - padL - padR) / 3)));
+  const xOf = (i) => padL + (n > 1 ? (i * (W - padL - padR)) / (n - 1) : (W - padL - padR) / 2);
+
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + plotH * (g / 4);
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="9" fill="#86909c" text-anchor="end">' + fmt(maxV * (1 - g / 4)) + '</text>';
+  }
+  points.forEach((p, i) => {
+    const a = pickA(p), b = pickB(p);
+    const ha = plotH * (a / maxV);
+    const hb = plotH * (b / maxV);
+    const x = xOf(i) - barW / 2;
+    if (a > 0) {
+      svg += '<rect x="' + x + '" y="' + (H - padB - ha) + '" width="' + barW + '" height="' + Math.max(1, ha) + '" rx="2" fill="' + colorA + '" opacity="0.9"><title>' + labelFn(p.bucket) + ' · ' + nameA + ': ' + fmt(a) + '</title></rect>';
+    }
+    if (b > 0) {
+      svg += '<rect x="' + x + '" y="' + (H - padB - ha - hb) + '" width="' + barW + '" height="' + Math.max(1, hb) + '" rx="2" fill="' + colorB + '" opacity="0.9"><title>' + labelFn(p.bucket) + ' · ' + nameB + ': ' + fmt(b) + '</title></rect>';
+    }
+  });
+  const step = Math.max(1, Math.floor(n / 8));
+  for (let k = 0; k < n; k += step) {
+    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + labelFn(points[k].bucket) + '</text>';
+  }
+  svg += "</svg>";
+  const leg = '<div class="chart-legend"><span class="leg-item"><span class="leg-swatch" style="background:' + colorA + '"></span>' + nameA +
+    '</span><span class="leg-item"><span class="leg-swatch" style="background:' + colorB + '"></span>' + nameB + "</span></div>";
+  return svg + leg;
+}
+
+// 用量分析图：按指标切换单系列/堆叠，按粒度切换 X 轴标签。
+function renderUsageChart(buckets, gran, metric) {
+  const labelFn = gran === "hour" ? hourLabel : dayLabel;
+  if (!buckets || !buckets.length) return '<div class="empty">所选区间暂无数据</div>';
+  if (metric === "cost") {
+    return renderBarChart(buckets, (b) => b.cost, "#f59e0b", fmtCost, labelFn);
+  }
+  if (metric === "requests") {
+    return renderBarChart(buckets, (b) => b.requests, "#3b82f6", fmtInt, labelFn);
+  }
+  return renderStackedBarChart(buckets,
+    (b) => b.prompt_tokens, (b) => b.completion_tokens,
+    "#3b82f6", "#10b981", "输入 tokens", "输出 tokens", fmtTokens, labelFn);
 }
 
 function hourLabel(ts) {
@@ -827,6 +893,145 @@ const LogsPage = {
   </div>`,
 };
 
+// ── 用量分析（对齐火山方舟「用量统计」交互：区间 + 粒度 + 维度下钻） ──
+const USAGE_DIMS = [
+  { v: "", label: "全部" },
+  { v: "model", label: "模型" },
+  { v: "subkey", label: "子 Key" },
+  { v: "account", label: "账号" },
+  { v: "endpoint", label: "接入点" },
+  { v: "provider", label: "供应商" },
+];
+
+const UsagePage = {
+  data() {
+    return {
+      from: toDateInput(new Date(Date.now() - 6 * 86400000)),
+      to: toDateInput(new Date()),
+      gran: "day",
+      dim: "",
+      entity: "",
+      metric: "tokens",
+      dims: USAGE_DIMS,
+      metrics: [
+        { v: "tokens", label: "Token" },
+        { v: "cost", label: "费用" },
+        { v: "requests", label: "次数" },
+      ],
+      r: null,
+      loading: false,
+    };
+  },
+  computed: {
+    summary() { return (this.r && this.r.summary) || {}; },
+    facets() { return (this.r && this.r.facets) || []; },
+    buckets() { return (this.r && this.r.series) || []; },
+    successRate() {
+      const s = this.summary;
+      return s.requests ? fmtPct((s.success / s.requests) * 100) : "—";
+    },
+    successRateCls() {
+      const s = this.summary;
+      if (!s.requests) return "ic-gray";
+      const p = (s.success / s.requests) * 100;
+      return p >= 99 ? "ic-green" : p >= 90 ? "ic-orange" : "ic-red";
+    },
+    dimLabel() {
+      const d = USAGE_DIMS.find((x) => x.v === this.dim);
+      return d ? d.label : "";
+    },
+    entityLabel() {
+      if (!this.entity) return "全部";
+      const f = this.facets.find((x) => x.key === this.entity);
+      return (f && f.label) || this.entity;
+    },
+    chartTitle() { return { tokens: "Token 用量", cost: "费用", requests: "调用次数" }[this.metric]; },
+    chartUnit() { return { tokens: "tokens", cost: "USD", requests: "次" }[this.metric]; },
+    chartHtml() { return renderUsageChart(this.buckets, this.gran, this.metric); },
+  },
+  mounted() { this.load(); },
+  methods: {
+    load() {
+      this.loading = true;
+      const from = Math.floor(new Date(this.from + "T00:00:00").getTime() / 1000);
+      const to = Math.floor(new Date(this.to + "T23:59:59").getTime() / 1000);
+      req("GET", "/api/usage/stats?from=" + from + "&to=" + to +
+        "&gran=" + this.gran + "&dim=" + this.dim + "&entity=" + encodeURIComponent(this.entity))
+        .then((d) => { this.r = d; })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.loading = false; });
+    },
+    onDimChange() { this.entity = ""; this.load(); },
+    pick(key) {
+      this.entity = this.entity === key ? "" : key;
+      this.load();
+    },
+    rateOf(s) { return s && s.requests ? fmtPct((s.success / s.requests) * 100) : "—"; },
+  },
+  template: `
+  <div class="page">
+    <div class="page-head">
+      <div class="page-title" style="margin:0">用量分析</div>
+      <div class="row-actions">
+        <button class="btn btn-outline btn-sm" @click="load" :disabled="loading">↻ 刷新</button>
+        <button class="btn btn-outline btn-sm" @click="toggleDark">🌓</button>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <input type="date" v-model="from" style="width:150px" @change="load"/>
+      <span style="color:var(--color-text-3)">~</span>
+      <input type="date" v-model="to" style="width:150px" @change="load"/>
+      <div class="seg">
+        <div class="seg-item" :class="{active: gran==='day'}" @click="gran='day'; load()">天</div>
+        <div class="seg-item" :class="{active: gran==='hour'}" @click="gran='hour'; load()">小时</div>
+      </div>
+      <select v-model="dim" style="width:140px" @change="onDimChange">
+        <option v-for="d in dims" :key="d.v" :value="d.v">{{ d.label }}</option>
+      </select>
+      <select v-if="dim" v-model="entity" style="width:230px" @change="load">
+        <option value="">全部</option>
+        <option v-for="f in facets" :key="f.key" :value="f.key">{{ f.label }}</option>
+      </select>
+      <div class="seg">
+        <div class="seg-item" v-for="m in metrics" :key="m.v" :class="{active: metric===m.v}" @click="metric=m.v; load()">{{ m.label }}</div>
+      </div>
+    </div>
+
+    <div class="stat-row">
+      <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ summary.requests || 0 }}</div><div class="l">调用次数</div></div></div>
+      <div class="stat-card"><div class="ic" :class="successRateCls">✓</div><div class="body"><div class="v">{{ successRate }}</div><div class="l">成功率</div></div></div>
+      <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(summary.total_tokens) }}</div><div class="l">总 Tokens</div></div></div>
+      <div class="stat-card"><div class="ic ic-green">↓</div><div class="body"><div class="v">{{ fmtTokens(summary.prompt_tokens) }}</div><div class="l">输入 Tokens</div></div></div>
+      <div class="stat-card"><div class="ic ic-purple">↑</div><div class="body"><div class="v">{{ fmtTokens(summary.completion_tokens) }}</div><div class="l">输出 Tokens</div></div></div>
+      <div class="stat-card"><div class="ic ic-orange">🖼</div><div class="body"><div class="v">{{ summary.images || 0 }}</div><div class="l">图像（张）</div></div></div>
+      <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(summary.cost) }}</div><div class="l">费用</div></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="card-title">{{ chartTitle }}（{{ chartUnit }}） · {{ dimLabel }}<template v-if="dim">：{{ entityLabel }}</template> · 按{{ gran === 'hour' ? '小时' : '天' }}</div></div>
+      <div class="chart-wrap" v-html="chartHtml"></div>
+    </div>
+
+    <div class="card" v-if="dim">
+      <div class="card-head"><div class="card-title">{{ dimLabel }}拆分（点击行下钻，再点取消）</div></div>
+      <div class="table-wrap"><table><thead><tr>
+        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th>Tokens</th><th>图像</th><th>成本</th>
+      </tr></thead><tbody>
+        <tr class="clickable" :class="{selected: entity===''}" @click="pick('')">
+          <td>全部</td><td>{{ summary.requests || 0 }}</td><td>{{ successRate }}</td>
+          <td>{{ fmtTokens(summary.total_tokens) }}</td><td>{{ summary.images || '—' }}</td><td class="cost">{{ fmtCost(summary.cost) }}</td>
+        </tr>
+        <tr v-for="f in facets" :key="f.key" class="clickable" :class="{selected: entity===f.key}" @click="pick(f.key)">
+          <td class="mono">{{ f.label }}</td><td>{{ f.requests }}</td><td>{{ rateOf(f) }}</td>
+          <td>{{ fmtTokens(f.total_tokens) }}</td><td>{{ f.images || '—' }}</td><td class="cost">{{ fmtCost(f.cost) }}</td>
+        </tr>
+        <tr v-if="!facets.length"><td colspan="6" class="empty">所选区间暂无数据</td></tr>
+      </tbody></table></div>
+    </div>
+  </div>`,
+};
+
 // ── 使用说明 ──
 const HelpPage = {
   data() { return { host: location.origin }; },
@@ -869,6 +1074,7 @@ const HelpPage = {
 // ── 管理端外壳 ──
 const MENU = [
   { key: "overview", label: "总览", icon: "📊", comp: "OverviewPage" },
+  { key: "usage", label: "用量分析", icon: "📈", comp: "UsagePage" },
   { key: "accounts", label: "上游账号", icon: "🏛", comp: "AccountsPage" },
   { key: "models", label: "模型映射", icon: "🧩", comp: "ModelsPage" },
   { key: "subkeys", label: "子 Key", icon: "🔑", comp: "SubKeysPage" },
@@ -1077,6 +1283,7 @@ app.config.globalProperties.fmtPct = fmtPct;
 app.config.globalProperties.toggleDark = toggleDark;
 app.config.globalProperties.capOptions = capOptions;
 app.component("OverviewPage", OverviewPage)
+  .component("UsagePage", UsagePage)
   .component("AccountsPage", AccountsPage)
   .component("ModelsPage", ModelsPage)
   .component("SubKeysPage", SubKeysPage)

@@ -112,8 +112,37 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/stats", a.handleStats)
 	reg("/api/overview", a.handleOverview)
 	reg("/api/usage/series", a.handleUsageSeries)
+	reg("/api/usage/stats", a.handleUsageStats)
 
 	return mux
+}
+
+// handleUsageStats 交互式用量分析查询：区间 + 粒度（day/hour）+ 维度（模型/子Key/
+// 账号/接入点/供应商）+ 实体过滤，一次返回总量、时序与维度实体小计（对齐火山方舟
+// 「用量统计」的交互形态）。
+func (a *Admin) handleUsageStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	qv := r.URL.Query()
+	toInt := func(key string) int64 {
+		n, _ := strconv.ParseInt(qv.Get(key), 10, 64)
+		return n
+	}
+	q := store.UsageQuery{
+		From:        toInt("from"),
+		To:          toInt("to"),
+		Granularity: qv.Get("gran"),
+		Dim:         qv.Get("dim"),
+		Entity:      qv.Get("entity"),
+	}
+	res, err := a.store.QueryUsage(q)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, res)
 }
 
 func bearer(r *http.Request) string {

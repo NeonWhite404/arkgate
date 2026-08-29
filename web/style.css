@@ -96,6 +96,7 @@ a { color: rgb(var(--primary-6)); text-decoration: none; }
 .ic-orange { background: linear-gradient(135deg, #ff7d00, #f7ba1e); }
 .ic-red { background: linear-gradient(135deg, #f53f3f, #cb2634); }
 .ic-purple { background: linear-gradient(135deg, #722ed1, #9254de); }
+.ic-gray { background: linear-gradient(135deg, #86909c, #a9aeb8); }
 .stat-card .v { font-size: 22px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
 .stat-card .l { font-size: 12px; color: var(--color-text-3); margin-top: 2px; }
 .stat-card .body { min-width: 0; }
@@ -240,6 +241,17 @@ input::placeholder, textarea::placeholder { color: var(--color-text-3); }
 .hbar-track { height: 14px; background: var(--color-fill-1); border-radius: 4px; overflow: hidden; }
 .hbar-fill { height: 100%; border-radius: 4px; background: rgb(var(--primary-6)); min-width: 2px; }
 .hbar-val { font-size: 12px; color: var(--color-text-3); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 分段切换控件（天/小时、指标） */
+.seg { display: inline-flex; background: var(--color-fill-1); border-radius: 6px; padding: 2px; gap: 2px; }
+.seg .seg-item { padding: 5px 14px; font-size: 13px; border-radius: 5px; cursor: pointer;
+  color: var(--color-text-2); user-select: none; white-space: nowrap; }
+.seg .seg-item.active { background: var(--color-bg-1); color: rgb(var(--primary-6));
+  font-weight: 600; box-shadow: var(--shadow-card); }
+
+/* 用量分析：实体拆分行可点击下钻 */
+tr.clickable { cursor: pointer; }
+tr.clickable.selected td { background: rgba(var(--primary-6), .08); }
 
 @media (max-width: 768px) {
   .sidebar { display: none; }
