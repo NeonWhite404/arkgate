@@ -1,15 +1,18 @@
 // Package model 定义 ArkGate 的核心数据结构，供各包共享。
 //
 // 拓扑：树状结构。
-//   - 叶节点 = 接入点 Endpoint（账号 × 真实 ep-xxx，服务某个易读模型名）。
+//   - 叶节点 = 接入点 Endpoint（账号 × 上游模型标识，服务某个易读模型名）。
 //     限流（并发/RPM/TPM）与熔断均只落在叶节点上。
-//   - 父节点 = 账号 Account（火山方舟账号，持有长效 API Key）。
+//   - 父节点 = 账号 Account（某供应商的账号，持有一条不透明的上游 API Key）。
 //     账号不单独限流、不单独熔断；只有 active/disabled 状态 + 统计聚合，
 //     管理员可从账号视角查看其下所有接入点的汇总统计。
 //
 // 路由语义：客户端用自己的子 Key + 想请求的易读模型名；网关在该模型名对应的
-// 所有「叶节点（ep 接入点）」里做加权轮询，命中一个叶子后替换子 Key → 账号真实
-// Key，并把 model 换成真实 ep-xxx 转发。
+// 所有「叶节点」里做加权轮询，命中一个叶子后替换子 Key → 账号真实 Key，
+// 并把 model 换成该叶子的上游模型标识转发。
+//
+// 不透明字符串原则：上游 API Key 与模型标识（Endpoint.EP）都是任意字符串——
+// 不校验前缀、不归一化、不推断类型（ep- 只是 Ark 平台的生成规则，网关不识别）。
 package model
 
 import "time"
@@ -18,6 +21,12 @@ import "time"
 const (
 	AccountActive   = "active"
 	AccountDisabled = "disabled"
+)
+
+// 模型类型
+const (
+	ModelTypeText  = "text"
+	ModelTypeImage = "image"
 )
 
 // 熔断与冷却相关常量。
@@ -29,18 +38,25 @@ const (
 	CircuitCooldownMax  = 60 * time.Second
 )
 
-// Account 对应一个火山方舟账号（含其长效 API Key）。
-// 真正请求火山时，网关用该 Key 替换下游传来的子 Key。
+// Account 对应一个上游供应商账号（含其 API Key）。
+// 真正请求上游时，网关用该 Key 替换下游传来的子 Key。
 // 账号自身不参与流控与熔断；仅提供 active/disabled 开关 + 统计聚合。
 type Account struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
-	ArkAPIKeyEnc string `json:"-"`        // 加密后的 API Key，不外发
-	KeyHint      string `json:"key_hint"` // 末 4 位，用于 UI 展示
-	Status       string `json:"status"`   // active | disabled
-	Weight       int    `json:"weight"`   // 账号级默认权重（其下叶节点 weight=0 时回落到此）
+	Provider     string `json:"provider"`      // 供应商 id（ark | openai | custom…），默认 ark
+	BaseURL      string `json:"base_url"`      // 覆盖 provider 默认 base；custom 必填
+	ArkAPIKeyEnc string `json:"-"`             // 加密后的 API Key（不透明字符串），不外发
+	KeyHint      string `json:"key_hint"`      // 末 4 位，用于 UI 展示
+	Status       string `json:"status"`        // active | disabled
+	Weight       int    `json:"weight"`        // 账号级默认权重（其下叶节点 weight=0 时回落到此）
 	CreatedAt    int64  `json:"created_at"`
 	LastUsedAt   int64  `json:"last_used_at"`
+
+	// 能力覆盖（三态）：0 继承 provider 默认（Go 零值即继承），1 强制是，-1 强制否。
+	// custom 等方言服务器的 responses/images 能力参差，需要账号级纠偏。
+	CapResponses int `json:"cap_responses"`
+	CapImages    int `json:"cap_images"`
 
 	// 累计统计（聚合其下所有接入点，用于「从账号视角」管理）
 	TotalRequests    int64 `json:"total_requests"`
@@ -49,13 +65,16 @@ type Account struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	TotalImages      int64 `json:"total_images"`
 }
 
 // Model 易读模型名目录（下游看到的名字，例如 doubao-seed-1-6）。
-// Fallback 是该模型在所有账号都不可用时的有序 fallback 链：
-// 请求该模型 → 若所有 {账号, ep} 元组均不可用 → 按顺序尝试 Fallback 里的模型。
+// Type 区分文本/图像：图像模型只能被 /v1/images/generations 调用，反之亦然。
+// Fallback 是该模型在所有账号都不可用时的有序 fallback 链（仅限同 Type）：
+// 请求该模型 → 若所有 {账号, 模型标识} 元组均不可用 → 按顺序尝试 Fallback 里的模型。
 type Model struct {
 	Name        string   `json:"name"`
+	Type        string   `json:"type"` // text | image（默认 text）
 	Display     string   `json:"display"`
 	Description string   `json:"description"`
 	Enabled     bool     `json:"enabled"`
@@ -63,13 +82,14 @@ type Model struct {
 	CreatedAt   int64    `json:"created_at"`
 }
 
-// Endpoint 是树上的叶节点：账号（父）× 真实接入点 ep-xxx，服务某个易读模型名。
+// Endpoint 是树上的叶节点：账号（父）× 上游模型标识 EP，服务某个易读模型名。
 // 限流（并发/RPM/TPM）与熔断都落在这一层，是最小的流控与路由单元。
+// EP 是不透明字符串：Ark 的 ep-xxx、OpenAI 的 gpt-4o 等都放这里。
 type Endpoint struct {
 	ID        string `json:"id"`
 	AccountID string `json:"account_id"` // 父节点
 	Model     string `json:"model"`      // 易读模型名
-	EP        string `json:"ep"`         // 真实 ep-xxx 或火山 Model ID
+	EP        string `json:"ep"`         // 上游模型标识 / 接入点（不透明字符串）
 	Enabled   bool   `json:"enabled"`
 	CreatedAt int64  `json:"created_at"`
 
@@ -77,7 +97,7 @@ type Endpoint struct {
 	Weight         int   `json:"weight"` // 0 = 继承账号权重
 	MaxConcurrency int   `json:"max_concurrency"`
 	RPMLimit       int   `json:"rpm_limit"`
-	TPMLimit       int64 `json:"tpm_limit"`
+	TPMLimit       int64 `json:"tpm_limit"` // 文本=tokens/min；图像=张/min
 
 	// 叶节点级累计统计
 	LastUsedAt       int64 `json:"last_used_at"`
@@ -87,13 +107,12 @@ type Endpoint struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	TotalImages      int64 `json:"total_images"`
 
 	// 运行时状态（仅内存，由 balancer 维护；json 不直接暴露内部窗口）
 	Runtime *EndpointRuntime `json:"-"`
 	// 快照用：序列化时暴露给管理 UI 的运行态概要。
 	RuntimeInfo *EndpointRuntimeInfo `json:"runtime,omitempty"`
-	// Synthetic 标记「透传合成的临时叶子」（非持久化，无 ep_ ID）。
-	Synthetic bool `json:"-"`
 }
 
 // EndpointRuntime 叶节点运行时状态：并发计数、熔断、RPM/TPM 窗口。
@@ -145,11 +164,13 @@ type SubKey struct {
 	AllowedModels    []string `json:"allowed_models"`     // 空 = 全部
 	AllowedAccounts  []string `json:"allowed_accounts"`   // 空 = 全部
 	DailyLimitTokens int64    `json:"daily_limit_tokens"` // 0 = 不限
+	DailyLimitImages int64    `json:"daily_limit_images"` // 0 = 不限
 	ExpiresAt        int64    `json:"expires_at"`
 	CreatedAt        int64    `json:"created_at"`
 	LastUsedAt       int64    `json:"last_used_at"`
 	TotalRequests    int64    `json:"total_requests"`
 	TotalTokens      int64    `json:"total_tokens"`
+	TotalImages      int64    `json:"total_images"`
 }
 
 // UsageLog 单次请求日志（用于管理页日志列表）。
@@ -160,13 +181,16 @@ type UsageLog struct {
 	SubKeyName       string `json:"subkey_name"`
 	AccountID        string `json:"account_id"`
 	AccountName      string `json:"account_name"`
+	Provider         string `json:"provider"`        // 命中账号的供应商
 	EndpointID       string `json:"endpoint_id"`
-	EP               string `json:"ep"`              // 真实调用到火山的 ep-xxx（或 Model ID）
+	EP               string `json:"ep"`              // 实际调用的上游模型标识
 	RequestedModel   string `json:"requested_model"` // 客户端请求的模型名
 	Model            string `json:"model"`           // 实际路由到的模型名（fallback 后）
+	Modality         string `json:"modality"`        // text | image
 	PromptTokens     int64  `json:"prompt_tokens"`
 	CompletionTokens int64  `json:"completion_tokens"`
 	TotalTokens      int64  `json:"total_tokens"`
+	ImageCount       int64  `json:"image_count"`
 	Status           string `json:"status"` // ok | error
 	LatencyMs        int64  `json:"latency_ms"`
 	Error            string `json:"error"`

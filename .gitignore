@@ -1,7 +1,13 @@
-
-# test
+# 构建产物
 arkgate
+arkgate.exe
+
+# 运行时数据
 arkgate.db
 arkgate.db-shm
 arkgate.db-wal
 secret.key
+
+# AI slop
+AGENTS.md
+docs/

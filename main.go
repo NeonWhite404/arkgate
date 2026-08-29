@@ -67,10 +67,10 @@ func main() {
 
 	// 端口占用时自动向后寻找可用端口，最多尝试 100 个。
 	ln, addr := listenWithFallback(cfg.ListenAddr, 100)
-	log.Printf("ArkGate 启动: http://%s", addr)
-	log.Printf("  - OpenAI 兼容端点: /v1/chat/completions /v1/models")
+	// 用监听器实际地址打印（含 ARKGATE_ADDR=:0 这类随机端口场景）。
+	log.Printf("ArkGate 启动: http://%s", ln.Addr().String())
+	log.Printf("  - OpenAI 兼容端点: /v1/chat/completions /v1/responses /v1/images/generations /v1/models")
 	log.Printf("  - 管理界面:       /")
-	log.Printf("  - 火山上游:       %s", cfg.ArkBaseURL)
 	log.Printf("  - 数据目录:       %s", cfg.DataDir)
 
 	srv := &http.Server{

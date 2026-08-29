@@ -1,7 +1,7 @@
 // Package balancer 实现多账号负载均衡。
 //
 // 拓扑：树状结构。
-//   - 叶节点 = 接入点 Endpoint（账号 × 真实 ep）。限流（并发/RPM/TPM）与熔断只落在叶节点。
+//   - 叶节点 = 接入点 Endpoint（账号 × 上游模型标识）。限流（并发/RPM/TPM）与熔断只落在叶节点。
 //   - 父节点 = 账号 Account。不做流控、不做熔断，只提供 active/disabled 开关与统计聚合。
 //
 // 并发模型：
@@ -11,10 +11,14 @@
 //   - 用量统计与日志经有界 channel 的「阻塞投递」落库（背压）——不丢弃，避免子 Key 日限额被绕过。
 //
 // 路由决策（Select）：
-//  1. 客户端给出易读模型名 model + 账号白名单 allowed + 排除集 exclude；
-//  2. 收集「model」下所有可用叶节点（账号 active、叶 enabled、未熔断、未超并发/RPM/TPM）；
+//  1. 客户端给出易读模型名 model + 账号白名单 allowed + 排除集 exclude + 目标 API；
+//  2. 收集「model」下所有可用叶节点（账号 active、叶 enabled、账号对该 API 有能力、
+//     未熔断、未超并发/RPM/TPM）；
 //  3. 在候选叶节点上做平滑加权轮询（权重：叶.weight > 账号.weight > 1）；
-//  4. 返回命中的叶节点（账号 + 真实 ep），调用方据此转发。
+//  4. 返回命中的叶节点（账号 + 上游模型标识），调用方据此转发。
+//
+// 不透明字符串：模型标识不做任何前缀识别——路由的唯一真源是映射表，
+// 无映射即报错（无透传逃生通道）。
 package balancer
 
 import (
@@ -26,6 +30,7 @@ import (
 	"time"
 
 	"arkgate/internal/model"
+	"arkgate/internal/provider"
 	"arkgate/internal/store"
 )
 
@@ -36,19 +41,31 @@ var (
 	ErrNoEndpoint = errors.New("模型没有对应的接入点")
 	// ErrAllThrottled 表示所有候选叶节点都被限流或熔断。
 	ErrAllThrottled = errors.New("所有可用接入点均被限流或熔断")
+	// ErrNoCapable 表示模型有映射，但没有任何账号支持目标 API（responses/images）。
+	ErrNoCapable = errors.New("该模型没有支持此 API 的账号映射")
 )
 
 // maxFallbackChain 限制 fallback 链展开后的总长度，防止配置成环或过深时
 // 单次请求退避到无限多个模型上。
 const maxFallbackChain = 16
 
+// API 标记请求打向哪类对外接口，用于路由时的账号能力过滤。
+type API int
+
+const (
+	APIChat API = iota
+	APIResponses
+	APIImages
+)
+
 // Balancer 是负载均衡器。
 type Balancer struct {
 	mu        sync.RWMutex
 	accounts  map[string]*model.Account    // accountID -> account
-	models    map[string]*model.Model      // 易读名 -> model
+	models    map[string]*model.Model      // 易读名 -> model（仅启用）
 	endpoints map[string]*model.Endpoint   // endpointID -> endpoint（叶节点）
 	modelApps map[string][]*model.Endpoint // 易读名 -> 该模型下全部叶子
+	defs      map[string]provider.Def      // accountID -> 供应商定义（Refresh 时解析缓存）
 
 	wrrMu    sync.Mutex
 	wrrState map[string]*wrrState
@@ -74,6 +91,7 @@ type statOp struct {
 	ok         bool
 	prompt     int64
 	completion int64
+	images     int64
 }
 
 // New 构造 Balancer 并启动后台消费者。
@@ -83,6 +101,7 @@ func New(st *store.Store) *Balancer {
 		models:    map[string]*model.Model{},
 		endpoints: map[string]*model.Endpoint{},
 		modelApps: map[string][]*model.Endpoint{},
+		defs:      map[string]provider.Def{},
 		wrrState:  map[string]*wrrState{},
 		logCh:     make(chan *model.UsageLog, 4096),
 		statCh:    make(chan statOp, 4096),
@@ -128,6 +147,12 @@ func (b *Balancer) applyStat(op statOp) {
 	if op.subkeyID != "" {
 		_ = b.store.AccumulateSubKey(op.subkeyID, op.ok, op.prompt, op.completion)
 	}
+	if op.images > 0 {
+		_ = b.store.AccumulateImages(op.accountID, op.endpointID, op.subkeyID, op.images)
+		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, op.images, 1)
+	} else {
+		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, 0, 1)
+	}
 	// 落库的同时同步内存副本：Snapshot* 读的是 b.accounts / b.endpoints，
 	// 若只写 DB，管理 UI 会一直显示上次 Refresh 时的陈旧统计。
 	b.accumulateInMemory(op)
@@ -142,11 +167,13 @@ func (b *Balancer) accumulateInMemory(op statOp) {
 	if a, ok := b.accounts[op.accountID]; ok {
 		bumpStats(&a.TotalRequests, &a.SuccessRequests, &a.FailRequests,
 			&a.PromptTokens, &a.CompletionTokens, &a.TotalTokens, op)
+		a.TotalImages += op.images
 		a.LastUsedAt = now
 	}
 	if e, ok := b.endpoints[op.endpointID]; ok {
 		bumpStats(&e.TotalRequests, &e.SuccessRequests, &e.FailRequests,
 			&e.PromptTokens, &e.CompletionTokens, &e.TotalTokens, op)
+		e.TotalImages += op.images
 		e.LastUsedAt = now
 	}
 }
@@ -188,9 +215,11 @@ func (b *Balancer) Refresh() {
 	modMap := map[string]*model.Model{}
 	epMap := map[string]*model.Endpoint{}
 	modelApps := map[string][]*model.Endpoint{}
+	defMap := map[string]provider.Def{}
 
 	for _, a := range accounts {
 		accMap[a.ID] = a
+		defMap[a.ID] = resolveDef(a)
 	}
 	for _, m := range modelsList {
 		if m.Enabled {
@@ -221,17 +250,75 @@ func (b *Balancer) Refresh() {
 	b.models = modMap
 	b.endpoints = epMap
 	b.modelApps = modelApps
+	b.defs = defMap
 	b.mu.Unlock()
 }
 
-// Select 按「平滑加权轮询 + 熔断 + 限流」选出一个可用叶节点。
+// resolveDef 解析账号的供应商定义；未注册的 id 回落为「仅 chat」兜底，
+// 避免手改数据库的账号整体失联。
+func resolveDef(a *model.Account) provider.Def {
+	if d, ok := provider.Get(a.Provider); ok {
+		return d
+	}
+	return provider.FallbackDef(a.Provider)
+}
+
+// AccountDef 返回账号的供应商定义（Refresh 时缓存的快照）。
+func (b *Balancer) AccountDef(accountID string) (provider.Def, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	d, ok := b.defs[accountID]
+	return d, ok
+}
+
+// ─────────────────────────── 能力判定 ───────────────────────────
+
+// capEnabled 三态覆盖判定：0 继承默认（Go 零值即继承），1 强制是，-1 强制否。
+func capEnabled(cover int, native bool) bool {
+	if cover > 0 {
+		return true
+	}
+	if cover < 0 {
+		return false
+	}
+	return native
+}
+
+// accountSupports 判断账号是否支持目标 API。
+func (b *Balancer) accountSupports(accountID string, api API) bool {
+	if api == APIChat {
+		return true // chat 是所有 OpenAI 兼容供应商的基础能力
+	}
+	d, ok := b.defs[accountID]
+	if !ok {
+		return false
+	}
+	acc := b.accounts[accountID]
+	if acc == nil {
+		return false
+	}
+	switch api {
+	case APIResponses:
+		return capEnabled(acc.CapResponses, d.Native.Responses)
+	case APIImages:
+		return capEnabled(acc.CapImages, d.Native.Images)
+	}
+	return false
+}
+
+// ─────────────────────────── 路由 ───────────────────────────
+
+// Select 按「平滑加权轮询 + 熔断 + 限流 + 能力过滤」选出一个可用叶节点。
 //
 // modelName 为下游请求里的易读模型名。
-func (b *Balancer) Select(modelName string, allowed []string, exclude map[string]bool) (ep *model.Endpoint, err error) {
-	cands, poolKey := b.usableEndpoints(modelName, allowed, exclude)
+func (b *Balancer) Select(modelName string, allowed []string, exclude map[string]bool, api API) (ep *model.Endpoint, err error) {
+	cands, poolKey := b.usableEndpoints(modelName, allowed, exclude, api)
 	if len(cands) == 0 {
-		if b.hasAnyEndpoint(modelName, allowed) {
+		if b.hasAnyEndpoint(modelName, allowed, api) {
 			return nil, ErrAllThrottled
+		}
+		if b.hasAnyEndpointRaw(modelName, allowed) {
+			return nil, ErrNoCapable
 		}
 		if b.modelNameKnown(modelName) {
 			return nil, ErrNoAccount
@@ -271,14 +358,15 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 // 再依次展开这些模型各自的 Fallback。去重、防环，总长上限 maxFallbackChain。
 // 例如 A.Fallback=[B,C]，B.Fallback=[D] → [A, B, C, D]。
 //
-// UI 把该字段描述为「逗号分隔，按顺序尝试」，因此这里必须遍历列表全部条目，
-// 而不能只取首项——否则用户配置的第二个及以后的候选会被静默忽略。
+// 同类型约束：请求模型已知时，链上只保留与其 Type 相同的候选
+// （文本模型永远不会退避到图像模型，反之亦然）。
 func (b *Balancer) FallbackChain(modelName string) []string {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if modelName == "" {
 		return nil
 	}
+	root, known := b.models[modelName]
 	chain := []string{modelName}
 	seen := map[string]bool{modelName: true}
 	for i := 0; i < len(chain) && len(chain) < maxFallbackChain; i++ {
@@ -289,6 +377,14 @@ func (b *Balancer) FallbackChain(modelName string) []string {
 		for _, f := range m.Fallback {
 			if f == "" || seen[f] {
 				continue
+			}
+			// 同类型约束：已登记且跨类型的目标明确跳过（文本永不退避到图像）。
+			// 未登记/未启用的目标保留在链上——Select 时自然失败并继续，
+			// 维持「配置的每一项都会被尝试」的既有语义。
+			if known {
+				if fm, exists := b.models[f]; exists && fm.Type != root.Type {
+					continue
+				}
 			}
 			seen[f] = true
 			chain = append(chain, f)
@@ -301,27 +397,46 @@ func (b *Balancer) FallbackChain(modelName string) []string {
 }
 
 // SelectWithFallback 先按请求的模型名做常规 Select；若该模型在所有账号的元组都
-// 不可用（ErrAllThrottled / ErrNoAccount / ErrNoEndpoint），自动沿 fallback 链
-// 依次尝试后续模型。返回命中的叶节点与实际使用的模型名。
+// 不可用（ErrAllThrottled / ErrNoCapable / ErrNoAccount / ErrNoEndpoint），自动沿
+// fallback 链依次尝试后续模型。返回命中的叶节点与实际使用的模型名。
 //
 // allowedAccounts 为账号白名单（子 Key 限定可用的账号）；allowedModels 为模型
 // 白名单（子 Key 限定的模型；非空时，fallback 链里不在白名单的模型会被跳过，
 // 避免「子 Key 仅授权模型 A，却经 fallback 打到未授权的模型 B」）。
-func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowedModels []string, exclude map[string]bool) (*model.Endpoint, string, error) {
+//
+// 链上全部失败时，返回信息量最大的错误（如「全被限流/熔断」优先于「没有映射」），
+// 而不是链上最后一个模型的失败原因。
+func (b *Balancer) SelectWithFallback(modelName string, allowedAccounts, allowedModels []string, exclude map[string]bool, api API) (*model.Endpoint, string, error) {
 	allowModel := setOf(allowedModels)
 	chain := b.FallbackChain(modelName)
-	var lastErr error
+	var bestErr error
 	for _, name := range chain {
 		if len(allowModel) > 0 && !allowModel[name] {
 			continue // 子 Key 未授权的 fallback 目标，跳过
 		}
-		ep, err := b.Select(name, allowedAccounts, exclude)
+		ep, err := b.Select(name, allowedAccounts, exclude, api)
 		if err == nil {
 			return ep, name, nil
 		}
-		lastErr = err
+		if selectErrPriority(err) >= selectErrPriority(bestErr) {
+			bestErr = err
+		}
 	}
-	return nil, modelName, lastErr
+	return nil, modelName, bestErr
+}
+
+// selectErrPriority 错误信息量排序：值越大越值得向客户端呈现。
+func selectErrPriority(err error) int {
+	switch {
+	case errors.Is(err, ErrAllThrottled):
+		return 3 // 有容量但全忙——最值得等待重试
+	case errors.Is(err, ErrNoCapable):
+		return 2 // 有映射但没有账号支持此 API
+	case errors.Is(err, ErrNoAccount):
+		return 1
+	default:
+		return 0 // ErrNoEndpoint 等
+	}
 }
 
 // weightTable 计算每个候选叶子的统一权重（叶.weight > 账号.weight > 1）。
@@ -344,7 +459,7 @@ func (b *Balancer) weightTable(cands []*model.Endpoint) map[string]int {
 }
 
 // usableEndpoints 收集「model 可用」的候选叶节点。
-func (b *Balancer) usableEndpoints(modelName string, allowed []string, exclude map[string]bool) ([]*model.Endpoint, string) {
+func (b *Balancer) usableEndpoints(modelName string, allowed []string, exclude map[string]bool, api API) ([]*model.Endpoint, string) {
 	allow := setOf(allowed)
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -352,61 +467,15 @@ func (b *Balancer) usableEndpoints(modelName string, allowed []string, exclude m
 	now := time.Now()
 	var cands []*model.Endpoint
 	for _, e := range b.modelApps[modelName] {
-		if !b.endpointUsable(e, allow, exclude, now) {
+		if !b.endpointUsable(e, allow, exclude, now, api) {
 			continue
 		}
 		cands = append(cands, e)
 	}
-
-	// 透传真实 ID：为「无映射」的模型名，给每个符合白名单的 active 账号合成一个临时叶子。
-	// 合成叶子是纯内存对象，不持久化、不熔断、不限流（透传属逃生通道，保持简单）。
-	if looksLikeRealID(modelName) && len(cands) == 0 {
-		for id, a := range b.accounts {
-			if a.Status != model.AccountActive {
-				continue
-			}
-			if len(allow) > 0 && !allow[id] {
-				continue
-			}
-			leaf := newPassthrough(id, modelName, a.Weight)
-			if exclude != nil && exclude[leaf.ID] {
-				continue
-			}
-			cands = append(cands, leaf)
-		}
-	}
-
 	return cands, poolKeyOf(modelName, allowed)
 }
 
-// newPassthrough 合成一个透传叶节点（纯路由用途，不限流不熔断）。
-// 其 ID 用「账号 ID」而非「passthrough:id」——这样失败方写入 exclude 的 ep.ID
-// 恰好等于该账号 ID，透传分支的 exclude[accountID] 判定才能命中，避免重试打同一账号。
-func newPassthrough(accountID, modelName string, weight int) *model.Endpoint {
-	e := &model.Endpoint{
-		ID:        "passthrough:" + accountID + ":" + modelName,
-		AccountID: accountID,
-		Model:     modelName,
-		EP:        modelName,
-		Enabled:   true,
-		Weight:    weight,
-		Synthetic: true,
-	}
-	e.EnsureRuntime()
-	return e
-}
-
-// passthroughExcludeKey 返回透传叶子在 exclude 集合里使用的键。
-// 透传叶子无持久化 ID，路径上（查询与写入）统一用账号 ID 作为排除键，保证失败重试能切账号。
-func passthroughExcludeKey(e *model.Endpoint) string {
-	return e.AccountID
-}
-
-func looksLikeRealID(s string) bool {
-	return strings.HasPrefix(s, "ep-")
-}
-
-func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, exclude map[string]bool, now time.Time) bool {
+func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, exclude map[string]bool, now time.Time, api API) bool {
 	if exclude != nil && exclude[e.ID] {
 		return false
 	}
@@ -415,6 +484,9 @@ func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, excl
 		return false
 	}
 	if len(allow) > 0 && !allow[e.AccountID] {
+		return false
+	}
+	if !b.accountSupports(e.AccountID, api) {
 		return false
 	}
 	rt := e.Runtime
@@ -436,11 +508,12 @@ func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, excl
 	return true
 }
 
-func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string) bool {
+// hasAnyEndpoint 判断模型是否存在「账号可用 + 能力匹配」的叶节点（不含运行态判断）。
+func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string, api API) bool {
 	allow := setOf(allowed)
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if _, known := b.models[modelName]; !known && !looksLikeRealID(modelName) {
+	if _, known := b.models[modelName]; !known {
 		return false
 	}
 	for _, e := range b.modelApps[modelName] {
@@ -451,18 +524,29 @@ func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string) bool {
 		if len(allow) > 0 && !allow[e.AccountID] {
 			continue
 		}
+		if !b.accountSupports(e.AccountID, api) {
+			continue
+		}
 		return true
 	}
-	if looksLikeRealID(modelName) {
-		for id, a := range b.accounts {
-			if a.Status != model.AccountActive {
-				continue
-			}
-			if len(allow) > 0 && !allow[id] {
-				continue
-			}
-			return true
+	return false
+}
+
+// hasAnyEndpointRaw 判断模型是否存在叶节点（不看能力与运行态），
+// 用于区分「有能力但全被限流/熔断」与「根本没有支持此 API 的账号」。
+func (b *Balancer) hasAnyEndpointRaw(modelName string, allowed []string) bool {
+	allow := setOf(allowed)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, e := range b.modelApps[modelName] {
+		acc, ok := b.accounts[e.AccountID]
+		if !ok || acc.Status != model.AccountActive {
+			continue
 		}
+		if len(allow) > 0 && !allow[e.AccountID] {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -517,15 +601,17 @@ func (b *Balancer) Release(e *model.Endpoint) {
 	atomic.AddInt32(&e.Runtime.Concurrency, -1)
 }
 
-// TPMAdd 在拿到实际 token 用量后喂入叶节点 TPM 窗口（含请求前未知预估值时也可预喂）。
-func (b *Balancer) TPMAdd(e *model.Endpoint, tokens int64) {
+// TPMAdd 在拿到实际用量后喂入叶节点 TPM 窗口。
+// 单位是「计费单位」：文本请求喂 token 数，图像请求喂张数。
+func (b *Balancer) TPMAdd(e *model.Endpoint, units int64) {
 	if e == nil || e.Runtime == nil || e.Runtime.TPM == nil {
 		return
 	}
-	e.Runtime.TPM.Add(tokens)
+	e.Runtime.TPM.Add(units)
 }
 
 // Record 上报一次请求结果：驱动叶节点熔断 + 账号/叶/子Key 统计 + 写日志。
+// 图像张数从 l.ImageCount 读取（0 表示文本请求）。
 // 走阻塞投递（背压），保证统计不丢，避免 SubKey 日限额被绕过。
 func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
 	if ep != nil && ep.Runtime != nil {
@@ -547,18 +633,12 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
 		ok:         ok,
 		prompt:     l.PromptTokens,
 		completion: l.CompletionTokens,
+		images:     l.ImageCount,
 	}
 	// 阻塞投递，保证不丢。
-	sendStat := func(op statOp) {
-		if b.statCh == nil {
-			return
-		}
+	if b.statCh != nil {
 		b.statCh <- op
 	}
-	if l.SubKeyID != "" {
-		op.subkeyID = l.SubKeyID
-	}
-	sendStat(op)
 	if b.logCh != nil {
 		b.logCh <- l
 	}

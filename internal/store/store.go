@@ -2,8 +2,10 @@
 //
 // 设计要点：
 //   - 单文件数据库（DataDir/arkgate.db），WAL 模式，单连接 writer + 读锁保护。
-//   - API Key 明文不落库——加密后才写入（由调用方用 secure.Box 先行加密）。
+//   - 上游 API Key 明文不落库——加密后才写入（由调用方用 secure.Box 先行加密）。
 //   - 启动时自动建表与迁移（幂等，兼容旧库缺列）。
+//   - 迁移守则（向前兼容）：只增不改——仅 ADD COLUMN / CREATE TABLE，DEFAULT 等价
+//     旧行为；不改名、不删列；新列用开放类型（provider 用 TEXT 而非枚举约束）。
 package store
 
 import (
@@ -50,6 +52,9 @@ func New(dataDir string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
+
+// schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
+const schemaVersion = "2"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -136,14 +141,24 @@ func (s *Store) migrate() error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		// 日限额按「日 × 子 Key」计量（修复累计值当当日值的缺陷）。
+		`CREATE TABLE IF NOT EXISTS usage_daily (
+			day TEXT NOT NULL,
+			subkey_id TEXT NOT NULL,
+			tokens INTEGER NOT NULL DEFAULT 0,
+			images INTEGER NOT NULL DEFAULT 0,
+			requests INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (day, subkey_id)
+		)`,
 	}
 	for _, st := range stmts {
 		if _, err := s.db.Exec(st); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	// 旧库缺列补齐（幂等，忽略「列已存在」错误）。
+	// 旧库缺列补齐（幂等，忽略「列已存在」这类良性错误；其余上抛防静默失败）。
 	alters := []string{
+		// —— v1 存量列 ——
 		`ALTER TABLE endpoints ADD COLUMN weight INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE endpoints ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE endpoints ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0`,
@@ -167,16 +182,32 @@ func (s *Store) migrate() error {
 		`ALTER TABLE accounts ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE accounts ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`,
+		// —— v2：多供应商 + 图像 + 日限额 ——
+		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'ark'`,
+		`ALTER TABLE accounts ADD COLUMN base_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN cap_responses INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN cap_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE models ADD COLUMN type TEXT NOT NULL DEFAULT 'text'`,
+		`ALTER TABLE endpoints ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subkeys ADD COLUMN daily_limit_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subkeys ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_logs ADD COLUMN modality TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_logs ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
-		// 只忽略「列已存在」这类良性幂等错误；其余错误向上抛，避免迁移静默失败后
-		// 到查询期才以 "no such column" 崩溃。
 		if _, err := s.db.Exec(st); err != nil {
 			if strings.Contains(err.Error(), "duplicate column") {
 				continue
 			}
 			return fmt.Errorf("migrate alter %q: %w", st, err)
 		}
+	}
+	// 记录 schema 版本（存在即更新，幂等）。
+	if _, err := s.db.Exec(`INSERT INTO settings(key,value) VALUES('schema_version',?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, schemaVersion); err != nil {
+		return fmt.Errorf("migrate schema_version: %w", err)
 	}
 	return nil
 }
@@ -201,14 +232,16 @@ func scanAccount(rows *sql.Rows) (*model.Account, error) {
 	a := &model.Account{}
 	if err := rows.Scan(&a.ID, &a.Name, &a.ArkAPIKeyEnc, &a.KeyHint, &a.Status, &a.Weight,
 		&a.CreatedAt, &a.LastUsedAt, &a.TotalRequests, &a.SuccessRequests, &a.FailRequests,
-		&a.PromptTokens, &a.CompletionTokens, &a.TotalTokens); err != nil {
+		&a.PromptTokens, &a.CompletionTokens, &a.TotalTokens,
+		&a.Provider, &a.BaseURL, &a.CapResponses, &a.CapImages, &a.TotalImages); err != nil {
 		return nil, err
 	}
 	return a, nil
 }
 
 const accountCols = `id,name,ark_key_enc,key_hint,status,weight,created_at,last_used_at,
-	total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens`
+	total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
+	provider,base_url,cap_responses,cap_images,total_images`
 
 func (s *Store) ListAccounts() ([]*model.Account, error) {
 	s.mu.RLock()
@@ -243,16 +276,23 @@ func (s *Store) GetAccount(id string) (*model.Account, error) {
 }
 
 func (s *Store) UpsertAccount(a *model.Account) error {
+	if a.Provider == "" {
+		a.Provider = "ark" // 兼容旧调用方
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO accounts (id,name,ark_key_enc,key_hint,status,weight,created_at,
-			last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
+			provider,base_url,cap_responses,cap_images,total_images)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, ark_key_enc=excluded.ark_key_enc,
-			key_hint=excluded.key_hint, status=excluded.status, weight=excluded.weight`,
+			key_hint=excluded.key_hint, status=excluded.status, weight=excluded.weight,
+			provider=excluded.provider, base_url=excluded.base_url,
+			cap_responses=excluded.cap_responses, cap_images=excluded.cap_images`,
 		a.ID, a.Name, a.ArkAPIKeyEnc, a.KeyHint, a.Status, a.Weight, nonzero(a.CreatedAt, nowUnix()),
 		a.LastUsedAt, a.TotalRequests, a.SuccessRequests, a.FailRequests, a.PromptTokens,
-		a.CompletionTokens, a.TotalTokens)
+		a.CompletionTokens, a.TotalTokens,
+		a.Provider, a.BaseURL, a.CapResponses, a.CapImages, a.TotalImages)
 	return err
 }
 
@@ -285,22 +325,33 @@ func (s *Store) AccumulateAccount(id string, ok bool, pt, ct int64) error {
 
 // ─────────────────────────── Model ───────────────────────────
 
+func scanModel(rows *sql.Rows) (*model.Model, error) {
+	m := &model.Model{}
+	var fb string
+	if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
+		&m.Type); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(fb), &m.Fallback)
+	return m, nil
+}
+
+const modelCols = `name,display,description,enabled,fallback,created_at,type`
+
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT name,display,description,enabled,fallback,created_at FROM models ORDER BY name ASC`)
+	rows, err := s.db.Query(`SELECT ` + modelCols + ` FROM models ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []*model.Model{}
 	for rows.Next() {
-		m := &model.Model{}
-		var fb string
-		if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt); err != nil {
+		m, err := scanModel(rows)
+		if err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(fb), &m.Fallback)
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -313,8 +364,8 @@ func (s *Store) GetModel(name string) (*model.Model, error) {
 	m := &model.Model{}
 	var fb string
 	err := s.db.QueryRow(
-		`SELECT name,display,description,enabled,fallback,created_at FROM models WHERE name=?`, name,
-	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt)
+		`SELECT `+modelCols+` FROM models WHERE name=?`, name,
+	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt, &m.Type)
 	if err != nil {
 		return nil, err
 	}
@@ -323,13 +374,17 @@ func (s *Store) GetModel(name string) (*model.Model, error) {
 }
 
 func (s *Store) UpsertModel(m *model.Model) error {
+	if m.Type == "" {
+		m.Type = model.ModelTypeText
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
-	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at)
-		VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
-		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback`,
-		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()))
+	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type)
+		VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
+		type=excluded.type`,
+		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type)
 	return err
 }
 
@@ -348,14 +403,15 @@ func (s *Store) DeleteModel(name string) error {
 // ─────────────────────────── Endpoint（元组） ───────────────────────────
 
 const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
-	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens`
+	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
+	total_images`
 
 func scanEndpoint(rows *sql.Rows) (*model.Endpoint, error) {
 	e := &model.Endpoint{}
 	if err := rows.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
-		&e.CompletionTokens, &e.TotalTokens); err != nil {
+		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages); err != nil {
 		return nil, err
 	}
 	return e, nil
@@ -412,14 +468,15 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 	}
 	_, err := s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
-			fail_requests,prompt_tokens,completion_tokens,total_tokens)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id,model) DO UPDATE SET ep=excluded.ep, enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
 			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
 		e.Weight, e.MaxConcurrency, e.RPMLimit, e.TPMLimit, e.LastUsedAt,
-		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens, e.TotalTokens)
+		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens,
+		e.TotalTokens, e.TotalImages)
 	return err
 }
 
@@ -441,9 +498,6 @@ func (s *Store) DeleteEndpoint(id string) error {
 
 // AccumulateEndpoint 累计元组用量/请求计数。
 func (s *Store) AccumulateEndpoint(id string, ok bool, pt, ct int64) error {
-	if id == "" || strings.HasPrefix(id, "passthrough:") {
-		return nil // 透传元组无持久化统计
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	col := "success_requests"
@@ -457,29 +511,64 @@ func (s *Store) AccumulateEndpoint(id string, ok bool, pt, ct int64) error {
 	return err
 }
 
+// AccumulateImages 累计图像张数（账号/元组/子 Key 三视图）。
+func (s *Store) AccumulateImages(accountID, endpointID, subkeyID string, n int64) error {
+	if n <= 0 {
+		n = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE accounts SET total_images=total_images+? WHERE id=?`, []any{n, accountID}},
+		{`UPDATE endpoints SET total_images=total_images+? WHERE id=?`, []any{n, endpointID}},
+		{`UPDATE subkeys SET total_images=total_images+? WHERE id=?`, []any{n, subkeyID}},
+	} {
+		if q.args[1] == "" {
+			continue
+		}
+		if _, err := s.db.Exec(q.sql, q.args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ─────────────────────────── SubKey ───────────────────────────
+
+const subkeyCols = `id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,
+	daily_limit_tokens,daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,
+	total_images`
+
+func scanSubKey(rows *sql.Rows) (*model.SubKey, error) {
+	sk := &model.SubKey{}
+	var am, aa string
+	if err := rows.Scan(&sk.ID, &sk.Name, &sk.Key, &sk.KeyHash, &sk.Enabled, &am, &aa,
+		&sk.DailyLimitTokens, &sk.DailyLimitImages, &sk.ExpiresAt, &sk.CreatedAt,
+		&sk.LastUsedAt, &sk.TotalRequests, &sk.TotalTokens, &sk.TotalImages); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(am), &sk.AllowedModels)
+	_ = json.Unmarshal([]byte(aa), &sk.AllowedAccounts)
+	return sk, nil
+}
 
 func (s *Store) ListSubKeys() ([]*model.SubKey, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,
-		daily_limit_tokens,expires_at,created_at,last_used_at,total_requests,total_tokens
-		FROM subkeys ORDER BY created_at ASC`)
+	rows, err := s.db.Query(`SELECT ` + subkeyCols + ` FROM subkeys ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []*model.SubKey{}
 	for rows.Next() {
-		sk := &model.SubKey{}
-		var am, aa string
-		if err := rows.Scan(&sk.ID, &sk.Name, &sk.Key, &sk.KeyHash, &sk.Enabled, &am, &aa,
-			&sk.DailyLimitTokens, &sk.ExpiresAt, &sk.CreatedAt, &sk.LastUsedAt,
-			&sk.TotalRequests, &sk.TotalTokens); err != nil {
+		sk, err := scanSubKey(rows)
+		if err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(am), &sk.AllowedModels)
-		_ = json.Unmarshal([]byte(aa), &sk.AllowedAccounts)
 		out = append(out, sk)
 	}
 	return out, rows.Err()
@@ -504,16 +593,16 @@ func (s *Store) UpsertSubKey(sk *model.SubKey) error {
 	am, _ := json.Marshal(sk.AllowedModels)
 	aa, _ := json.Marshal(sk.AllowedAccounts)
 	_, err := s.db.Exec(`INSERT INTO subkeys
-		(id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,daily_limit_tokens,expires_at,created_at,
-		 last_used_at,total_requests,total_tokens)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		(id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,daily_limit_tokens,
+		 daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,total_images)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_text=excluded.key_text,
 			key_hash=excluded.key_hash, enabled=excluded.enabled, allowed_models=excluded.allowed_models,
 			allowed_accounts=excluded.allowed_accounts, daily_limit_tokens=excluded.daily_limit_tokens,
-			expires_at=excluded.expires_at`,
+			daily_limit_images=excluded.daily_limit_images, expires_at=excluded.expires_at`,
 		sk.ID, sk.Name, sk.Key, sk.KeyHash, boolInt(sk.Enabled), string(am), string(aa),
-		sk.DailyLimitTokens, sk.ExpiresAt, nonzero(sk.CreatedAt, nowUnix()),
-		sk.LastUsedAt, sk.TotalRequests, sk.TotalTokens)
+		sk.DailyLimitTokens, sk.DailyLimitImages, sk.ExpiresAt, nonzero(sk.CreatedAt, nowUnix()),
+		sk.LastUsedAt, sk.TotalRequests, sk.TotalTokens, sk.TotalImages)
 	return err
 }
 
@@ -538,11 +627,28 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
-		(ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,requested_model,model,ep,prompt_tokens,completion_tokens,total_tokens,status,latency_ms,error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.EndpointID,
-		l.RequestedModel, l.Model, l.EP, l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.Status, l.LatencyMs, l.Error)
+		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
+		 prompt_tokens,completion_tokens,total_tokens,image_count,status,latency_ms,error)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
+		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
+		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Status, l.LatencyMs, l.Error)
 	return err
+}
+
+const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
+	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
+	status,latency_ms,error`
+
+func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
+	l := &model.UsageLog{}
+	if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
+		&l.Provider, &l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.Modality,
+		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
+		&l.Status, &l.LatencyMs, &l.Error); err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
@@ -551,19 +657,15 @@ func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id,ts,subkey_id,subkey_name,account_id,account_name,endpoint_id,requested_model,model,ep,
-		prompt_tokens,completion_tokens,total_tokens,status,latency_ms,error
-		FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT ` + usageLogCols + ` FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []*model.UsageLog{}
 	for rows.Next() {
-		l := &model.UsageLog{}
-		if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
-			&l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens,
-			&l.Status, &l.LatencyMs, &l.Error); err != nil {
+		l, err := scanUsageLog(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, l)
@@ -628,6 +730,50 @@ func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
 	return out, rows.Err()
 }
 
+// ─────────────────────────── Daily usage（日限额） ───────────────────────────
+
+// DailyUsage 某子 Key 在自然日内的用量。
+type DailyUsage struct {
+	Tokens   int64 `json:"tokens"`
+	Images   int64 `json:"images"`
+	Requests int64 `json:"requests"`
+}
+
+// today 返回本地时区的自然日（与「当日」直觉一致）。
+func today() string { return time.Now().Format("2006-01-02") }
+
+// AddDailyUsage 异步 consumer 落库时同步累计当日用量行。
+func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64) error {
+	if subkeyID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO usage_daily(day,subkey_id,tokens,images,requests)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(day,subkey_id) DO UPDATE SET
+			tokens=tokens+excluded.tokens, images=images+excluded.images,
+			requests=requests+excluded.requests`,
+		today(), subkeyID, tokens, images, requests)
+	return err
+}
+
+// GetDailyUsage 读取子 Key 当日用量（无行返回零值）。
+func (s *Store) GetDailyUsage(subkeyID string) (*DailyUsage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := &DailyUsage{}
+	err := s.db.QueryRow(`SELECT tokens,images,requests FROM usage_daily WHERE day=? AND subkey_id=?`,
+		today(), subkeyID).Scan(&d.Tokens, &d.Images, &d.Requests)
+	if err == sql.ErrNoRows {
+		return &DailyUsage{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
 // ─────────────────────────── Settings ───────────────────────────
 
 func (s *Store) GetSetting(key string) (string, bool) {
@@ -650,7 +796,8 @@ func (s *Store) SetSetting(key, value string) error {
 
 // ─────────────────────────── 工具 ───────────────────────────
 
-// NormalizeKey 标准化用户输入的子 Key：补全 sk- 前缀。
+// NormalizeKey 标准化用户输入的子 Key：补全 sk- 前缀（仅子 Key 使用；
+// 上游 Key 为不透明字符串，不做任何前缀处理）。
 func NormalizeKey(k string) string {
 	k = strings.TrimSpace(k)
 	if k == "" {
@@ -662,5 +809,5 @@ func NormalizeKey(k string) string {
 	return k
 }
 
-// NormalizeEP 标准化接入点输入：去除前后空白。
+// NormalizeEP 标准化接入点输入：仅去前后空白（不透明字符串，无格式假设）。
 func NormalizeEP(ep string) string { return strings.TrimSpace(ep) }

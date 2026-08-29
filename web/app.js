@@ -86,8 +86,8 @@
         '<div class="page">' +
           '<div class="banner"><div>' +
             '<div class="badge"><span class="pulse"></span>运行中</div>' +
-            '<h2>ArkGate · 火山方舟多账号网关</h2>' +
-            '<p>多账号加权轮询 · 熔断 · 限流 · OpenAI 兼容 /v1 端点</p>' +
+            '<h2>ArkGate · 多供应商 LLM 网关</h2>' +
+            '<p>多账号加权轮询 · 熔断 · 限流 · OpenAI 兼容 /v1（chat / responses / images）</p>' +
           '</div><div class="row-actions">' +
             '<button class="btn btn-outline" id="btn-dark">🌓 深色</button>' +
           '</div></div>' +
@@ -103,14 +103,14 @@
           '</div>' +
           '<div class="card"><div class="card-head"><div class="card-title">账号状态</div></div>' +
             '<div class="table-wrap"><table><thead><tr>' +
-            '<th>账号</th><th>状态</th><th>权重</th><th>请求</th><th>成功</th><th>失败</th><th>Token</th><th>最后使用</th>' +
+            '<th>账号</th><th>供应商</th><th>状态</th><th>权重</th><th>请求</th><th>成功</th><th>失败</th><th>Token</th><th>最后使用</th>' +
             '</tr></thead><tbody>' + (accs.length ? accs.map(function (a) {
-              return "<tr><td>" + esc(a.name) + "</td><td>" + statusTag(a.status) +
+              return "<tr><td>" + esc(a.name) + "</td><td>" + esc(a.provider || "ark") + "</td><td>" + statusTag(a.status) +
                 "</td><td>" + esc(a.weight) + "</td><td>" + a.total_requests +
                 "</td><td class='v' style='color:rgb(var(--green-6))'>" + a.success_requests +
                 "</td><td class='v' style='color:rgb(var(--red-6))'>" + a.fail_requests +
                 "</td><td>" + fmtTokens(a.total_tokens) + "</td><td>" + fmtTime(a.last_used_at) + "</td></tr>";
-            }).join("") : '<tr><td colspan="8" class="empty">暂无账号，请先添加</td></tr>') +
+            }).join("") : '<tr><td colspan="9" class="empty">暂无账号，请先添加</td></tr>') +
             "</tbody></table></div></div>" +
           '<div class="card"><div class="card-head"><div class="card-title">各子 Key × 模型用量（最近 24 小时，按小时）</div></div>' +
             '<div id="usage-chart" class="chart-wrap"></div></div>' +
@@ -241,20 +241,20 @@
         root.innerHTML = "";
         root.appendChild(h(
           '<div class="page">' +
-            '<div class="page-title">火山账号</div><div class="page-sub">每个账号对应一个火山方舟长效 API Key，网关会在请求时动态替换。</div>' +
+            '<div class="page-title">上游账号</div><div class="page-sub">每个账号对应一个供应商（火山方舟 / OpenAI / 自定义 OpenAI 兼容）的 API Key，网关会在请求时动态替换。Key 为任意字符串，网关不做格式假设。</div>' +
             '<div class="toolbar"><button class="btn btn-primary" id="add">+ 添加账号</button><div class="spacer"></div></div>' +
             '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>名称</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th>Token</th><th>操作</th>' +
+            '<th>名称</th><th>供应商</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th>Token</th><th>图像</th><th>操作</th>' +
             '</tr></thead><tbody>' + (accs.length ? accs.map(function (a) {
-              return "<tr><td><strong>" + esc(a.name) + "</strong></td><td class='mono'>" + esc(a.key_hint) +
+              return "<tr><td><strong>" + esc(a.name) + "</strong></td><td>" + esc(a.provider || "ark") + "</td><td class='mono'>" + esc(a.key_hint) +
                 "</td><td>" + statusTag(a.status) + "</td><td>" + esc(a.weight) +
                 "</td><td>" + a.total_requests + "/" + a.success_requests + "/" + a.fail_requests +
-                "</td><td>" + fmtTokens(a.total_tokens) +
+                "</td><td>" + fmtTokens(a.total_tokens) + "</td><td>" + (a.total_images || 0) +
                 "</td><td><div class='row-actions'>" +
                 '<button class="btn btn-outline btn-sm" data-edit="' + esc(a.id) + '">编辑</button>' +
                 '<button class="btn btn-danger btn-sm" data-del="' + esc(a.id) + '">删除</button>' +
                 "</div></td></tr>";
-            }).join("") : '<tr><td colspan="7" class="empty">暂无账号</td></tr>') +
+            }).join("") : '<tr><td colspan="9" class="empty">暂无账号</td></tr>') +
             "</tbody></table></div></div>" +
           "</div>"
         ));
@@ -276,53 +276,91 @@
 
   function showAccountModal(id, done) {
     var isEdit = !!id;
-    var title = isEdit ? "编辑账号" : "添加账号";
-    var modal = h(
-      '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>' + title + '</h3>' +
-      '<button class="modal-close">×</button></div><div class="modal-body">' +
-      '<div class="form-item"><label>名称 <span class="req">*</span></label><input id="f-name" placeholder="例如：主账号-北京"/></div>' +
-      '<div class="form-item"><label>方舟 API Key <span class="req">*</span>' + (isEdit ? "（留空表示不修改）" : "") + '</label><input id="f-key" placeholder="火山方舟长效 API Key"/></div>' +
-      '<div class="form-row">' +
-      '<div class="form-item"><label>权重</label><input id="f-weight" type="number" value="1"/></div>' +
-      '<div class="form-item"><label>状态</label><select id="f-status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>' +
-      '</div>' +
-      '<div class="form-item"><label style="color:var(--color-text-3)">并发 / RPM / TPM 限额请到「模型映射」按接入点配置。</label></div>' +
-      '</div><div class="modal-foot">' +
-      '<button class="btn btn-outline" id="cancel">取消</button>' +
-      '<button class="btn btn-primary" id="save">保存</button>' +
-      '</div></div></div>'
-    );
-    document.body.appendChild(modal);
-    function close() { modal.remove(); }
-    modal.querySelector(".modal-close").onclick = close;
-    modal.querySelector("#cancel").onclick = close;
-    modal.addEventListener("click", function (e) { if (e.target === modal) close(); });
+    Promise.all([req("GET", "/api/providers"), isEdit ? req("GET", "/api/accounts") : Promise.resolve([])]).then(function (rs) {
+      var providers = rs[0] || [];
+      var acc = null;
+      if (isEdit) {
+        acc = (rs[1] || []).find(function (x) { return x.id === id; });
+        if (!acc) return;
+      }
+      var curProvider = acc ? (acc.provider || "ark") : "ark";
+      var popts = providers.map(function (p) {
+        return '<option value="' + esc(p.id) + '"' + (p.id === curProvider ? " selected" : "") + ">" + esc(p.display_name) + "（" + esc(p.id) + "）</option>";
+      }).join("");
+      var title = isEdit ? "编辑账号" : "添加账号";
+      var modal = h(
+        '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>' + title + '</h3>' +
+        '<button class="modal-close">×</button></div><div class="modal-body">' +
+        '<div class="form-item"><label>名称 <span class="req">*</span></label><input id="f-name" placeholder="例如：主账号-北京"/></div>' +
+        '<div class="form-row">' +
+        '<div class="form-item"><label>供应商</label><select id="f-provider">' + popts + "</select></div>" +
+        '<div class="form-item"><label>权重</label><input id="f-weight" type="number" value="1"/></div>' +
+        '<div class="form-item"><label>状态</label><select id="f-status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>' +
+        '</div>' +
+        '<div class="form-item"><label>Base URL</label><input id="f-baseurl" placeholder=""/></div>' +
+        '<div class="form-item"><label>上游 API Key <span class="req">*</span>' + (isEdit ? "（留空表示不修改）" : "") + '</label><input id="f-key" placeholder="任意字符串，网关不做格式假设"/></div>' +
+        '<div class="form-row">' +
+        '<div class="form-item"><label>Responses 能力</label><select id="f-capr">' + capOpts(acc ? acc.cap_responses : 0) + "</select></div>" +
+        '<div class="form-item"><label>图像能力</label><select id="f-capi">' + capOpts(acc ? acc.cap_images : 0) + "</select></div>" +
+        '</div>' +
+        '<div class="form-item"><label style="color:var(--color-text-3)">并发 / RPM / TPM 限额请到「模型映射」按接入点配置；能力覆盖用于纠正自定义供应商的能力声明。</label></div>' +
+        '</div><div class="modal-foot">' +
+        '<button class="btn btn-outline" id="cancel">取消</button>' +
+        '<button class="btn btn-primary" id="save">保存</button>' +
+        '</div></div></div>'
+      );
+      document.body.appendChild(modal);
+      function close() { modal.remove(); }
+      modal.querySelector(".modal-close").onclick = close;
+      modal.querySelector("#cancel").onclick = close;
+      modal.addEventListener("click", function (e) { if (e.target === modal) close(); });
 
-    if (isEdit) {
-      req("GET", "/api/accounts").then(function (accs) {
-        var a = accs.find(function (x) { return x.id === id; });
-        if (!a) return;
-        modal.querySelector("#f-name").value = a.name;
-        modal.querySelector("#f-weight").value = a.weight;
-        modal.querySelector("#f-status").value = a.status;
-      });
-    }
+      function syncBasePlaceholder() {
+        var pid = modal.querySelector("#f-provider").value;
+        var def = providers.find(function (x) { return x.id === pid; });
+        modal.querySelector("#f-baseurl").placeholder = def && def.default_base_url
+          ? "留空使用默认：" + def.default_base_url
+          : "必填：该供应商无默认地址（http(s)://…）";
+      }
+      syncBasePlaceholder();
+      modal.querySelector("#f-provider").onchange = syncBasePlaceholder;
 
-    modal.querySelector("#save").onclick = function () {
-      var payload = {
-        name: modal.querySelector("#f-name").value.trim(),
-        ark_api_key: modal.querySelector("#f-key").value.trim(),
-        weight: parseInt(modal.querySelector("#f-weight").value, 10) || 1,
-        status: modal.querySelector("#f-status").value,
+      if (acc) {
+        modal.querySelector("#f-name").value = acc.name;
+        modal.querySelector("#f-weight").value = acc.weight;
+        modal.querySelector("#f-status").value = acc.status;
+        modal.querySelector("#f-baseurl").value = acc.base_url || "";
+      }
+
+      modal.querySelector("#save").onclick = function () {
+        var payload = {
+          name: modal.querySelector("#f-name").value.trim(),
+          provider: modal.querySelector("#f-provider").value,
+          base_url: modal.querySelector("#f-baseurl").value.trim(),
+          api_key: modal.querySelector("#f-key").value.trim(),
+          cap_responses: parseInt(modal.querySelector("#f-capr").value, 10),
+          cap_images: parseInt(modal.querySelector("#f-capi").value, 10),
+          weight: parseInt(modal.querySelector("#f-weight").value, 10) || 1,
+          status: modal.querySelector("#f-status").value,
+        };
+        if (!payload.name) { toast("请输入名称", false); return; }
+        if (!isEdit && !payload.api_key) { toast("请输入 API Key", false); return; }
+        var p = isEdit
+          ? req("PUT", "/api/accounts/" + id, payload)
+          : req("POST", "/api/accounts", payload);
+        p.then(function () { toast("已保存"); close(); done && done(); })
+         .catch(function (e) { toast(e.message, false); });
       };
-      if (!payload.name) { toast("请输入名称", false); return; }
-      if (!isEdit && !payload.ark_api_key) { toast("请输入 API Key", false); return; }
-      var p = isEdit
-        ? req("PUT", "/api/accounts/" + id, payload)
-        : req("POST", "/api/accounts", payload);
-      p.then(function () { toast("已保存"); close(); done && done(); })
-       .catch(function (e) { toast(e.message, false); });
-    };
+    });
+  }
+
+  // 能力三态下拉：0 继承 / 1 强制是 / -1 强制否。
+  function capOpts(cur) {
+    cur = Number(cur || 0);
+    function o(v, label) {
+      return '<option value="' + v + '"' + (cur === v ? " selected" : "") + ">" + label + "</option>";
+    }
+    return o(0, "继承供应商默认") + o(1, "强制可用") + o(-1, "强制禁用");
   }
 
   // ── 模型 & 映射 ──
@@ -339,22 +377,25 @@
           root.appendChild(h(
             '<div class="page">' +
               '<div class="page-title">模型映射</div>' +
-              '<div class="page-sub">把可读性差的 ep-xxx… 接入点映射为易读模型名；下游用它调用，网关调用火山时自动换回 ep-。每个账号的接入点天然不同，因此映射按「账号 × 模型」维护。</div>' +
+              '<div class="page-sub">把上游模型标识（不透明字符串：Ark 的 ep-xxx、OpenAI 的 gpt-4o 等）映射为易读模型名。映射按「账号 × 模型」维护，支持文本与图像两类。</div>' +
               '<div class="toolbar"><button class="btn btn-primary" id="add-model">+ 新建模型</button>' +
               '<button class="btn btn-outline" id="add-ep">+ 添加映射</button><div class="spacer"></div></div>' +
-              '<div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链）</div></div>' +
-              '<div class="table-wrap"><table><thead><tr><th>模型名</th><th>显示名</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+              '<div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>' +
+              '<div class="table-wrap"><table><thead><tr><th>模型名</th><th>类型</th><th>显示名</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
               (models.length ? models.map(function (m) {
-                return "<tr><td class='mono'>" + esc(m.name) + "</td><td>" + esc(m.display) + "</td>" +
+                var typeTag = m.type === "image"
+                  ? '<span class="tag tag-purple" title="图像生成模型">图像</span>'
+                  : '<span class="tag tag-blue" title="文本对话模型">文本</span>';
+                return "<tr><td class='mono'>" + esc(m.name) + "</td><td>" + typeTag + "</td><td>" + esc(m.display) + "</td>" +
                   "<td class='mono'>" + esc((m.fallback && m.fallback.length ? m.fallback.join(" → ") : "—")) + "</td><td>" + esc(m.description) +
                   "<td>" + (m.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">停用</span>') +
                   "</td><td><div class='row-actions'>" +
                   '<button class="btn btn-outline btn-sm" data-edit-model="' + esc(m.name) + '">编辑</button>' +
                   '<button class="btn btn-danger btn-sm" data-del-model="' + esc(m.name) + '">删除</button></div></td></tr>';
-              }).join("") : '<tr><td colspan="6" class="empty">暂无模型</td></tr>') +
+              }).join("") : '<tr><td colspan="7" class="empty">暂无模型</td></tr>') +
               "</tbody></table></div></div>" +
-              '<div class="card"><div class="card-head"><div class="card-title">接入点映射（元组级流控）</div></div>' +
-              '<div class="table-wrap"><table><thead><tr><th>账号</th><th>模型名</th><th>真实接入点 (ep-)</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+              '<div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控）</div></div>' +
+              '<div class="table-wrap"><table><thead><tr><th>账号</th><th>模型名</th><th>上游模型 / 接入点</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
               (eps.length ? eps.map(function (e) {
                 return "<tr><td>" + esc(e.account_name || e.account_id) + "</td><td class='mono'>" + esc(e.model) +
                   "</td><td class='mono'>" + esc(e.ep) + "</td><td>" + (e.weight || "继承") +
@@ -372,8 +413,9 @@
               '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>新建模型</h3><button class="modal-close">×</button></div>' +
               '<div class="modal-body">' +
               '<div class="form-item"><label>模型名（下游调用用，唯一）<span class="req">*</span></label><input id="m-name" placeholder="例如 doubao-seed-1-6"/></div>' +
+              '<div class="form-item"><label>类型</label><select id="m-type"><option value="text">文本（chat / responses）</option><option value="image">图像（images/generations）</option></select></div>' +
               '<div class="form-item"><label>显示名</label><input id="m-display" placeholder="豆包 Seed 1.6"/></div>' +
-              '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；当本模型在所有账号都不可用时启用）</label><input id="m-fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>' +
+              '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型）</label><input id="m-fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>' +
               '<div class="form-item"><label>描述</label><input id="m-desc"/></div>' +
               '</div><div class="modal-foot"><button class="btn btn-outline" id="m-cancel">取消</button><button class="btn btn-primary" id="m-save">保存</button></div></div></div>'
             );
@@ -387,8 +429,9 @@
               var fallback = modal.querySelector("#m-fallback").value.split(",")
                 .map(function (s) { return s.trim(); })
                 .filter(function (s) { return s.length > 0; });
-              req("POST", "/api/models", { name: name, display: modal.querySelector("#m-display").value.trim() || name, description: modal.querySelector("#m-desc").value.trim(), fallback: fallback })
-                .then(function () { toast("已保存"); close(); renderModels(); });
+              req("POST", "/api/models", { name: name, type: modal.querySelector("#m-type").value, display: modal.querySelector("#m-display").value.trim() || name, description: modal.querySelector("#m-desc").value.trim(), fallback: fallback })
+                .then(function () { toast("已保存"); close(); renderModels(); })
+                .catch(function (e) { toast(e.message, false); });
             };
           };
 
@@ -404,7 +447,7 @@
               '<div class="modal-body">' +
               '<div class="form-item"><label>账号 <span class="req">*</span></label><select id="e-acc">' + opts + "</select></div>" +
               '<div class="form-item"><label>模型名 <span class="req">*</span></label><select id="e-model">' + mopts + "</select></div>" +
-              '<div class="form-item"><label>真实接入点 <span class="req">*</span></label><input id="e-ep" placeholder="ep-2025xxxxxxx-xxxxx"/></div>' +
+              '<div class="form-item"><label>上游模型 / 接入点 <span class="req">*</span></label><input id="e-ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/></div>' +
               '<div class="form-row three">' +
               '<div class="form-item"><label>权重</label><input id="e-weight" type="number" value="0"/></div>' +
               '<div class="form-item"><label>并发上限</label><input id="e-conc" type="number" value="0"/></div>' +
@@ -441,7 +484,7 @@
                 var modal = h(
                   '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>编辑接入点映射</h3><button class="modal-close">×</button></div>' +
                   '<div class="modal-body">' +
-                  '<div class="form-item"><label>真实接入点</label><input id="x-ep" value="' + esc(e.ep) + '"/></div>' +
+                  '<div class="form-item"><label>上游模型 / 接入点</label><input id="x-ep" value="' + esc(e.ep) + '"/></div>' +
                   '<div class="form-row three">' +
                   '<div class="form-item"><label>权重</label><input id="x-weight" type="number" value="' + (e.weight || 0) + '"/></div>' +
                   '<div class="form-item"><label>并发上限</label><input id="x-conc" type="number" value="' + (e.max_concurrency || 0) + '"/></div>' +
@@ -477,7 +520,8 @@
 	                var modal = h(
 	                  '<div class="modal-mask"><div class="modal"><div class="modal-head"><h3>编辑模型</h3><button class="modal-close">×</button></div>' +
 	                  '<div class="modal-body">' +
-	                  '<div class="form-item"><label>显示名</label><input id="x-display" value="' + esc(m.display) + '"/></div>' +
+		                  '<div class="form-item"><label>类型</label><select id="x-type"><option value="text"' + (m.type !== "image" ? " selected" : "") + '>文本（chat / responses）</option><option value="image"' + (m.type === "image" ? " selected" : "") + '>图像（images/generations）</option></select></div>' +
+		                  '<div class="form-item"><label>显示名</label><input id="x-display" value="' + esc(m.display) + '"/></div>' +
 	                  '<div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试）</label><input id="x-fallback" value="' + esc((m.fallback && m.fallback.length ? m.fallback.join(", ") : "")) + '"/></div>' +
 	                  '<div class="form-item"><label>描述</label><input id="x-desc" value="' + esc(m.description || "") + '"/></div>' +
 	                  '<div class="form-item"><label>状态</label><select id="x-enabled"><option value="true"' + (m.enabled ? " selected" : "") + '>启用</option><option value="false"' + (!m.enabled ? " selected" : "") + '>停用</option></select></div>' +
@@ -491,8 +535,9 @@
 	                  var fallback = modal.querySelector("#x-fallback").value.split(",")
 	                    .map(function (s) { return s.trim(); })
 	                    .filter(function (s) { return s.length > 0; });
-	                  req("PUT", "/api/models/" + name, {
-	                    display: modal.querySelector("#x-display").value.trim() || name,
+		                  req("PUT", "/api/models/" + name, {
+		                    type: modal.querySelector("#x-type").value,
+		                    display: modal.querySelector("#x-display").value.trim() || name,
 	                    description: modal.querySelector("#x-desc").value.trim(),
 	                    fallback: fallback,
 	                    enabled: modal.querySelector("#x-enabled").value === "true",
@@ -526,21 +571,21 @@
         root.appendChild(h(
           '<div class="page">' +
             '<div class="page-title">子 API Key</div>' +
-            '<div class="page-sub">下发给客户端使用的 OpenAI 兼容 Key（sk-xxx）。真正的火山 Key 不出网，网关按白名单与限额路由。</div>' +
+            '<div class="page-sub">下发给客户端使用的 OpenAI 兼容 Key（sk-xxx）。真正的供应商 Key 不出网，网关按白名单与限额路由。</div>' +
             '<div class="toolbar"><button class="btn btn-primary" id="add">+ 新建子 Key</button><div class="spacer"></div></div>' +
             '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token</th><th>操作</th>' +
+            '<th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token</th><th>图像</th><th>操作</th>' +
             '</tr></thead><tbody>' + (subs.length ? subs.map(function (s) {
               return "<tr><td><strong>" + esc(s.name || s.id) + "</strong></td>" +
                 "<td class='mono'><span class='code-copy' title='点击复制' data-copy='" + esc(s.key) + "'>" + esc(s.key) + "</span></td>" +
                 "<td>" + (s.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-gray">禁用</span>') + "</td>" +
                 "<td>" + (s.allowed_models && s.allowed_models.length ? s.allowed_models.join(", ") : "全部") + "</td>" +
-                "<td>" + s.total_requests + "</td><td>" + fmtTokens(s.total_tokens) + "</td>" +
+                "<td>" + s.total_requests + "</td><td>" + fmtTokens(s.total_tokens) + "</td><td>" + (s.total_images || 0) + "</td>" +
                 "<td><div class='row-actions'>" +
                 '<button class="btn btn-outline btn-sm" data-edit="' + esc(s.id) + '">编辑</button>' +
                 '<button class="btn btn-danger btn-sm" data-del="' + esc(s.id) + '">删除</button>' +
                 "</div></td></tr>";
-            }).join("") : '<tr><td colspan="7" class="empty">暂无子 Key</td></tr>') +
+            }).join("") : '<tr><td colspan="8" class="empty">暂无子 Key</td></tr>') +
             "</tbody></table></div></div>" +
           "</div>"
         ));
@@ -578,6 +623,7 @@
         '<div class="form-item"><label>可访问模型（不勾选 = 全部）</label><div class="form-item" style="max-height:120px;overflow:auto;border:1px solid var(--color-border-2);border-radius:6px;padding:8px;">' + (mopts || '<span class="tag tag-gray">暂无模型</span>') + "</div></div>" +
         '<div class="form-item"><label>可访问账号（不勾选 = 全部）</label><div class="form-item" style="max-height:120px;overflow:auto;border:1px solid var(--color-border-2);border-radius:6px;padding:8px;">' + (aopts || '<span class="tag tag-gray">暂无账号</span>') + "</div></div>" +
         '<div class="form-item"><label>当日 Token 限额（0 = 不限）</label><input id="sk-limit" type="number" value="0"/></div>' +
+        '<div class="form-item"><label>当日图像张数限额（0 = 不限）</label><input id="sk-imglimit" type="number" value="0"/></div>' +
         '</div><div class="modal-foot"><button class="btn btn-outline" id="sk-cancel">取消</button><button class="btn btn-primary" id="sk-save">保存</button></div></div></div>'
       );
       document.body.appendChild(modal);
@@ -592,6 +638,7 @@
           if (!s) return;
           modal.querySelector("#sk-name").value = s.name;
           modal.querySelector("#sk-limit").value = s.daily_limit_tokens;
+          modal.querySelector("#sk-imglimit").value = s.daily_limit_images || 0;
           modal.querySelectorAll('input[type=checkbox]').forEach(function (cb) {
             var allowed = (cb.value.length > 12 ? s.allowed_accounts : s.allowed_models) || [];
             cb.checked = allowed.indexOf(cb.value) >= 0;
@@ -611,12 +658,13 @@
           allowed_models: allowedModels,
           allowed_accounts: allowedAccounts,
           daily_limit_tokens: parseInt(modal.querySelector("#sk-limit").value, 10) || 0,
+          daily_limit_images: parseInt(modal.querySelector("#sk-imglimit").value, 10) || 0,
         };
         var keyEl = modal.querySelector("#sk-key");
         if (keyEl && keyEl.value.trim()) payload.key = keyEl.value.trim();
         var p;
         if (isEdit) {
-          p = req("PUT", "/api/subkeys/" + id, { name: payload.name, allowed_models: payload.allowed_models, allowed_accounts: payload.allowed_accounts, daily_limit_tokens: payload.daily_limit_tokens });
+          p = req("PUT", "/api/subkeys/" + id, { name: payload.name, allowed_models: payload.allowed_models, allowed_accounts: payload.allowed_accounts, daily_limit_tokens: payload.daily_limit_tokens, daily_limit_images: payload.daily_limit_images });
         } else {
           p = req("POST", "/api/subkeys", payload);
         }
@@ -635,11 +683,11 @@
         root.innerHTML = "";
         root.appendChild(h(
           '<div class="page">' +
-            '<div class="page-title">请求日志</div><div class="page-sub">子 Key 维度的用量与错误记录（不含火山上游同步）。</div>' +
+            '<div class="page-title">请求日志</div><div class="page-sub">子 Key 维度的用量与错误记录（不含上游同步）。</div>' +
             '<div class="toolbar"><button class="btn btn-outline" id="refresh">刷新</button>' +
             '<button class="btn btn-danger" id="clear">清空日志</button><div class="spacer"></div></div>' +
             '<div class="card"><div class="table-wrap"><table><thead><tr>' +
-            '<th>时间</th><th>子 Key</th><th>账号</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>耗时</th><th>状态</th><th>错误</th>' +
+            '<th>时间</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>耗时</th><th>状态</th><th>错误</th>' +
             '</tr></thead><tbody>' + (logs.length ? logs.map(function (l) {
               var fellBack = l.requested_model && l.requested_model !== l.model;
               var modelCell = fellBack
@@ -647,11 +695,12 @@
                 : '<span class="mono">' + esc(l.requested_model || l.model) + '</span>';
               var realCell = '<span class="mono">' + esc(l.model) + '</span>';
               return "<tr><td>" + fmtTime(l.ts) + "</td><td>" + esc(l.subkey_name || l.subkey_id) +
-                "</td><td>" + esc(l.account_name || l.account_id) + "</td><td>" + modelCell + "</td><td>" + realCell +
+                "</td><td>" + esc(l.account_name || l.account_id) + "</td><td>" + esc(l.provider || "-") + "</td><td>" + modelCell + "</td><td>" + realCell +
                 "</td><td>" + l.prompt_tokens + "</td><td>" + l.completion_tokens + "</td><td>" + l.total_tokens +
+                "</td><td>" + (l.modality === "image" ? (l.image_count || 0) + " 张" : "—") +
                 "</td><td>" + l.latency_ms + "ms</td><td>" + (l.status === "ok" ? '<span class="tag tag-green">OK</span>' : '<span class="tag tag-red">ERR</span>') +
                 "</td><td style='max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)' title='" + esc(l.error) + "'>" + esc(l.error) + "</td></tr>";
-            }).join("") : '<tr><td colspan="11" class="empty">暂无日志</td></tr>') +
+            }).join("") : '<tr><td colspan="13" class="empty">暂无日志</td></tr>') +
             "</tbody></table></div></div>" +
           "</div>"
         ));
@@ -676,6 +725,8 @@
           '<div class="card"><div class="card-head"><div class="card-title">OpenAI 兼容端点</div></div>' +
           '<div class="kv"><span class="k">Base URL</span><span class="v mono code-copy" data-copy="' + host + '/v1">' + host + "/v1</span></div>" +
           '<div class="kv"><span class="k">Chat Completions</span><span class="v mono">POST /v1/chat/completions</span></div>' +
+          '<div class="kv"><span class="k">Responses</span><span class="v mono">POST /v1/responses</span></div>' +
+          '<div class="kv"><span class="k">Images Generations</span><span class="v mono">POST /v1/images/generations</span></div>' +
           '<div class="kv"><span class="k">模型列表</span><span class="v mono">GET /v1/models</span></div>' +
           "</div>" +
           '<div class="card"><div class="card-head"><div class="card-title">调用示例</div></div>' +
@@ -691,8 +742,7 @@
           ) + "</pre></div>" +
           '<div class="card"><div class="card-head"><div class="card-title">环境变量</div></div>' +
           '<div class="kv"><span class="k">ARKGATE_ADDR</span><span class="v mono">监听地址（默认 0.0.0.0:8002）</span></div>' +
-          '<div class="kv"><span class="k">ARKGATE_BASE_URL</span><span class="v mono">火山 Base URL（默认 cn-beijing）</span></div>' +
-          '<div class="kv"><span class="k">ARKGATE_DATA_DIR</span><span class="v mono">数据目录（默认 ~/.arkgate）</span></div>' +
+          '<div class="kv"><span class="k">ARKGATE_DATA_DIR</span><span class="v mono">数据目录（默认可执行文件同级）</span></div>' +
           "</div>" +
         "</div>"
       ));
@@ -705,7 +755,7 @@
   // ── 路由与外壳 ──
   var MENU = [
     { key: "overview", label: "总览", icon: "📊" },
-    { key: "accounts", label: "火山账号", icon: "🏛" },
+    { key: "accounts", label: "上游账号", icon: "🏛" },
     { key: "models", label: "模型映射", icon: "🧩" },
     { key: "subkeys", label: "子 Key", icon: "🔑" },
     { key: "logs", label: "请求日志", icon: "📄" },

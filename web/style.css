@@ -13,6 +13,7 @@
   --green-6: 0,180,42;
   --orange-6: 255,125,0;
   --red-6: 245,63,63;
+  --purple-6: 114,46,209;
   --shadow-card: 0 2px 8px rgba(0,0,0,0.05);
 }
 [data-theme="dark"] {
@@ -116,6 +117,7 @@ tr:hover td { background: var(--color-fill-1); }
 .tag-orange { background: rgba(var(--orange-6), .12); color: rgb(var(--orange-6)); }
 .tag-gray { background: var(--color-fill-1); color: var(--color-text-3); }
 .tag-blue { background: rgba(var(--primary-6), .12); color: rgb(var(--primary-6)); }
+.tag-purple { background: rgba(var(--purple-6), .12); color: rgb(var(--purple-6)); }
 
 /* 表单控件 */
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }

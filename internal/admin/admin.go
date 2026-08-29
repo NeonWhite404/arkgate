@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"arkgate/internal/balancer"
 	"arkgate/internal/model"
+	"arkgate/internal/provider"
 	"arkgate/internal/secure"
 	"arkgate/internal/store"
 )
@@ -97,6 +99,7 @@ func (a *Admin) routes() http.Handler {
 	}
 
 	reg("/api/auth/info", a.handleInfo)
+	reg("/api/providers", a.handleProviders)
 	reg("/api/accounts", a.handleAccountsCollection)
 	reg("/api/accounts/", a.handleAccountItem)
 	reg("/api/models", a.handleModelsCollection)
@@ -166,14 +169,68 @@ func (a *Admin) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": a.isInitialized()})
 }
 
+// ─────────────────────────── providers ───────────────────────────
+
+// handleProviders 返回供应商注册表（前端下拉与能力展示用）。
+func (a *Admin) handleProviders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, provider.List())
+}
+
 // ─────────────────────────── accounts ───────────────────────────
 
 type accountPayload struct {
-	ID        string `json:"id"`
+	ID string `json:"id"`
+	// 上游 API Key 为不透明字符串：仅 TrimSpace，不校验前缀/格式。
+	// api_key 是新字段名；ark_api_key 为兼容旧前端的别名。
+	APIKey    string `json:"api_key"`
+	ArkAPIKey string `json:"ark_api_key"`
 	Name      string `json:"name"`
-	ArkAPIKey string `json:"ark_api_key"` // 明文入参，仅在新增/更新时
 	Status    string `json:"status"`
 	Weight    int    `json:"weight"`
+
+	Provider string `json:"provider"` // ark | openai | custom…
+	BaseURL  string `json:"base_url"` // 覆盖 provider 默认 base
+	// 能力三态覆盖：0 继承 provider 默认，1 强制是，-1 强制否。
+	// 指针：未出现的字段不覆盖（默认 0 继承）。
+	CapResponses *int `json:"cap_responses"`
+	CapImages    *int `json:"cap_images"`
+}
+
+func (p *accountPayload) key() string {
+	if p.APIKey != "" {
+		return p.APIKey
+	}
+	return p.ArkAPIKey
+}
+
+// validateProvider 校验 payload 的 provider/base_url/能力覆盖，返回规范化后的值。
+func (p *accountPayload) validateProvider() (def provider.Def, baseURL string, caps [2]int, err error) {
+	id := strings.TrimSpace(p.Provider)
+	if id == "" {
+		id = "ark" // 兼容旧前端
+	}
+	d, ok := provider.Get(id)
+	if !ok {
+		return d, "", [2]int{}, errors.New("未知的供应商 " + id)
+	}
+	baseURL = provider.NormalizeBaseURL(p.BaseURL)
+	if baseURL != "" && !provider.IsHTTPURL(baseURL) {
+		return d, "", [2]int{}, errors.New("base_url 必须是 http(s) 地址")
+	}
+	if d.DefaultBaseURL == "" && baseURL == "" {
+		return d, "", [2]int{}, errors.New("该供应商需要填写 base_url")
+	}
+	for i, c := range []*int{p.CapResponses, p.CapImages} {
+		v := 0
+		if c != nil {
+			v = *c
+		}
+		if v != -1 && v != 0 && v != 1 {
+			return d, "", [2]int{}, errors.New("能力覆盖仅支持 0（继承）/ 1（是）/ -1（否）")
+		}
+		caps[i] = v
+	}
+	return d, baseURL, caps, nil
 }
 
 func (a *Admin) handleAccountsCollection(w http.ResponseWriter, r *http.Request) {
@@ -191,24 +248,34 @@ func (a *Admin) handleAccountsCollection(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
-		if p.Name == "" || p.ArkAPIKey == "" {
-			writeJSON(w, 400, map[string]any{"detail": "name 与 ark_api_key 必填"})
+		if p.Name == "" || p.key() == "" {
+			writeJSON(w, 400, map[string]any{"detail": "name 与 api_key 必填"})
+			return
+		}
+		def, baseURL, caps, verr := p.validateProvider()
+		if verr != nil {
+			writeJSON(w, 400, map[string]any{"detail": verr.Error()})
 			return
 		}
 		id := p.ID
 		if id == "" {
 			id = "acc_" + randHex(6)
 		}
-		enc, err := a.box.Encrypt(strings.TrimSpace(p.ArkAPIKey))
+		key := strings.TrimSpace(p.key())
+		enc, err := a.box.Encrypt(key)
 		if err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
 		acc := &model.Account{
 			ID: id, Name: p.Name, ArkAPIKeyEnc: enc,
-			KeyHint: secure.Mask(strings.TrimSpace(p.ArkAPIKey)),
-			Status:  defaultStr(p.Status, model.AccountActive),
-			Weight:  defaultInt(p.Weight, 1),
+			KeyHint:      secure.Mask(key),
+			Status:       defaultStr(p.Status, model.AccountActive),
+			Weight:       defaultInt(p.Weight, 1),
+			Provider:     def.ID,
+			BaseURL:      baseURL,
+			CapResponses: caps[0],
+			CapImages:    caps[1],
 		}
 		if err := a.store.UpsertAccount(acc); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -248,14 +315,50 @@ func (a *Admin) handleAccountItem(w http.ResponseWriter, r *http.Request) {
 		if p.Weight > 0 {
 			acc.Weight = p.Weight
 		}
-		if p.ArkAPIKey != "" {
-			enc, err := a.box.Encrypt(strings.TrimSpace(p.ArkAPIKey))
+		// 供应商相关：任一字段变化都需整体过一遍校验（provider 决定 base_url 是否必填）。
+		if (p.Provider != "" && p.Provider != acc.Provider) || p.BaseURL != "" {
+			probe := accountPayload{Provider: p.Provider, BaseURL: p.BaseURL}
+			if _, _, _, verr := probe.validateProvider(); verr != nil {
+				writeJSON(w, 400, map[string]any{"detail": verr.Error()})
+				return
+			}
+			if p.Provider != "" {
+				acc.Provider = strings.TrimSpace(p.Provider)
+			}
+			if p.BaseURL != "" {
+				acc.BaseURL = provider.NormalizeBaseURL(p.BaseURL)
+			}
+		}
+		if p.CapResponses != nil {
+			if v := *p.CapResponses; v == -1 || v == 0 || v == 1 {
+				acc.CapResponses = v
+			} else {
+				writeJSON(w, 400, map[string]any{"detail": "能力覆盖仅支持 0（继承）/ 1（是）/ -1（否）"})
+				return
+			}
+		}
+		if p.CapImages != nil {
+			if v := *p.CapImages; v == -1 || v == 0 || v == 1 {
+				acc.CapImages = v
+			} else {
+				writeJSON(w, 400, map[string]any{"detail": "能力覆盖仅支持 0（继承）/ 1（是）/ -1（否）"})
+				return
+			}
+		}
+		if k := p.key(); k != "" {
+			key := strings.TrimSpace(k)
+			enc, err := a.box.Encrypt(key)
 			if err != nil {
 				writeJSON(w, 500, map[string]any{"detail": err.Error()})
 				return
 			}
 			acc.ArkAPIKeyEnc = enc
-			acc.KeyHint = secure.Mask(strings.TrimSpace(p.ArkAPIKey))
+			acc.KeyHint = secure.Mask(key)
+		}
+		// base_url 可能被清空（如从 custom 迁回 ark），需要复核是否满足 provider 要求。
+		if def, ok := provider.Get(acc.Provider); ok && def.DefaultBaseURL == "" && provider.NormalizeBaseURL(acc.BaseURL) == "" {
+			writeJSON(w, 400, map[string]any{"detail": "该供应商需要填写 base_url"})
+			return
 		}
 		if err := a.store.UpsertAccount(acc); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -276,6 +379,35 @@ func (a *Admin) handleAccountItem(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────── models ───────────────────────────
+
+// validateModelType 校验模型类型字段，空值回落为 text。
+func validateModelType(t string) (string, error) {
+	if t == "" {
+		return model.ModelTypeText, nil
+	}
+	if t != model.ModelTypeText && t != model.ModelTypeImage {
+		return "", errors.New("模型类型仅支持 text / image")
+	}
+	return t, nil
+}
+
+// validateFallbackChain 校验 fallback 链：所有名字必须已存在且与模型同类型。
+func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
+	for _, f := range chain {
+		fm, err := a.store.GetModel(f)
+		if err != nil {
+			return errors.New("fallback 模型 " + f + " 不存在")
+		}
+		ft := fm.Type
+		if ft == "" {
+			ft = model.ModelTypeText
+		}
+		if ft != modelType {
+			return errors.New("fallback 模型 " + f + " 与该模型类型不同（仅允许同类型退避）")
+		}
+	}
+	return nil
+}
 
 func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -298,6 +430,16 @@ func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		if m.Display == "" {
 			m.Display = m.Name
+		}
+		t, terr := validateModelType(m.Type)
+		if terr != nil {
+			writeJSON(w, 400, map[string]any{"detail": terr.Error()})
+			return
+		}
+		m.Type = t
+		if err := a.validateFallbackChain(m.Fallback, t); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
 		}
 		m.Enabled = true // 新建默认启用
 		if err := a.store.UpsertModel(&m); err != nil {
@@ -341,8 +483,24 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		if v, ok := probe["enabled"].(bool); ok {
 			existing.Enabled = v
 		}
+		if v, ok := probe["type"].(string); ok {
+			t, terr := validateModelType(v)
+			if terr != nil {
+				writeJSON(w, 400, map[string]any{"detail": terr.Error()})
+				return
+			}
+			existing.Type = t
+		}
 		if raw, ok := probe["fallback"]; ok {
 			existing.Fallback = stringSlice(raw)
+		}
+		et := existing.Type
+		if et == "" {
+			et = model.ModelTypeText
+		}
+		if err := a.validateFallbackChain(existing.Fallback, et); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
 		}
 		if err := a.store.UpsertModel(existing); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -485,6 +643,7 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			AllowedModels    []string `json:"allowed_models"`
 			AllowedAccounts  []string `json:"allowed_accounts"`
 			DailyLimitTokens int64    `json:"daily_limit_tokens"`
+			DailyLimitImages int64    `json:"daily_limit_images"`
 		}
 		if err := decode(r, &p); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
@@ -504,6 +663,7 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			AllowedModels:    p.AllowedModels,
 			AllowedAccounts:  p.AllowedAccounts,
 			DailyLimitTokens: p.DailyLimitTokens,
+			DailyLimitImages: p.DailyLimitImages,
 			CreatedAt:        time.Now().Unix(),
 		}
 		if err := a.store.UpsertSubKey(sk); err != nil {
@@ -530,6 +690,7 @@ func (a *Admin) handleSubkeyItem(w http.ResponseWriter, r *http.Request) {
 			AllowedModels    []string `json:"allowed_models"`
 			AllowedAccounts  []string `json:"allowed_accounts"`
 			DailyLimitTokens *int64   `json:"daily_limit_tokens"`
+			DailyLimitImages *int64   `json:"daily_limit_images"`
 		}
 		if err := decode(r, &p); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
@@ -565,6 +726,9 @@ func (a *Admin) handleSubkeyItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.DailyLimitTokens != nil {
 			sk.DailyLimitTokens = *p.DailyLimitTokens
+		}
+		if p.DailyLimitImages != nil {
+			sk.DailyLimitImages = *p.DailyLimitImages
 		}
 		if err := a.store.UpsertSubKey(sk); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
