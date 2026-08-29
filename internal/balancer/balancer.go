@@ -67,6 +67,7 @@ type Balancer struct {
 	modelApps map[string][]*model.Endpoint // 易读名 -> 该模型下全部叶子
 	defs      map[string]provider.Def      // accountID -> 供应商定义（Refresh 时解析缓存）
 	prices    map[string][3]float64        // 易读名 -> [输入,输出,图像] 单价（含停用模型，供成本核算）
+	limits    map[string][2]int64          // 易读名 -> [上下文,最大输出] 上限（含停用模型；0=不校验）
 
 	wrrMu    sync.Mutex
 	wrrState map[string]*wrrState
@@ -115,6 +116,7 @@ func New(st *store.Store, sessionTTL time.Duration) *Balancer {
 		modelApps:  map[string][]*model.Endpoint{},
 		defs:       map[string]provider.Def{},
 		prices:     map[string][3]float64{},
+		limits:     map[string][2]int64{},
 		wrrState:   map[string]*wrrState{},
 		sessions:   map[string]sessEntry{},
 		sessionTTL: sessionTTL,
@@ -232,6 +234,7 @@ func (b *Balancer) Refresh() {
 	modelApps := map[string][]*model.Endpoint{}
 	defMap := map[string]provider.Def{}
 	priceMap := map[string][3]float64{}
+	limitMap := map[string][2]int64{}
 
 	for _, a := range accounts {
 		accMap[a.ID] = a
@@ -240,6 +243,7 @@ func (b *Balancer) Refresh() {
 	for _, m := range modelsList {
 		// 价格索引包含停用模型：日志里的历史用量仍要按当时定价折算。
 		priceMap[m.Name] = [3]float64{m.PriceInput, m.PriceOutput, m.PriceImage}
+		limitMap[m.Name] = [2]int64{m.ContextTokens, m.MaxOutputTokens}
 		if m.Enabled {
 			modMap[m.Name] = m
 		}
@@ -270,6 +274,7 @@ func (b *Balancer) Refresh() {
 	b.modelApps = modelApps
 	b.defs = defMap
 	b.prices = priceMap
+	b.limits = limitMap
 	b.mu.Unlock()
 
 	// 清理指向已不存在叶子的粘性会话（TTL 过期在读侧惰性淘汰）。
@@ -685,17 +690,31 @@ func (b *Balancer) TPMAdd(e *model.Endpoint, units int64) {
 	e.Runtime.TPM.Add(units)
 }
 
+// ModelLimits 返回模型能力上限（上下文、单次最大输出；0 = 未设置不校验）。
+// 与价格索引同口径：包含停用模型，供网关前置校验。
+func (b *Balancer) ModelLimits(name string) (context, maxOut int64) {
+	b.mu.RLock()
+	lim, ok := b.limits[name]
+	b.mu.RUnlock()
+	if !ok {
+		return 0, 0
+	}
+	return lim[0], lim[1]
+}
+
 // Record 上报一次请求结果：驱动叶节点熔断 + 账号/叶/子Key 统计 + 写日志。
 // 图像张数从 l.ImageCount 读取（0 表示文本请求）。
 // 成本按实际命中的模型名（l.Model，fallback 后）折算并写回 l.Cost。
 // 走阻塞投递（背压），保证统计不丢，避免 SubKey 日限额被绕过。
-func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok bool) {
+// clientErr 表示失败由客户端请求自身导致（如上下文超限、max_tokens 超上限）：
+// 统计与日志照记，但不计入端点连续失败——这是请求方的错，不应熔断健康端点。
+func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr bool) {
 	if ep != nil && ep.Runtime != nil {
 		rt := ep.Runtime
 		if ok {
 			atomic.StoreInt32(&rt.ConsecutiveFailures, 0)
 			atomic.StoreInt64(&rt.CircuitOpenUntil, 0)
-		} else {
+		} else if !clientErr {
 			fails := atomic.AddInt32(&rt.ConsecutiveFailures, 1)
 			if fails >= model.CircuitBreakerThreshold {
 				atomic.StoreInt64(&rt.CircuitOpenUntil, nowPlusCooldown(fails))

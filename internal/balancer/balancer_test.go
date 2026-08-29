@@ -106,16 +106,32 @@ func TestCircuitBreakerRecord(t *testing.T) {
 	b.seed([]*model.Account{mkAcc("a1", 1)}, []*model.Endpoint{e}, nil)
 
 	for i := 0; i < model.CircuitBreakerThreshold; i++ {
-		b.Record(&model.UsageLog{AccountID: "a1", EndpointID: e.ID}, e, false)
+		b.Record(&model.UsageLog{AccountID: "a1", EndpointID: e.ID}, e, false, false)
 	}
 	e.EnsureRuntime()
 	if e.Runtime.CircuitOpenUntil <= 0 {
 		t.Fatalf("expected endpoint circuit to open after failures")
 	}
 	// 成功应复位熔断。（阻塞投递需 consumer 消费；直接读内存态即可）
-	b.Record(&model.UsageLog{AccountID: "a1", EndpointID: e.ID}, e, true)
+	b.Record(&model.UsageLog{AccountID: "a1", EndpointID: e.ID}, e, true, false)
 	if e.Runtime.CircuitOpenUntil != 0 || e.Runtime.ConsecutiveFailures != 0 {
 		t.Fatalf("expected circuit reset on success")
+	}
+}
+
+// TestRecordClientErrNoCircuit 客户端请求自身导致的失败（上下文超限等）
+// 不计入端点熔断：统计照记，但连续次数不累加、熔断不打开。
+func TestRecordClientErrNoCircuit(t *testing.T) {
+	b := newTestBalancer()
+	e := mkEP("e1", "a1", "m", "ep-1", 1)
+	b.seed([]*model.Account{mkAcc("a1", 1)}, []*model.Endpoint{e}, nil)
+
+	for i := 0; i < model.CircuitBreakerThreshold*3; i++ {
+		b.Record(&model.UsageLog{AccountID: "a1", EndpointID: e.ID}, e, false, true)
+	}
+	e.EnsureRuntime()
+	if e.Runtime.CircuitOpenUntil != 0 || e.Runtime.ConsecutiveFailures != 0 {
+		t.Fatalf("client-caused failures must not trip circuit: %+v", e.Runtime)
 	}
 }
 
@@ -480,7 +496,7 @@ func TestComputeCost(t *testing.T) {
 	b.statCh = make(chan statOp, 8)
 	b.logCh = make(chan *model.UsageLog, 8)
 	l := &model.UsageLog{Model: "m", PromptTokens: 2_000_000}
-	b.Record(l, nil, true)
+	b.Record(l, nil, true, false)
 	if l.Cost != 4 {
 		t.Fatalf("Record must stamp cost on log, got %v", l.Cost)
 	}

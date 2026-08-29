@@ -1,7 +1,7 @@
 /* ArkGate 前端 —— Vue 3（vendor 全局构建，免 Node 构建；Arco 风格沿用 style.css）
  *
  * 结构：LoginPage（管理端 / 子 Key 门户双模式登录）
- *      ├─ AdminShell（侧边栏 + 六个管理页：总览/账号/模型映射/子Key/日志/使用说明）
+ *      ├─ AdminShell（侧边栏 + 管理页：总览/用量分析/账号/模型映射/子Key/日志/设置 + 底部折叠使用说明）
  *      └─ PortalPage（子 Key 自助门户：限额进度、用量、成功率、脱敏调用记录）
  */
 "use strict";
@@ -61,6 +61,30 @@ function toast(msg, ok = true) {
     const i = toasts.findIndex((t) => t.id === id);
     if (i >= 0) toasts.splice(i, 1);
   }, 2600);
+}
+
+// ── 本地偏好（仅存本浏览器 localStorage，不影响网关配置） ──
+const DEFAULT_BG_URL = "https://img.paulzzh.com/touhou/random";
+const prefs = reactive({
+  // 背景图：随机图床或固定图片地址均可；空串 = 关闭背景。未设置过时用默认图床。
+  bgUrl: localStorage.getItem("arkgate_bg") !== null ? localStorage.getItem("arkgate_bg") : DEFAULT_BG_URL,
+  bgBlur: Number(localStorage.getItem("arkgate_bg_blur") ?? 40), // 模糊百分比 0-100
+  theme: localStorage.getItem("arkgate_theme") || "light",
+  overviewAuto: Number(localStorage.getItem("arkgate_overview_auto") ?? 0), // 总览自动刷新秒数，0=关闭
+  helpOpen: localStorage.getItem("arkgate_help_open") !== "0", // 侧栏使用说明默认展开
+});
+// savePrefs 落盘并即时应用（模糊换算：40% ≈ 12px，纯视觉参数）。
+function savePrefs() {
+  localStorage.setItem("arkgate_bg", prefs.bgUrl);
+  localStorage.setItem("arkgate_bg_blur", String(prefs.bgBlur));
+  localStorage.setItem("arkgate_theme", prefs.theme);
+  localStorage.setItem("arkgate_overview_auto", String(prefs.overviewAuto));
+  localStorage.setItem("arkgate_help_open", prefs.helpOpen ? "1" : "0");
+  applyPrefs();
+}
+function applyPrefs() {
+  document.documentElement.setAttribute("data-theme", prefs.theme === "dark" ? "dark" : "");
+  document.documentElement.classList.toggle("has-bg", !!prefs.bgUrl);
 }
 
 // ── API 封装 ──
@@ -182,7 +206,7 @@ function statusTag(s) {
 
 // ── 总览（以统计图表为主） ──
 const OverviewPage = {
-  data() { return { o: null, series: [] }; },
+  data() { return { o: null, series: [], prefs }; },
   computed: {
     // 按小时聚合：tokens / cost / requests 三条趋势共用一套时间桶。
     hourly() {
@@ -227,7 +251,13 @@ const OverviewPage = {
     costChartHtml() { return renderBarChart(this.hourly, (p) => p.cost, "#f59e0b", fmtCost); },
     reqChartHtml() { return renderBarChart(this.hourly, (p) => p.requests, "#3b82f6", fmtInt); },
   },
-  mounted() { this.load(); },
+  mounted() {
+    this.load();
+    this.setupAuto();
+  },
+  beforeUnmount() {
+    if (this._timer) clearInterval(this._timer);
+  },
   template: `
   <div class="page">
     <div class="page-head">
@@ -277,15 +307,21 @@ const OverviewPage = {
       req("GET", "/api/overview").then((d) => { this.o = d; }).catch((e) => toast(e.message, false));
       req("GET", "/api/usage/series?hours=24").then((s) => { this.series = s || []; }).catch(() => {});
     },
+    // setupAuto 按设置页的自动刷新间隔起停定时器（进入本页时生效）。
+    setupAuto() {
+      if (this._timer) clearInterval(this._timer);
+      this._timer = null;
+      if (this.prefs.overviewAuto > 0) {
+        this._timer = setInterval(() => this.load(), this.prefs.overviewAuto * 1000);
+      }
+    },
   },
 };
 
-// 深/浅色切换（挂到 globalProperties 供模板调用）。
+// 深/浅色切换（挂到 globalProperties 供模板调用；状态并入 prefs 设置页可见）。
 function toggleDark() {
-  const cur = document.documentElement.getAttribute("data-theme");
-  const next = cur === "dark" ? "" : "dark";
-  document.documentElement.setAttribute("data-theme", next);
-  localStorage.setItem("arkgate_theme", next);
+  prefs.theme = prefs.theme === "dark" ? "light" : "dark";
+  savePrefs();
 }
 
 // Token 用量趋势：子 Key × 模型按小时堆叠柱状图（SVG 字符串）。
@@ -564,8 +600,9 @@ const ModelsPage = {
   data() {
     return {
       models: [], accounts: [], eps: [],
-      mModal: null, // 模型弹窗 {name|null, form}
+      mModal: null, // 模型弹窗 {name|null, form, catHint}
       eModal: null, // 映射弹窗 {id|null, form}
+      syncing: false, // 目录补全进行中
     };
   },
   mounted() { this.load(); },
@@ -587,12 +624,37 @@ const ModelsPage = {
         name: m.name,
         form: { type: m.type || "text", display: m.display, description: m.description || "",
           fallback: (m.fallback || []).join(", "), enabled: m.enabled,
-          price_input: m.price_input || 0, price_output: m.price_output || 0, price_image: m.price_image || 0 },
+          price_input: m.price_input || 0, price_output: m.price_output || 0, price_image: m.price_image || 0,
+          context_tokens: m.context_tokens || 0, max_output_tokens: m.max_output_tokens || 0 },
+        catHint: "",
       } : {
         name: null,
         form: { type: "text", display: "", description: "", fallback: "", enabled: true,
-          price_input: 0, price_output: 0, price_image: 0 },
+          price_input: 0, price_output: 0, price_image: 0,
+          context_tokens: 0, max_output_tokens: 0 },
+        catHint: "",
       };
+      if (m) this.lookupCat(m.name); // 编辑态：即时显示目录命中情况
+    },
+    // lookupCat 按模型名查内置目录，提示将自动补全的价格/能力（人工填写优先）。
+    lookupCat(name) {
+      if (!name || !this.mModal) return;
+      req("GET", "/api/catalog/lookup?name=" + encodeURIComponent(name))
+        .then((d) => {
+          if (!this.mModal) return;
+          this.mModal.catHint = d.found ? this.catText(d.entry) : "";
+        })
+        .catch(() => {});
+    },
+    catText(e) {
+      if (!e) return "";
+      const parts = [];
+      if (e.max_input) parts.push("上下文 " + fmtTokens(e.max_input));
+      if (e.max_output) parts.push("最大输出 " + fmtTokens(e.max_output));
+      if (e.cost_in) parts.push("输入 $" + e.cost_in + "/1M");
+      if (e.cost_out) parts.push("输出 $" + e.cost_out + "/1M");
+      if (e.cost_image) parts.push("图像 $" + e.cost_image + "/张");
+      return parts.join(" · ");
     },
     saveModel() {
       const f = this.mModal.form;
@@ -603,6 +665,7 @@ const ModelsPage = {
         fallback, enabled: f.enabled,
         price_input: Number(f.price_input) || 0, price_output: Number(f.price_output) || 0,
         price_image: Number(f.price_image) || 0,
+        context_tokens: Number(f.context_tokens) || 0, max_output_tokens: Number(f.max_output_tokens) || 0,
       };
       if (!name) {
         if (!f.name0 || !f.name0.trim()) { toast("请输入模型名", false); return; }
@@ -610,8 +673,25 @@ const ModelsPage = {
       const p = name
         ? req("PUT", "/api/models/" + name, payload)
         : req("POST", "/api/models", { ...payload, name: (f.name0 || "").trim() });
-      p.then(() => { toast("已保存"); this.mModal = null; this.load(); })
+      p.then((d) => {
+        const filled = d && d.auto_filled;
+        toast(filled && filled.length ? "已保存，目录自动补全：" + filled.join("、") : "已保存");
+        this.mModal = null; this.load();
+      })
         .catch((e) => toast(e.message, false));
+    },
+    // syncCatalog 在线刷新目录（失败回落内嵌快照）并为所有模型补全空缺字段。
+    syncCatalog() {
+      if (this.syncing) return;
+      this.syncing = true;
+      req("POST", "/api/models/metadata-sync")
+        .then((d) => {
+          const src = d.fetch_ok ? "在线目录" : "内嵌快照";
+          toast(d.updated > 0 ? "已从" + src + "补全 " + d.updated + " 个模型" : "目录已是最新（来源：" + src + "）");
+          this.load();
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.syncing = false; });
     },
     delModel(m) {
       if (!confirm("确认删除该模型及其所有映射？")) return;
@@ -654,16 +734,21 @@ const ModelsPage = {
       <button class="btn btn-primary" @click="openModel(null)">+ 新建模型</button>
       <button class="btn btn-outline" @click="openEp(null)">+ 添加映射</button>
       <div class="spacer"></div>
+      <button class="btn btn-outline" :disabled="syncing" @click="syncCatalog">{{ syncing ? '补全中…' : '⟳ 从目录补全' }}</button>
     </div>
     <div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>模型名</th><th>类型</th><th>显示名</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
+        <th>模型名</th><th>类型</th><th>显示名</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
       </tr></thead><tbody>
-        <tr v-if="!models.length"><td colspan="8" class="empty">暂无模型</td></tr>
+        <tr v-if="!models.length"><td colspan="9" class="empty">暂无模型</td></tr>
         <tr v-for="m in models" :key="m.name">
           <td class="mono">{{ m.name }}</td>
           <td><span :class="m.type==='image' ? 'tag tag-purple' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : '文本' }}</span></td>
           <td>{{ m.display }}</td>
+          <td class="mono">
+            <template v-if="m.context_tokens || m.max_output_tokens">{{ m.context_tokens ? fmtTokens(m.context_tokens) : '—' }} / {{ m.max_output_tokens ? fmtTokens(m.max_output_tokens) : '—' }}</template>
+            <span v-else>—</span>
+          </td>
           <td class="cost">
             <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
             <template v-else-if="m.price_input || m.price_output">{{ fmtCost(m.price_input) }} / {{ fmtCost(m.price_output) }} per 1M</template>
@@ -700,8 +785,9 @@ const ModelsPage = {
       <div class="modal"><div class="modal-head"><h3>{{ mModal.name ? '编辑模型' : '新建模型' }}</h3><button class="modal-close" @click="mModal=null">×</button></div>
       <div class="modal-body">
         <div class="form-item"><label>模型名（下游调用用，唯一）<span class="req" v-if="!mModal.name">*</span></label>
-          <input v-if="!mModal.name" v-model="mModal.form.name0" placeholder="例如 doubao-seed-1-6"/>
-          <input v-else :value="mModal.name" disabled/></div>
+          <input v-if="!mModal.name" v-model="mModal.form.name0" placeholder="例如 doubao-seed-1-6" @blur="lookupCat(mModal.form.name0 && mModal.form.name0.trim())"/>
+          <input v-else :value="mModal.name" disabled/>
+          <div v-if="mModal.catHint" class="form-tip">目录命中：{{ mModal.catHint }}（保存时自动补全空缺字段，人工填写优先）</div></div>
         <div class="form-item"><label>类型</label>
           <select v-model="mModal.form.type">
             <option value="text">文本（chat / responses）</option>
@@ -714,6 +800,10 @@ const ModelsPage = {
         <div class="form-row" v-else>
           <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model="mModal.form.price_input" type="number" step="0.0001"/></div>
           <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model="mModal.form.price_output" type="number" step="0.0001"/></div>
+        </div>
+        <div class="form-row" v-if="mModal.form.type!=='image'">
+          <div class="form-item"><label>上下文窗口（tokens，0=不校验）</label><input v-model="mModal.form.context_tokens" type="number"/></div>
+          <div class="form-item"><label>最大输出（tokens，0=不裁剪）</label><input v-model="mModal.form.max_output_tokens" type="number"/></div>
         </div>
         <div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型）</label>
           <input v-model="mModal.form.fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>
@@ -1032,43 +1122,46 @@ const UsagePage = {
   </div>`,
 };
 
-// ── 使用说明 ──
-const HelpPage = {
-  data() { return { host: location.origin }; },
-  methods: { copy(text) { navigator.clipboard.writeText(text).then(() => toast("已复制")); } },
-  template: `
-  <div class="page">
-    <div class="page-title">使用说明</div>
-    <div class="page-sub">把 ArkGate 当作 OpenAI 兼容端点接入你的客户端。</div>
-    <div class="card"><div class="card-head"><div class="card-title">OpenAI 兼容端点</div></div>
-      <div class="kv"><span class="k">Base URL</span><span class="v mono code-copy" @click="copy(host + '/v1')">{{ host }}/v1</span></div>
-      <div class="kv"><span class="k">Chat Completions</span><span class="v mono">POST /v1/chat/completions</span></div>
-      <div class="kv"><span class="k">Responses</span><span class="v mono">POST /v1/responses</span></div>
-      <div class="kv"><span class="k">Images Generations</span><span class="v mono">POST /v1/images/generations</span></div>
-      <div class="kv"><span class="k">模型列表</span><span class="v mono">GET /v1/models</span></div>
-      <div class="kv"><span class="k">子 Key 自助门户</span><span class="v mono">POST /api/portal/overview（Bearer sk-xxx）</span></div>
-    </div>
-    <div class="card"><div class="card-head"><div class="card-title">调用示例</div></div>
-      <pre style="background:var(--color-fill-1);border-radius:8px;padding:16px;overflow:auto;font-size:12px;font-family:ui-monospace,Menlo,monospace">{{ example }}</pre></div>
-    <div class="card"><div class="card-head"><div class="card-title">环境变量</div></div>
-      <div class="kv"><span class="k">ARKGATE_ADDR</span><span class="v mono">监听地址（默认 0.0.0.0:8002）</span></div>
-      <div class="kv"><span class="k">ARKGATE_DATA_DIR</span><span class="v mono">数据目录（默认可执行文件同级）</span></div>
-      <div class="kv"><span class="k">ARKGATE_FIRST_TOKEN_TIMEOUT</span><span class="v mono">流式首字节超时秒数（默认 30，0 关闭；超时换下一叶子重试）</span></div>
-      <div class="kv"><span class="k">ARKGATE_SESSION_TTL</span><span class="v mono">会话粘性 TTL 秒数（默认 300，0 关闭；同子 Key+模型固定路由，利于 prompt cache）</span></div>
-    </div>
-  </div>`,
-  computed: {
-    example() {
-      return "curl " + this.host + "/v1/chat/completions \\\n" +
-        '  -H "Authorization: Bearer sk-你的子Key" \\\n' +
-        '  -H "Content-Type: application/json" \\\n' +
-        "  -d '{\n" +
-        '    "model": "doubao-seed-1-6",\n' +
-        '    "messages": [{"role":"user","content":"你好"}],\n' +
-        '    "stream": false\n' +
-        "  }";
+// ── 设置（本浏览器偏好：外观 / 总览；不影响网关配置） ──
+const SettingsPage = {
+  data() { return { prefs }; },
+  methods: {
+    save() { savePrefs(); },
+    resetBg() {
+      this.prefs.bgUrl = DEFAULT_BG_URL;
+      this.prefs.bgBlur = 40;
+      savePrefs();
+      toast("已恢复默认背景");
     },
   },
+  template: `
+  <div class="page">
+    <div class="page-title">设置</div>
+    <div class="page-sub">本地浏览器偏好，仅保存在当前浏览器，不影响网关配置；改动即时生效。</div>
+    <div class="card"><div class="card-head"><div class="card-title">外观</div></div>
+      <div class="form-item"><label>背景图地址（留空关闭；可填随机图床或固定图片 URL）</label>
+        <div style="display:flex;gap:8px">
+          <input v-model="prefs.bgUrl" placeholder="https://img.paulzzh.com/touhou/random" @input="save"/>
+          <button class="btn btn-outline" style="white-space:nowrap" @click="resetBg">恢复默认</button>
+        </div></div>
+      <div class="form-item"><label>背景模糊：{{ prefs.bgBlur }}%</label>
+        <input type="range" min="0" max="100" v-model.number="prefs.bgBlur" @input="save" style="width:100%"/></div>
+      <div class="form-item"><label>主题</label>
+        <select v-model="prefs.theme" @change="save">
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+        </select></div>
+    </div>
+    <div class="card"><div class="card-head"><div class="card-title">总览</div></div>
+      <div class="form-item"><label>自动刷新间隔</label>
+        <select v-model.number="prefs.overviewAuto" @change="save">
+          <option :value="0">关闭（手动刷新）</option>
+          <option :value="10">每 10 秒</option>
+          <option :value="30">每 30 秒</option>
+          <option :value="60">每 60 秒</option>
+        </select></div>
+    </div>
+  </div>`,
 };
 
 // ── 管理端外壳 ──
@@ -1079,18 +1172,23 @@ const MENU = [
   { key: "models", label: "模型映射", icon: "🧩", comp: "ModelsPage" },
   { key: "subkeys", label: "子 Key", icon: "🔑", comp: "SubKeysPage" },
   { key: "logs", label: "请求日志", icon: "📄", comp: "LogsPage" },
-  { key: "settings", label: "使用说明", icon: "⚙️", comp: "HelpPage" },
+  { key: "settings", label: "设置", icon: "⚙️", comp: "SettingsPage" },
 ];
 
 const AdminShell = {
   emits: ["logout"],
-  data() { return { view: "overview" }; },
+  data() { return { view: "overview", prefs, host: location.origin }; },
   methods: {
     logout() {
       state.adminToken = "";
       localStorage.removeItem("arkgate_token");
       this.$emit("logout");
     },
+    toggleHelp() {
+      prefs.helpOpen = !prefs.helpOpen;
+      savePrefs();
+    },
+    copy(text) { navigator.clipboard.writeText(text).then(() => toast("已复制")); },
   },
   template: `
   <div class="layout">
@@ -1099,6 +1197,19 @@ const AdminShell = {
       <div class="nav">
         <div v-for="m in menu" :key="m.key" class="nav-item" :class="{active: view===m.key}" @click="view=m.key">
           <span class="ic">{{ m.icon }}</span>{{ m.label }}
+        </div>
+      </div>
+      <div class="side-help">
+        <div class="side-help-head" @click="toggleHelp">
+          <span>📖 使用说明</span><span class="arr">{{ prefs.helpOpen ? '▾' : '▸' }}</span>
+        </div>
+        <div v-show="prefs.helpOpen" class="side-help-body">
+          <div class="sh-row">Base URL：<span class="mono linkish" title="点击复制" @click="copy(host + '/v1')">{{ host }}/v1</span></div>
+          <div class="sh-row mono">POST /v1/chat/completions</div>
+          <div class="sh-row mono">POST /v1/responses</div>
+          <div class="sh-row mono">POST /v1/images/generations</div>
+          <div class="sh-row mono">GET /v1/models</div>
+          <div class="sh-note">鉴权：Authorization: Bearer sk-你的子Key</div>
         </div>
       </div>
       <div style="padding:12px">
@@ -1221,7 +1332,17 @@ const PortalPage = {
 // ── 根组件 ──
 const App = {
   components: { LoginPage, AdminShell, PortalPage },
-  data() { return { mode: "loading" }; },
+  // toasts/prefs：模块级 reactive（toast() 写入、设置页读写），挂进 data 供模板渲染。
+  data() { return { mode: "loading", toasts, prefs }; },
+  computed: {
+    // 背景层样式：模糊百分比换算 px（40% ≈ 12px），inset 负边距消除模糊边缘发虚。
+    bgStyle() {
+      return {
+        backgroundImage: "url(\"" + this.prefs.bgUrl + "\")",
+        filter: "blur(" + Math.round(this.prefs.bgBlur * 0.3) + "px)",
+      };
+    },
+  },
   methods: {
     onAdmin(tok) {
       state.adminToken = tok;
@@ -1237,8 +1358,7 @@ const App = {
     logoutPortal() { state.subKey = ""; localStorage.removeItem("arkgate_sk"); this.mode = "login"; },
   },
   mounted() {
-    const theme = localStorage.getItem("arkgate_theme");
-    if (theme) document.documentElement.setAttribute("data-theme", theme);
+    applyPrefs();
     // 401 统一兜底：门户会话与管理会话分别退回登录页。
     window.__arkgateOn401 = (path) => {
       if (path && path.indexOf("/api/portal/") === 0) {
@@ -1267,10 +1387,13 @@ const App = {
     });
   },
   template: `
+    <div v-if="prefs.bgUrl" class="app-bg" :style="bgStyle"></div>
+    <div v-if="prefs.bgUrl" class="app-bg-shade"></div>
     <LoginPage v-if="mode==='login'" @admin="onAdmin" @portal="onPortal"/>
     <AdminShell v-else-if="mode==='admin'" @logout="logoutAdmin"/>
     <PortalPage v-else-if="mode==='portal'" @logout="logoutPortal"/>
-    <div v-else class="login-wrap"><div class="login-card sub">加载中…</div></div>`,
+    <div v-else class="login-wrap"><div class="login-card sub">加载中…</div></div>
+    <div class="toasts"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.ok ? '' : 'err'">{{ t.msg }}</div></div>`,
 };
 
 const app = createApp(App);
@@ -1288,5 +1411,5 @@ app.component("OverviewPage", OverviewPage)
   .component("ModelsPage", ModelsPage)
   .component("SubKeysPage", SubKeysPage)
   .component("LogsPage", LogsPage)
-  .component("HelpPage", HelpPage)
+  .component("SettingsPage", SettingsPage)
   .mount("#app");

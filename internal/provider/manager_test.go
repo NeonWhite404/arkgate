@@ -12,6 +12,33 @@ import (
 	"time"
 )
 
+// TestIsRequestFault 锁定客户端错误分类：仅 400/413/422 且错误体命中超限特征
+// 才视为请求方问题；限流/鉴权/参数无关错误仍计入端点熔断。
+func TestIsRequestFault(t *testing.T) {
+	cases := []struct {
+		code int
+		body string
+		want bool
+	}{
+		{400, `{"error":{"message":"This model's maximum context length is 128000 tokens"}}`, true},
+		{413, "The number of input tokens exceeds the model's limit", true},
+		{422, `{"message":"prompt is too long: 200000 tokens > 131072 maximum"}`, true},
+		{400, `{"error":{"message":"Invalid value for 'temperature'"}}`, false},
+		{429, "quota exceeded for this account", false}, // 含 exceed 但状态码不对
+		{401, "invalid api key", false},
+		{404, `{"error":{"message":"model not found"}}`, false},
+	}
+	for _, c := range cases {
+		got := IsRequestFault(&HTTPError{Code: c.code, Body: []byte(c.body)})
+		if got != c.want {
+			t.Fatalf("IsRequestFault(%d, %q) = %v, want %v", c.code, c.body, got, c.want)
+		}
+	}
+	if IsRequestFault(errors.New("plain network error")) {
+		t.Fatalf("non-HTTPError must not be request fault")
+	}
+}
+
 // TestChatPassthroughAndModelSwap 锁定透传语义：除 model 换成上游标识外，
 // 其余字段（含供应商私有字段）原样到达上游；Key 为不透明字符串原样进鉴权头。
 func TestChatPassthroughAndModelSwap(t *testing.T) {

@@ -55,7 +55,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
-const schemaVersion = "3"
+const schemaVersion = "4"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -202,6 +202,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE models ADD COLUMN price_image REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN cost REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_daily ADD COLUMN cost REAL NOT NULL DEFAULT 0`,
+		// —— v4：模型能力上限（0=未设置，允许目录自动补全） ——
+		`ALTER TABLE models ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE models ADD COLUMN max_output_tokens INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -336,14 +339,15 @@ func scanModel(rows *sql.Rows) (*model.Model, error) {
 	m := &model.Model{}
 	var fb string
 	if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
-		&m.Type, &m.PriceInput, &m.PriceOutput, &m.PriceImage); err != nil {
+		&m.Type, &m.PriceInput, &m.PriceOutput, &m.PriceImage,
+		&m.ContextTokens, &m.MaxOutputTokens); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(fb), &m.Fallback)
 	return m, nil
 }
 
-const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image`
+const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image,context_tokens,max_output_tokens`
 
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
@@ -373,7 +377,8 @@ func (s *Store) GetModel(name string) (*model.Model, error) {
 	err := s.db.QueryRow(
 		`SELECT `+modelCols+` FROM models WHERE name=?`, name,
 	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt, &m.Type,
-		&m.PriceInput, &m.PriceOutput, &m.PriceImage)
+		&m.PriceInput, &m.PriceOutput, &m.PriceImage,
+		&m.ContextTokens, &m.MaxOutputTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -389,13 +394,14 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
 	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,
-			price_input,price_output,price_image)
-		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+			price_input,price_output,price_image,context_tokens,max_output_tokens)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
 		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
 		type=excluded.type, price_input=excluded.price_input, price_output=excluded.price_output,
-		price_image=excluded.price_image`,
+		price_image=excluded.price_image, context_tokens=excluded.context_tokens,
+		max_output_tokens=excluded.max_output_tokens`,
 		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type,
-		m.PriceInput, m.PriceOutput, m.PriceImage)
+		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens)
 	return err
 }
 

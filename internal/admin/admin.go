@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"arkgate/internal/balancer"
+	"arkgate/internal/catalog"
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
 	"arkgate/internal/secure"
@@ -25,6 +27,7 @@ type Admin struct {
 	store   *store.Store
 	box     *secure.Box
 	bal     *balancer.Balancer
+	catalog *catalog.Catalog // 内置模型元数据目录（价格/能力自动补全来源）
 	handler http.Handler
 }
 
@@ -32,7 +35,7 @@ const tokenHashKey = "admin_token_hash"
 
 // New 构造管理后端。
 func New(st *store.Store, box *secure.Box, bal *balancer.Balancer) *Admin {
-	a := &Admin{store: st, box: box, bal: bal}
+	a := &Admin{store: st, box: box, bal: bal, catalog: catalog.New()}
 	a.handler = a.routes()
 	return a
 }
@@ -104,6 +107,8 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/accounts/", a.handleAccountItem)
 	reg("/api/models", a.handleModelsCollection)
 	reg("/api/models/", a.handleModelItem)
+	reg("/api/models/metadata-sync", a.handleMetadataSync)
+	reg("/api/catalog/lookup", a.handleCatalogLookup)
 	reg("/api/endpoints", a.handleEndpointsCollection)
 	reg("/api/endpoints/", a.handleEndpointItem)
 	reg("/api/subkeys", a.handleSubkeysCollection)
@@ -438,6 +443,114 @@ func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
 	return nil
 }
 
+// ─────────────────────────── 模型目录自动补全 ───────────────────────────
+
+// catalogDataURL LiteLLM 社区维护的模型元数据目录（统一来源，按模型名查询）。
+const catalogDataURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+
+// fillModelFromCatalog 按模型名查内置目录，补全空缺（零值）字段；
+// 人工填写的非零值一律不动。返回被补全的字段名列表。
+func fillModelFromCatalog(c *catalog.Catalog, m *model.Model) []string {
+	e, ok := c.Lookup(m.Name)
+	if !ok {
+		return nil
+	}
+	var filled []string
+	if m.ContextTokens == 0 && e.MaxInput > 0 {
+		m.ContextTokens = e.MaxInput
+		filled = append(filled, "context_tokens")
+	}
+	if m.MaxOutputTokens == 0 && e.MaxOutput > 0 {
+		m.MaxOutputTokens = e.MaxOutput
+		filled = append(filled, "max_output_tokens")
+	}
+	if m.PriceInput == 0 && e.CostIn > 0 {
+		m.PriceInput = e.CostIn
+		filled = append(filled, "price_input")
+	}
+	if m.PriceOutput == 0 && e.CostOut > 0 {
+		m.PriceOutput = e.CostOut
+		filled = append(filled, "price_output")
+	}
+	if m.PriceImage == 0 && e.CostImage > 0 {
+		m.PriceImage = e.CostImage
+		filled = append(filled, "price_image")
+	}
+	return filled
+}
+
+// fetchLatestCatalog 在线拉取最新目录原文（失败返回 nil，由调用方回落内嵌快照）。
+func fetchLatestCatalog() []byte {
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(catalogDataURL)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// handleMetadataSync 全量补全：优先在线拉取最新目录（失败静默回落内嵌快照），
+// 然后为所有模型补全空缺（零值）字段；人工填写的值不动。
+func (a *Admin) handleMetadataSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	fetchOK := false
+	if data := fetchLatestCatalog(); data != nil {
+		if err := a.catalog.Reload(data); err == nil {
+			fetchOK = true
+		}
+	}
+	type entry struct {
+		Name   string   `json:"name"`
+		Fields []string `json:"fields"`
+	}
+	details := []entry{}
+	models, err := a.store.ListModels()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	for _, m := range models {
+		fields := fillModelFromCatalog(a.catalog, m)
+		if len(fields) == 0 {
+			continue
+		}
+		if err := a.store.UpsertModel(m); err != nil {
+			writeJSON(w, 500, map[string]any{"detail": err.Error()})
+			return
+		}
+		details = append(details, entry{Name: m.Name, Fields: fields})
+	}
+	a.bal.Refresh()
+	writeJSON(w, 200, map[string]any{
+		"updated":  len(details),
+		"details":  details,
+		"fetch_ok": fetchOK,
+		"source":   a.catalog.Source(),
+		"entries":  a.catalog.Count(),
+	})
+}
+
+// handleCatalogLookup 按模型名查目录，供前端表单即时提示与预填参考。
+func (a *Admin) handleCatalogLookup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	e, ok := a.catalog.Lookup(r.URL.Query().Get("name"))
+	writeJSON(w, 200, map[string]any{"found": ok, "entry": e})
+}
+
 func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -470,13 +583,15 @@ func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		// 目录自动补全：按模型名查内置目录，只填空缺（零值）字段，人工填写优先。
+		filled := fillModelFromCatalog(a.catalog, &m)
 		m.Enabled = true // 新建默认启用
 		if err := a.store.UpsertModel(&m); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
 		a.bal.Refresh()
-		writeJSON(w, 200, map[string]any{"success": true})
+		writeJSON(w, 200, map[string]any{"success": true, "auto_filled": filled})
 	default:
 		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
 	}
@@ -532,6 +647,13 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if v, ok := probe["price_image"]; ok {
 			existing.PriceImage = floatField(v)
+		}
+		// 能力上限：0 = 未设置（不校验，允许目录自动补全）。
+		if v, ok := probe["context_tokens"]; ok {
+			existing.ContextTokens = int64Field(v)
+		}
+		if v, ok := probe["max_output_tokens"]; ok {
+			existing.MaxOutputTokens = int64Field(v)
 		}
 		et := existing.Type
 		if et == "" {
@@ -934,6 +1056,23 @@ func intField(v any) int {
 	case json.Number:
 		i, _ := n.Int64()
 		return int(i)
+	default:
+		return 0
+	}
+}
+
+// int64Field 把 JSON 解码得到的数字安全转 int64（上限字段用）。
+func int64Field(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return i
 	default:
 		return 0
 	}

@@ -40,7 +40,8 @@ func TestStoreBasics(t *testing.T) {
 	}
 
 	m := &model.Model{Name: "img", Type: model.ModelTypeImage, Display: "图像", Enabled: true,
-		Fallback: []string{}, PriceImage: 0.5, PriceInput: 1.5, PriceOutput: 2.5}
+		Fallback: []string{}, PriceImage: 0.5, PriceInput: 1.5, PriceOutput: 2.5,
+		ContextTokens: 4096, MaxOutputTokens: 1024}
 	if err := s.UpsertModel(m); err != nil {
 		t.Fatalf("upsert model: %v", err)
 	}
@@ -53,6 +54,9 @@ func TestStoreBasics(t *testing.T) {
 	}
 	if gm.PriceImage != 0.5 || gm.PriceInput != 1.5 || gm.PriceOutput != 2.5 {
 		t.Fatalf("model prices roundtrip: %+v", gm)
+	}
+	if gm.ContextTokens != 4096 || gm.MaxOutputTokens != 1024 {
+		t.Fatalf("model limits roundtrip: %+v", gm)
 	}
 
 	ep := &model.Endpoint{ID: "e1", AccountID: "a1", Model: "img", EP: "doubao-seedream-4-0", Enabled: true, Weight: 3}

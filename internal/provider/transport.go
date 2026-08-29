@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Route 是网关选叶后解析出的「一条可发送路由」：
@@ -45,6 +46,38 @@ func AsHTTPError(err error) (*HTTPError, bool) {
 		return he, true
 	}
 	return nil, false
+}
+
+// requestFaultHints 上游「请求本身超限/非法」类错误体特征（宽松子串匹配，
+// 仅对 400/413/422 生效）。判定宁可偏宽：误判的代价只是少计一次端点失败，
+// 漏判的代价是把客户端错误累加成健康端点的熔断。
+var requestFaultHints = []string{
+	"context length", "maximum context", "context_length", "context window",
+	"input token", "prompt token", "prompt is too long", "prompt too long",
+	"too long", "token limit", "length limit", "max_tokens", "max_completion_tokens",
+	"max_output_tokens", "supports at most", "exceed",
+}
+
+// IsRequestFault 判断 err 是否由客户端请求自身问题导致（上下文超限、
+// max_tokens 超上限、参数非法等 4xx）。这类错误是请求方的错，不是端点故障，
+// 调用方应据此跳过端点熔断计数（透传行为不变）。
+func IsRequestFault(err error) bool {
+	he, ok := AsHTTPError(err)
+	if !ok {
+		return false
+	}
+	switch he.Code {
+	case 400, 413, 422:
+	default:
+		return false
+	}
+	body := strings.ToLower(string(he.Body))
+	for _, h := range requestFaultHints {
+		if strings.Contains(body, h) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(b []byte, n int) string {

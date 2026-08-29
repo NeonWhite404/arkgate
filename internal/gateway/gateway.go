@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -188,6 +189,8 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, ri routeInfo,
 	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, start time.Time) {
 	ok := ferr == nil
+	// 客户端请求自身导致的失败（上下文超限等）：统计/日志照记，但不计入端点熔断。
+	clientErr := !ok && provider.IsRequestFault(ferr)
 	l := &model.UsageLog{
 		TS:               time.Now().Unix(),
 		SubKeyID:         sk.ID,
@@ -210,6 +213,10 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, ri route
 	if !ok {
 		l.Status = "error"
 		l.Error = errText(ferr)
+		if clientErr {
+			// 标注请求方责任：日志页可直接过滤定位，且不计入端点熔断。
+			l.Error = "请求超限（客户端侧）：" + l.Error
+		}
 	}
 	// 喂 TPM：计费单位与叶节点 tpm_limit 的语义一致——文本喂 token 数，
 	// 图像喂张数（图像响应即使带 token 用量也不混入张数窗口）。
@@ -218,8 +225,46 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, ri route
 		units = images
 	}
 	g.bal.TPMAdd(leaf, units)
-	g.bal.Record(l, leaf, ok)
+	g.bal.Record(l, leaf, ok, clientErr)
 	g.bal.Release(leaf)
+}
+
+// chatOutputKeys / responsesOutputKeys 各端点中表达「输出上限」的请求字段。
+var (
+	chatOutputKeys      = []string{"max_tokens", "max_completion_tokens"}
+	responsesOutputKeys = []string{"max_output_tokens"}
+)
+
+// clampOutput 把请求体中的输出上限字段裁剪到模型最大输出 limit。
+// max_tokens 是上限语义而非承诺，裁剪不会截断输出，可省掉一次注定 4xx 的
+// 上游调用（省配额、不进失败统计）。仅在确实超过时重编码请求体，否则原样
+// 返回，保持字节透传。
+func clampOutput(body []byte, keys []string, limit int64) ([]byte, bool) {
+	var req map[string]json.RawMessage
+	if json.Unmarshal(body, &req) != nil {
+		return body, false
+	}
+	changed := false
+	for _, k := range keys {
+		raw, ok := req[k]
+		if !ok {
+			continue
+		}
+		var v float64
+		if json.Unmarshal(raw, &v) != nil || v <= float64(limit) {
+			continue // 未超限或非数值字段不碰
+		}
+		req[k] = json.RawMessage(strconv.AppendInt(nil, limit, 10))
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return out, true
 }
 
 // ─────────────────────────── /v1/chat/completions ───────────────────────────
@@ -248,6 +293,12 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !modelAllowed(sk, modelName) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
 		return
+	}
+	// 能力前置校验：目录设置了最大输出时裁剪输出上限字段，省掉注定失败的上游调用。
+	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
+		if nb, changed := clampOutput(body, chatOutputKeys, maxOut); changed {
+			body = nb
+		}
 	}
 
 	if wantsStream(body) {
@@ -339,6 +390,12 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	if !modelAllowed(sk, modelName) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
 		return
+	}
+	// 能力前置校验：同 chat，responses 的输出上限字段是 max_output_tokens。
+	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
+		if nb, changed := clampOutput(body, responsesOutputKeys, maxOut); changed {
+			body = nb
+		}
 	}
 
 	if wantsStream(body) {
@@ -619,6 +676,9 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
 		Type    string `json:"type"` // 自定义扩展：text | image（标准客户端忽略）
+		// 能力上限扩展（0 省略）：目录设置后下游可据此约束请求规模。
+		ContextWindow   int64 `json:"context_window,omitempty"`
+		MaxOutputTokens int64 `json:"max_output_tokens,omitempty"`
 	}
 	all, err := g.store.ListModels()
 	if err != nil {
@@ -637,7 +697,8 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 		if t == "" {
 			t = model.ModelTypeText
 		}
-		items = append(items, modelObj{ID: m.Name, Object: "model", Created: 1, OwnedBy: "arkgate", Type: t})
+		items = append(items, modelObj{ID: m.Name, Object: "model", Created: 1, OwnedBy: "arkgate", Type: t,
+			ContextWindow: m.ContextTokens, MaxOutputTokens: m.MaxOutputTokens})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": items})
 }

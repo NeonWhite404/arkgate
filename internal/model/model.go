@@ -86,6 +86,10 @@ type Model struct {
 	PriceInput  float64 `json:"price_input"`  // 输入 token 单价：$ / 1M tokens
 	PriceOutput float64 `json:"price_output"` // 输出 token 单价：$ / 1M tokens
 	PriceImage  float64 `json:"price_image"`  // 图像单价：$ / 张
+
+	// 能力上限（0 = 未设置：不校验，允许目录按模型名自动补全；人工填写的值优先）。
+	ContextTokens   int64 `json:"context_tokens"`   // 上下文窗口（tokens）
+	MaxOutputTokens int64 `json:"max_output_tokens"` // 单次最大输出（tokens），非 0 时网关裁剪 max_tokens
 }
 
 // Endpoint 是树上的叶节点：账号（父）× 上游模型标识 EP，服务某个易读模型名。
