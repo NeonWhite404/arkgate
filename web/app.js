@@ -389,13 +389,16 @@ function renderStackedTokenChart(series) {
 }
 
 // 通用单系列柱状图：points [{t, ...}]，取值与格式化由调用方注入（成本/请求趋势共用）。
-// labelFn 缺省用小时标签；天粒度图表传 dayLabel。
-function renderBarChart(points, pick, color, format, labelFn) {
+// labelFn 缺省用小时标签；天粒度图表传 dayLabel。big=true 用量分析主图规格
+// （820×240、5 格网格），与堆叠图/折线图同框；缺省总览小图（400×190）。
+function renderBarChart(points, pick, color, format, labelFn, big) {
   labelFn = labelFn || hourLabel;
   if (!points || !points.length) return '<div class="empty">暂无数据</div>';
   // 时间字段兼容两种形态：总览 hourly 用 .t，用量分析桶用 .bucket。
   const tf = (p) => (p.t !== undefined ? p.t : p.bucket);
-  const W = 400, H = 190, padL = 44, padR = 8, padT = 10, padB = 24;
+  const W = big ? 820 : 400, H = big ? 240 : 190;
+  const padL = big ? 56 : 44, padR = big ? 12 : 8, padT = big ? 12 : 10, padB = big ? 28 : 24;
+  const grids = big ? 4 : 3; // 网格分段数
   const vals = points.map(pick);
   const maxV = Math.max(...vals, 1);
   const plotH = H - padT - padB;
@@ -405,9 +408,9 @@ function renderBarChart(points, pick, color, format, labelFn) {
   const xOf = (i) => padL + (n > 1 ? (i * (W - padL - padR) / (n - 1)) : (W - padL - padR) / 2);
 
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
-  for (let g = 0; g <= 3; g++) {
-    const y = padT + plotH * (g / 3);
-    const v = maxV * (1 - g / 3);
+  for (let g = 0; g <= grids; g++) {
+    const y = padT + plotH * (g / grids);
+    const v = maxV * (1 - g / grids);
     svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
     svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="9" fill="#86909c" text-anchor="end">' + format(v) + '</text>';
   }
@@ -418,9 +421,51 @@ function renderBarChart(points, pick, color, format, labelFn) {
     const y = H - padB - h;
     svg += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + h + '" rx="2" fill="' + color + '" opacity="0.9"><title>' + labelFn(tf(p)) + ' · ' + format(v) + '</title></rect>';
   });
-  const step = Math.max(1, Math.floor(n / 6));
+  const step = Math.max(1, Math.floor(n / (big ? 8 : 6)));
   for (let k = 0; k < n; k += step) {
     svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + labelFn(tf(points[k])) + '</text>';
+  }
+  svg += "</svg>";
+  return svg;
+}
+
+// 成功率折线图（用量分析主图规格）：pick(p) 返回 {pct, ok, n} 或 null（该桶无请求，
+// 折线断开）。Y 轴固定 0-100%，与柱状图同一绘图框，切指标时布局不跳变。
+function renderLineChart(points, pick, labelFn) {
+  if (!points || !points.length) return '<div class="empty">所选区间暂无数据</div>';
+  const W = 820, H = 240, padL = 56, padR = 12, padT = 12, padB = 28;
+  const plotH = H - padT - padB;
+  const n = points.length;
+  const xOf = (i) => padL + (n > 1 ? (i * (W - padL - padR)) / (n - 1) : (W - padL - padR) / 2);
+  const yOf = (pct) => padT + plotH * (1 - Math.min(100, Math.max(0, pct)) / 100);
+
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + plotH * (g / 4);
+    svg += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e5e7eb" />';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="9" fill="#86909c" text-anchor="end">' + Math.round(100 - g * 25) + '%</text>';
+  }
+  // 分段折线：有效点连 L，遇 null 重起 M（空桶断线，不伪造 0%）。
+  let d = "", hasPoint = false, penDown = false;
+  points.forEach((p, i) => {
+    const v = pick(p);
+    if (!v) { penDown = false; return; }
+    hasPoint = true;
+    const cmd = penDown ? "L" : "M";
+    d += cmd + xOf(i).toFixed(1) + " " + yOf(v.pct).toFixed(1) + " ";
+    penDown = true;
+  });
+  svg += '<path d="' + d + '" fill="none" stroke="#10b981" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+  points.forEach((p, i) => {
+    const v = pick(p);
+    if (!v) return;
+    svg += '<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(v.pct).toFixed(1) + '" r="2.6" fill="#10b981"><title>' +
+      labelFn(p.bucket) + " · 成功率 " + v.pct.toFixed(1) + "%（" + v.ok + "/" + v.n + " 次）</title></circle>";
+  });
+  if (!hasPoint) return '<div class="empty">所选区间暂无数据</div>';
+  const step = Math.max(1, Math.floor(n / 8));
+  for (let k = 0; k < n; k += step) {
+    svg += '<text x="' + xOf(k) + '" y="' + (H - 6) + '" font-size="10" fill="#6b7280" text-anchor="middle">' + labelFn(points[k].bucket) + '</text>';
   }
   svg += "</svg>";
   return svg;
@@ -464,15 +509,21 @@ function renderStackedBarChart(points, pickA, pickB, colorA, colorB, nameA, name
   return svg + leg;
 }
 
-// 用量分析图：按指标切换单系列/堆叠，按粒度切换 X 轴标签。
+// 用量分析图：按指标切换单系列/堆叠/折线，按粒度切换 X 轴标签。
+// 四种指标共用同一主图框（820×240），切换时布局不跳变。
 function renderUsageChart(buckets, gran, metric) {
   const labelFn = gran === "hour" ? hourLabel : dayLabel;
   if (!buckets || !buckets.length) return '<div class="empty">所选区间暂无数据</div>';
   if (metric === "cost") {
-    return renderBarChart(buckets, (b) => b.cost, "#f59e0b", fmtCost, labelFn);
+    return renderBarChart(buckets, (b) => b.cost, "#f59e0b", fmtCost, labelFn, true);
   }
   if (metric === "requests") {
-    return renderBarChart(buckets, (b) => b.requests, "#3b82f6", fmtInt, labelFn);
+    return renderBarChart(buckets, (b) => b.requests, "#3b82f6", fmtInt, labelFn, true);
+  }
+  if (metric === "success") {
+    return renderLineChart(buckets,
+      (b) => (b.requests > 0 ? { pct: (b.success / b.requests) * 100, ok: b.success, n: b.requests } : null),
+      labelFn);
   }
   return renderStackedBarChart(buckets,
     (b) => b.prompt_tokens, (b) => b.completion_tokens,
@@ -1007,6 +1058,7 @@ const UsagePage = {
         { v: "tokens", label: "Token" },
         { v: "cost", label: "费用" },
         { v: "requests", label: "次数" },
+        { v: "success", label: "成功率" },
       ],
       r: null,
       loading: false,
@@ -1035,8 +1087,8 @@ const UsagePage = {
       const f = this.facets.find((x) => x.key === this.entity);
       return (f && f.label) || this.entity;
     },
-    chartTitle() { return { tokens: "Token 用量", cost: "费用", requests: "调用次数" }[this.metric]; },
-    chartUnit() { return { tokens: "tokens", cost: "USD", requests: "次" }[this.metric]; },
+    chartTitle() { return { tokens: "Token 用量", cost: "费用", requests: "调用次数", success: "成功率" }[this.metric]; },
+    chartUnit() { return { tokens: "tokens", cost: "USD", requests: "次", success: "%" }[this.metric]; },
     chartHtml() { return renderUsageChart(this.buckets, this.gran, this.metric); },
   },
   mounted() { this.load(); },
