@@ -31,13 +31,22 @@ type Manager struct {
 	httpc *http.Client
 }
 
-// NewManager 构造传输器；timeout 为单次上游请求的兜底超时。
-func NewManager(timeout time.Duration) *Manager {
-	return &Manager{httpc: &http.Client{Timeout: timeout}}
+// NewManager 构造传输器。
+// 注意：http.Client.Timeout 故意留空——单次上游请求的超时由调用方按当前配置
+// 用 context 施加（见 Manager.post / openStream），这样管理端热改超时后立即生效，
+// 无需重建客户端或重启进程；连接池与 keep-alive 仍复用同一客户端。
+func NewManager() *Manager {
+	return &Manager{httpc: &http.Client{}}
 }
 
 // post 经 SDK 发送一次非流式调用，返回上游原始响应字节（错误响应体也完整保留）。
-func (m *Manager) post(ctx context.Context, rt Route, path string, body []byte) ([]byte, error) {
+// timeout > 0 时对本次调用施加整体超时（含读完响应体）。
+func (m *Manager) post(ctx context.Context, rt Route, path string, body []byte, timeout time.Duration) ([]byte, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	var (
 		captured []byte // 上游响应原始字节（含错误响应，供原样透传）
 		status   int
@@ -84,12 +93,13 @@ func (m *Manager) post(ctx context.Context, rt Route, path string, body []byte) 
 // ─────────────────────────── chat/completions ───────────────────────────
 
 // Chat 转发非流式 chat/completions，返回上游原始响应与用量。
-func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel string) ([]byte, *TextUsage, error) {
+// timeout 为本次调用的整体超时（0 = 不限）。
+func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *TextUsage, error) {
 	body, err := prepareBody(down, upstreamModel)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw, err := m.post(ctx, rt, "chat/completions", body)
+	raw, err := m.post(ctx, rt, "chat/completions", body, timeout)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -99,12 +109,13 @@ func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel
 // ─────────────────────────── responses ───────────────────────────
 
 // Responses 转发非流式 responses，返回上游原始响应与用量（input/output → prompt/completion）。
-func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstreamModel string) ([]byte, *TextUsage, error) {
+// timeout 为本次调用的整体超时（0 = 不限）。
+func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *TextUsage, error) {
 	body, err := prepareBody(down, upstreamModel)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw, err := m.post(ctx, rt, "responses", body)
+	raw, err := m.post(ctx, rt, "responses", body, timeout)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -114,12 +125,13 @@ func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstream
 // ─────────────────────────── images/generations ───────────────────────────
 
 // Images 转发非流式 images/generations，返回原始响应与张数计量。
-func (m *Manager) Images(ctx context.Context, rt Route, down []byte, upstreamModel string) ([]byte, *ImageUsage, error) {
+// timeout 为本次调用的整体超时（0 = 不限）。
+func (m *Manager) Images(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *ImageUsage, error) {
 	body, err := prepareBody(down, upstreamModel)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw, err := m.post(ctx, rt, "images/generations", body)
+	raw, err := m.post(ctx, rt, "images/generations", body, timeout)
 	if err != nil {
 		return nil, nil, err
 	}

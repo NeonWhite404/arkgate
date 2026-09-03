@@ -50,7 +50,7 @@ func main() {
 	defer bal.Close()
 
 	gw := gateway.New(cfg, st, box, bal)
-	adm := admin.New(st, box, bal)
+	adm := admin.New(st, box, bal, cfg)
 	pt := portal.New(st, bal)
 
 	// 首次运行自动生成管理令牌。

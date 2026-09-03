@@ -6,11 +6,38 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Conf 是全局运行时配置的单例。
-var Conf = &Config{}
+var Conf = &Config{Timeouts: &Timeouts{}}
+
+// Timeouts 上游超时的运行时可调值：管理端（设置页）写、网关每次请求读，
+// 因此用原子存取而不是普通字段——避免热改与转发并发读写产生数据竞争。
+// 单位纳秒；0 表示关闭该项超时。
+type Timeouts struct {
+	request    atomic.Int64
+	firstToken atomic.Int64
+}
+
+// Request 非流式请求的整体超时（含读完响应体）。0 = 不限。
+func (t *Timeouts) Request() time.Duration { return time.Duration(t.request.Load()) }
+
+// FirstToken 流式请求的首字节超时（首字节前失败可换叶子重试）。0 = 关闭。
+func (t *Timeouts) FirstToken() time.Duration { return time.Duration(t.firstToken.Load()) }
+
+// SetRequest / SetFirstToken 由管理端热改；负值归零（视为关闭）。
+func (t *Timeouts) SetRequest(d time.Duration) { t.request.Store(int64(max0(d))) }
+
+func (t *Timeouts) SetFirstToken(d time.Duration) { t.firstToken.Store(int64(max0(d))) }
+
+func max0(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
+}
 
 type Config struct {
 	// Web 管理监听地址。
@@ -24,19 +51,23 @@ type Config struct {
 	AccessToken string
 
 	// 代理轮询等默认参数。
-	RequestTimeout      time.Duration
 	DefaultCircuitMax   time.Duration
 	MaxRetriesAvailable int
 
-	// 流式请求「首字节超时」：上游建连后在该时长内未产出任何字节（含 SSE 首行）
-	// 即视为该叶子失败，换下一个叶子重试（首字节前未向客户端写过任何数据，可安全重试）。
-	// 0 表示关闭。默认 30s。
-	FirstTokenTimeout time.Duration
+	// Timeouts 上游超时（非流式整体超时 + 流式首字节超时）：
+	// 启动时取「DB 持久化值 > 环境变量 > 内置默认」，之后可在设置页热改。
+	Timeouts *Timeouts
 
 	// 会话粘性 TTL：同一子 Key + 模型在该时长内的后续请求固定路由到同一叶节点
 	// （利于上游 prompt cache 命中）。0 表示关闭。默认 5min。
 	SessionTTL time.Duration
 }
+
+// 上游超时的内置默认值（环境变量未设置时生效）。
+const (
+	DefaultRequestTimeout    = 300 * time.Second
+	DefaultFirstTokenTimeout = 30 * time.Second
+)
 
 // Load 从环境变量加载配置，未设置的项回落到默认值。
 func Load() *Config {
@@ -45,11 +76,14 @@ func Load() *Config {
 	Conf.ArkBaseURL = strings.TrimRight(getenv("ARKGATE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"), "/")
 	Conf.AccessToken = os.Getenv("ARKGATE_TOKEN")
 
-	Conf.RequestTimeout = 300 * time.Second
 	Conf.DefaultCircuitMax = 60 * time.Second
 	Conf.MaxRetriesAvailable = 3
 
-	Conf.FirstTokenTimeout = getDurationSec("ARKGATE_FIRST_TOKEN_TIMEOUT", 30*time.Second)
+	if Conf.Timeouts == nil {
+		Conf.Timeouts = &Timeouts{}
+	}
+	Conf.Timeouts.SetRequest(getDurationSec("ARKGATE_REQUEST_TIMEOUT", DefaultRequestTimeout))
+	Conf.Timeouts.SetFirstToken(getDurationSec("ARKGATE_FIRST_TOKEN_TIMEOUT", DefaultFirstTokenTimeout))
 	Conf.SessionTTL = getDurationSec("ARKGATE_SESSION_TTL", 5*time.Minute)
 
 	return Conf

@@ -54,10 +54,10 @@ func TestChatPassthroughAndModelSwap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "some-opaque-key-9999"}
 	down := []byte(`{"model":"doubao","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"}}`)
-	raw, usage, err := m.Chat(context.Background(), rt, down, "ep-xyz")
+	raw, usage, err := m.Chat(context.Background(), rt, down, "ep-xyz", time.Second)
 	if err != nil {
 		t.Fatalf("chat: %v", err)
 	}
@@ -93,9 +93,9 @@ func TestBaseURLKeepsVersionSegment(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "openai"), BaseURL: srv.URL + "/v1", Key: "k"}
-	if _, _, err := m.Chat(context.Background(), rt, []byte(`{"model":"gpt-4o"}`), "gpt-4o"); err != nil {
+	if _, _, err := m.Chat(context.Background(), rt, []byte(`{"model":"gpt-4o"}`), "gpt-4o", time.Second); err != nil {
 		t.Fatalf("chat: %v", err)
 	}
 	if gotPath != "/v1/chat/completions" {
@@ -112,9 +112,9 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
-	_, _, err := m.Chat(context.Background(), rt, []byte(`{"model":"m"}`), "ep-1")
+	_, _, err := m.Chat(context.Background(), rt, []byte(`{"model":"m"}`), "ep-1", time.Second)
 	he, ok := AsHTTPError(err)
 	if !ok {
 		t.Fatalf("want HTTPError, got %v", err)
@@ -140,7 +140,7 @@ func TestChatStreamForward(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
 	var sink strings.Builder
 	usage, err := m.ChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", &sink)
@@ -183,7 +183,7 @@ func TestResponsesUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "openai"), BaseURL: srv.URL, Key: "k"}
 	var sink strings.Builder
 	usage, err := m.ResponsesStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "gpt-4o", &sink)
@@ -211,9 +211,9 @@ func TestImagesUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
-	raw, usage, err := m.Images(context.Background(), rt, []byte(`{"model":"seedream","prompt":"a cat","n":2}`), "doubao-seedream-4-0")
+	raw, usage, err := m.Images(context.Background(), rt, []byte(`{"model":"seedream","prompt":"a cat","n":2}`), "doubao-seedream-4-0", time.Second)
 	if err != nil {
 		t.Fatalf("images: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestOpenStreamFirstTokenTimeout(t *testing.T) {
 	}))
 	defer func() { close(release); srv.Close() }()
 
-	m := NewManager(time.Second)
+	m := NewManager()
 	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
 
 	start := time.Now()

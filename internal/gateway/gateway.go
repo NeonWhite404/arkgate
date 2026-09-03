@@ -50,7 +50,7 @@ type Store interface {
 
 // New 构造网关。
 func New(cfg *config.Config, st Store, box *secure.Box, bal *balancer.Balancer) *Gateway {
-	g := &Gateway{cfg: cfg, store: st, box: box, bal: bal, mgr: provider.NewManager(cfg.RequestTimeout)}
+	g := &Gateway{cfg: cfg, store: st, box: box, bal: bal, mgr: provider.NewManager()}
 	g.handler = g.routes()
 	return g
 }
@@ -339,7 +339,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Chat(r.Context(), ri.rt, body, leaf.EP)
+		respBody, usage, ferr := g.mgr.Chat(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		if ferr == nil {
 			var pt, ct int64
 			if usage != nil {
@@ -431,7 +431,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Responses(r.Context(), ri.rt, body, leaf.EP)
+		respBody, usage, ferr := g.mgr.Responses(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		if ferr == nil {
 			var pt, ct int64
 			if usage != nil {
@@ -525,7 +525,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Images(r.Context(), ri.rt, body, leaf.EP)
+		respBody, usage, ferr := g.mgr.Images(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		if ferr == nil {
 			var images int64
 			var pt, ct int64
@@ -642,9 +642,9 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 	g.writeUpstreamError(w, lastErr)
 }
 
-// openStream 按目标 API 打开对应的上游流（首 token 超时取自配置，0 = 不限时）。
+// openStream 按目标 API 打开对应的上游流（首 token 超时取自运行时配置，0 = 不限时）。
 func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte, ep string, api balancer.API) (*provider.Stream, error) {
-	timeout := g.cfg.FirstTokenTimeout
+	timeout := g.cfg.Timeouts.FirstToken()
 	switch api {
 	case balancer.APIResponses:
 		return g.mgr.OpenResponsesStream(ctx, rt, body, ep, timeout)

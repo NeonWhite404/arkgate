@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"arkgate/internal/balancer"
 	"arkgate/internal/catalog"
+	"arkgate/internal/config"
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
 	"arkgate/internal/secure"
@@ -27,17 +29,40 @@ type Admin struct {
 	store   *store.Store
 	box     *secure.Box
 	bal     *balancer.Balancer
+	cfg     *config.Config   // 运行时配置（超时热改写入其原子字段）
 	catalog *catalog.Catalog // 内置模型元数据目录（价格/能力自动补全来源）
 	handler http.Handler
 }
 
 const tokenHashKey = "admin_token_hash"
 
-// New 构造管理后端。
-func New(st *store.Store, box *secure.Box, bal *balancer.Balancer) *Admin {
-	a := &Admin{store: st, box: box, bal: bal, catalog: catalog.New()}
+// 运行时设置的持久化键（settings 表，值为秒；"0" = 关闭该超时）。
+const (
+	keyTimeoutRequest    = "timeout_request_sec"
+	keyTimeoutFirstToken = "timeout_first_token_sec"
+)
+
+// New 构造管理后端，并把已持久化的运行时设置应用到 cfg
+// （优先级：DB 持久化值 > 环境变量 > 内置默认）。
+func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.Config) *Admin {
+	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New()}
+	a.loadPersistedTimeouts()
 	a.handler = a.routes()
 	return a
+}
+
+// loadPersistedTimeouts 启动时把 DB 里的超时设置覆盖到 cfg（未设置过则保留环境变量/默认值）。
+func (a *Admin) loadPersistedTimeouts() {
+	if v, ok := a.store.GetSetting(keyTimeoutRequest); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			a.cfg.Timeouts.SetRequest(time.Duration(f * float64(time.Second)))
+		}
+	}
+	if v, ok := a.store.GetSetting(keyTimeoutFirstToken); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			a.cfg.Timeouts.SetFirstToken(time.Duration(f * float64(time.Second)))
+		}
+	}
 }
 
 // Handler 返回 http.Handler。
@@ -103,6 +128,7 @@ func (a *Admin) routes() http.Handler {
 
 	reg("/api/auth/info", a.handleInfo)
 	reg("/api/providers", a.handleProviders)
+	reg("/api/settings/runtime", a.handleRuntimeSettings)
 	reg("/api/accounts", a.handleAccountsCollection)
 	reg("/api/accounts/", a.handleAccountItem)
 	reg("/api/models", a.handleModelsCollection)
@@ -441,6 +467,64 @@ func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
 		}
 	}
 	return nil
+}
+
+// ─────────────────────────── 运行时设置（上游超时） ───────────────────────────
+
+// 超时可设区间（秒）：上限 1 小时够覆盖长推理，0 表示关闭该项超时。
+const maxTimeoutSec = 3600
+
+// handleRuntimeSettings GET 读当前上游超时，PUT 热改并持久化。
+// 语义：秒（支持小数），0 = 关闭该项；只写请求里显式带上的键（部分更新）。
+// 改动立即对后续请求生效（cfg.Timeouts 原子字段），无需重启。
+func (a *Admin) handleRuntimeSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, a.runtimeSettingsBody())
+	case http.MethodPut:
+		var probe map[string]any
+		if err := decode(r, &probe); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		apply := func(key string, set func(time.Duration), storeKey string) error {
+			raw, ok := probe[key]
+			if !ok {
+				return nil
+			}
+			sec := floatField(raw)
+			if sec < 0 || sec > maxTimeoutSec {
+				return fmt.Errorf("%s 需在 0~%d 秒之间（0 = 关闭）", key, maxTimeoutSec)
+			}
+			set(time.Duration(sec * float64(time.Second)))
+			return a.store.SetSetting(storeKey, strconv.FormatFloat(sec, 'f', -1, 64))
+		}
+		if err := apply("request_timeout_sec", a.cfg.Timeouts.SetRequest, keyTimeoutRequest); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		if err := apply("first_token_timeout_sec", a.cfg.Timeouts.SetFirstToken, keyTimeoutFirstToken); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		writeJSON(w, 200, a.runtimeSettingsBody())
+	default:
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+	}
+}
+
+func (a *Admin) runtimeSettingsBody() map[string]any {
+	return map[string]any{
+		"request_timeout_sec":     a.cfg.Timeouts.Request().Seconds(),
+		"first_token_timeout_sec": a.cfg.Timeouts.FirstToken().Seconds(),
+		"session_ttl_sec":         a.cfg.SessionTTL.Seconds(),
+		"max_retries":             a.cfg.MaxRetriesAvailable,
+		"max_timeout_sec":         maxTimeoutSec,
+		"defaults": map[string]any{
+			"request_timeout_sec":     config.DefaultRequestTimeout.Seconds(),
+			"first_token_timeout_sec": config.DefaultFirstTokenTimeout.Seconds(),
+		},
+	}
 }
 
 // ─────────────────────────── 模型目录自动补全 ───────────────────────────
