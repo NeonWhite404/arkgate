@@ -71,6 +71,44 @@ func TestSelectWeightedRoundRobin(t *testing.T) {
 	}
 }
 
+// TestSelectMultipleEndpointsSameAccount 同一账号下同一模型挂多个接入点
+// （同模型的不同发布版本）：都参与 WRR，按各自权重分摊，互不覆盖。
+func TestSelectMultipleEndpointsSameAccount(t *testing.T) {
+	b := newTestBalancer()
+	b.seed([]*model.Account{mkAcc("a1", 1)}, []*model.Endpoint{
+		mkEP("e1", "a1", "m", "ep-250615", 1),
+		mkEP("e2", "a1", "m", "ep-250828", 3),
+	}, []*model.Model{{Name: "m", Enabled: true}})
+
+	counts := map[string]int{}
+	for i := 0; i < 4; i++ {
+		e, err := b.Select("m", nil, nil, APIChat, "")
+		if err != nil {
+			t.Fatalf("select: %v", err)
+		}
+		counts[e.EP]++
+		b.Release(e)
+	}
+	if counts["ep-250828"] != 3 || counts["ep-250615"] != 1 {
+		t.Fatalf("want new-version x3 / old-version x1, got %v", counts)
+	}
+
+	// 其中一个版本熔断时，同账号的另一个版本仍可承接（叶级熔断不牵连兄弟叶）。
+	b.mu.Lock()
+	b.endpoints["e2"].Runtime.CircuitOpenUntil = 1 << 62
+	b.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		e, err := b.Select("m", nil, nil, APIChat, "")
+		if err != nil {
+			t.Fatalf("select after circuit: %v", err)
+		}
+		if e.EP != "ep-250615" {
+			t.Fatalf("want surviving sibling leaf, got %s", e.EP)
+		}
+		b.Release(e)
+	}
+}
+
 func TestSelectNoEndpoint(t *testing.T) {
 	b := newTestBalancer()
 	b.seed([]*model.Account{mkAcc("a1", 1)}, nil, []*model.Model{{Name: "known", Enabled: true}})

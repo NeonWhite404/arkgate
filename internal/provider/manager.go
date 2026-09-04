@@ -138,6 +138,82 @@ func (m *Manager) Images(ctx context.Context, rt Route, down []byte, upstreamMod
 	return raw, ExtractImageUsage(raw), nil
 }
 
+// ─────────────────────────── 上游模型列表（OpenAI 兼容 GET /models） ───────────────────────────
+
+// UpstreamModel 上游模型列表里的一项（只取管理端用得到的字段）。
+type UpstreamModel struct {
+	ID      string `json:"id"`
+	OwnedBy string `json:"owned_by,omitempty"`
+}
+
+// ListModels 拉取上游的 OpenAI 兼容模型列表（GET {base}/models），供管理端
+// 「从上游导入」减少手工录入。非 2xx 原样包成 HTTPError（错误体保留），
+// 让管理端能显示上游的真实原因（未授权 / 不支持该接口等）。
+//
+// 解析容忍三种常见形态：标准 {"data":[{"id":...}]}、裸对象数组、裸字符串数组；
+// 都取不到就报错，而不是静默返回空列表（空列表会被误读成「上游没有模型」）。
+func (m *Manager) ListModels(ctx context.Context, rt Route, timeout time.Duration) ([]UpstreamModel, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(rt.BaseURL, "/")+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+rt.Key)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := m.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &HTTPError{Code: resp.StatusCode, Body: raw}
+	}
+	return parseModelList(raw)
+}
+
+func parseModelList(raw []byte) ([]UpstreamModel, error) {
+	var wrapped struct {
+		Data []UpstreamModel `json:"data"`
+	}
+	if json.Unmarshal(raw, &wrapped) == nil && len(wrapped.Data) > 0 {
+		return filterModels(wrapped.Data), nil
+	}
+	var bare []UpstreamModel
+	if json.Unmarshal(raw, &bare) == nil && len(bare) > 0 {
+		return filterModels(bare), nil
+	}
+	var names []string
+	if json.Unmarshal(raw, &names) == nil && len(names) > 0 {
+		out := make([]UpstreamModel, 0, len(names))
+		for _, n := range names {
+			out = append(out, UpstreamModel{ID: n})
+		}
+		return filterModels(out), nil
+	}
+	return nil, fmt.Errorf("上游模型列表无法解析: %s", truncate(raw, 200))
+}
+
+// filterModels 丢掉没有 id 的条目（个别兼容实现会塞空项）。
+func filterModels(in []UpstreamModel) []UpstreamModel {
+	out := make([]UpstreamModel, 0, len(in))
+	for _, m := range in {
+		if strings.TrimSpace(m.ID) != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // ─────────────────────────── 流式转发（唯一自研 HTTP） ───────────────────────────
 //
 // 流式被拆成两段，让「首字节之前」的失败可以安全换叶子重试：

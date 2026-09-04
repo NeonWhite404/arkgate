@@ -292,7 +292,52 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
 .linkish { color: rgb(var(--primary-6)); cursor: pointer; }
 .sh-note { color: var(--color-text-3); font-size: 11px; line-height: 1.5; }
 
+/* 上游模型拉取：候选 chip 与批量导入列表 */
+.ep-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 120px; overflow-y: auto; }
+.ep-chip { padding: 3px 8px; border: 1px solid var(--color-border-2); border-radius: 5px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; cursor: pointer;
+  color: var(--color-text-2); }
+.ep-chip:hover { border-color: rgb(var(--primary-6)); color: rgb(var(--primary-6)); }
+.ep-chip.active { background: rgba(var(--primary-6), .12); border-color: rgb(var(--primary-6)); color: rgb(var(--primary-6)); }
+.import-list { max-height: 300px; overflow-y: auto; border: 1px solid var(--color-border-2); border-radius: 8px; }
+.import-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 13px;
+  border-bottom: 1px solid var(--color-border-2); cursor: pointer; }
+.import-row:last-child { border-bottom: none; }
+.import-row:hover { background: var(--color-fill-1); }
+.import-row input[type=checkbox] { width: auto; margin: 0; }
+
+/* 分流配置页：左侧模型列表 + 右侧权重条与链路编排 */
+.route-wrap { display: grid; grid-template-columns: 260px 1fr; gap: 16px; align-items: start; }
+.route-side { padding-bottom: 8px; }
+.route-list { max-height: 520px; overflow-y: auto; }
+.route-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 16px; cursor: pointer; font-size: 13px; border-left: 2px solid transparent; }
+.route-item:hover { background: var(--color-fill-1); }
+.route-item.active { background: rgba(var(--primary-6), .1); border-left-color: rgb(var(--primary-6));
+  color: rgb(var(--primary-6)); font-weight: 600; }
+.route-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.share-bar { display: flex; height: 30px; border-radius: 6px; overflow: hidden; margin: 0 16px 14px;
+  background: var(--color-fill-1); }
+.share-seg { display: flex; align-items: center; justify-content: center; color: #fff; font-size: 11px;
+  font-weight: 600; min-width: 2px; transition: width .18s ease; }
+.share-empty { flex: 1; display: flex; align-items: center; justify-content: center;
+  color: var(--color-text-3); font-size: 12px; }
+.dot-color { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.w-edit { display: flex; align-items: center; gap: 4px; }
+.w-edit input { width: 64px; padding: 4px 6px; text-align: center; }
+.chain-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 16px 12px; }
+.chain-arrow { color: var(--color-text-3); }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; font-size: 12px;
+  border: 1px solid var(--color-border-2); border-radius: 6px; background: var(--color-bg-1); }
+.chip-self { background: rgba(var(--primary-6), .1); border-color: rgb(var(--primary-6)); color: rgb(var(--primary-6)); }
+.chip-btn { border: none; background: none; cursor: pointer; color: var(--color-text-3); font-size: 11px; padding: 0 2px; }
+.chip-btn:hover { color: rgb(var(--primary-6)); }
+.chip-btn.chip-del:hover { color: rgb(var(--red-6)); }
+.chain-add { display: flex; align-items: center; gap: 8px; padding: 0 16px 16px; flex-wrap: wrap; }
+.chain-add select { width: 240px; }
+
 @media (max-width: 768px) {
   .sidebar { display: none; }
   .form-row, .form-row.three { grid-template-columns: 1fr; }
+  .route-wrap { grid-template-columns: 1fr; }
 }

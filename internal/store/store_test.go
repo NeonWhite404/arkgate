@@ -285,6 +285,76 @@ func TestMigrateFromLegacySchema(t *testing.T) {
 	if err := s.UpsertModel(&model.Model{Name: "new", Type: model.ModelTypeImage, Enabled: true}); err != nil {
 		t.Fatalf("write after migrate: %v", err)
 	}
+	// v5 迁移已把 endpoints 的唯一约束放宽到三元组：同账号同模型可再挂一个 ep，
+	// 且旧行必须原样保留（重建表不能丢数据）。
+	if err := s.UpsertEndpoint(&model.Endpoint{
+		ID: "e1", AccountID: "legacy", Model: "old", EP: "ep-legacy-250828", Enabled: true, Weight: 2,
+	}); err != nil {
+		t.Fatalf("second ep on same account+model: %v", err)
+	}
+	eps, err := s.ListEndpoints()
+	if err != nil || len(eps) != 2 {
+		t.Fatalf("endpoints after relax: %d (%v)", len(eps), err)
+	}
+	byEP := map[string]*model.Endpoint{}
+	for _, e := range eps {
+		byEP[e.EP] = e
+	}
+	if old, ok := byEP["ep-legacy"]; !ok || old.ID != "e0" || !old.Enabled {
+		t.Fatalf("legacy endpoint row lost or altered: %+v", byEP)
+	}
+	if fresh, ok := byEP["ep-legacy-250828"]; !ok || fresh.Weight != 2 {
+		t.Fatalf("new endpoint not persisted: %+v", byEP)
+	}
+}
+
+// TestEndpointTupleUnique 锁定映射唯一性口径：唯一键是
+// (账号, 模型名, 上游标识) 三元组——同账号同模型的多个 ep 可并存（同模型不同
+// 发布版本），完全相同的三元组仍视为同一条（更新而非重复插入）。
+func TestEndpointTupleUnique(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	mk := func(id, ep string, weight int) *model.Endpoint {
+		return &model.Endpoint{ID: id, AccountID: "a1", Model: "doubao-seed-1-6", EP: ep, Enabled: true, Weight: weight}
+	}
+	for _, e := range []*model.Endpoint{
+		mk("e1", "ep-250615", 1),
+		mk("e2", "ep-250828", 3),
+	} {
+		if err := s.UpsertEndpoint(e); err != nil {
+			t.Fatalf("upsert %s: %v", e.EP, err)
+		}
+	}
+	eps, err := s.ListEndpoints()
+	if err != nil || len(eps) != 2 {
+		t.Fatalf("two versions must coexist: %d (%v)", len(eps), err)
+	}
+
+	// 三元组查重：命中返回既有 id，不同 ep 未命中。
+	if id, ok := s.EndpointIDByTuple("a1", "doubao-seed-1-6", "ep-250828"); !ok || id != "e2" {
+		t.Fatalf("tuple lookup = %q %v", id, ok)
+	}
+	if _, ok := s.EndpointIDByTuple("a1", "doubao-seed-1-6", "ep-unknown"); ok {
+		t.Fatalf("unknown tuple must not match")
+	}
+
+	// 同三元组 + 新 id：更新既有行的流控字段，不新增行（否则会出现重复叶子）。
+	if err := s.UpsertEndpoint(mk("e-dup", "ep-250828", 9)); err != nil {
+		t.Fatalf("same tuple upsert: %v", err)
+	}
+	eps, _ = s.ListEndpoints()
+	if len(eps) != 2 {
+		t.Fatalf("same tuple must not duplicate: %d", len(eps))
+	}
+	got, err := s.GetEndpoint("e2")
+	if err != nil || got.Weight != 9 {
+		t.Fatalf("same tuple must update existing row: %+v (%v)", got, err)
+	}
 }
 
 // TestQueryUsage 锁定用量分析聚合：小时/天分桶（本地时区）、维度 facet、

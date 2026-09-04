@@ -55,7 +55,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
-const schemaVersion = "4"
+const schemaVersion = "5"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -101,7 +101,7 @@ func (s *Store) migrate() error {
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
-			UNIQUE(account_id, model)
+			UNIQUE(account_id, model, ep)
 		)`,
 		`CREATE TABLE IF NOT EXISTS subkeys (
 			id TEXT PRIMARY KEY,
@@ -219,7 +219,77 @@ func (s *Store) migrate() error {
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, schemaVersion); err != nil {
 		return fmt.Errorf("migrate schema_version: %w", err)
 	}
+	// v5：把 endpoints 的唯一约束从 (account_id, model) 放宽到 (account_id, model, ep)。
+	// 放在版本号之后：该步骤自带「检测到旧约束才动」的幂等判断，重复启动为 no-op。
+	if err := s.relaxEndpointUnique(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// relaxEndpointUnique 把旧库 endpoints 表的 UNIQUE(account_id, model) 放宽为
+// UNIQUE(account_id, model, ep)，使同一账号下同一模型可挂多个上游接入点
+// （例如同一模型的不同发布日期版本）。
+//
+// SQLite 不支持 ALTER TABLE DROP CONSTRAINT，只能重建表——这是本项目唯一
+// 偏离「迁移只增不改」的地方，因此把动作限制到最小：
+//   - 仅在表 SQL 里确实存在旧的两列唯一约束时执行（新库/已迁移库为 no-op）；
+//   - 事务内 建新表 → 按列名显式搬数据 → 换名 → 重建索引，全程不丢列不丢行；
+//   - 列清单与建表语句保持一致，新增列已由前面的 ALTER 阶段补齐。
+func (s *Store) relaxEndpointUnique() error {
+	var tableSQL string
+	err := s.db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='endpoints'`).Scan(&tableSQL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil // 表还不存在（理论上不会：建表在前）
+		}
+		return fmt.Errorf("migrate endpoints unique 探测: %w", err)
+	}
+	// 归一化后比对：右括号保证 "unique(account_id,model)" 不会误匹配三元组约束。
+	norm := strings.ToLower(strings.Join(strings.Fields(tableSQL), ""))
+	if !strings.Contains(norm, "unique(account_id,model)") {
+		return nil // 已是三元组约束
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("migrate endpoints unique 开启事务: %w", err)
+	}
+	defer tx.Rollback()
+	steps := []string{
+		`CREATE TABLE endpoints_v5 (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			model TEXT NOT NULL,
+			ep TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at INTEGER NOT NULL DEFAULT 0,
+			weight INTEGER NOT NULL DEFAULT 0,
+			max_concurrency INTEGER NOT NULL DEFAULT 0,
+			rpm_limit INTEGER NOT NULL DEFAULT 0,
+			tpm_limit INTEGER NOT NULL DEFAULT 0,
+			last_used_at INTEGER NOT NULL DEFAULT 0,
+			total_requests INTEGER NOT NULL DEFAULT 0,
+			success_requests INTEGER NOT NULL DEFAULT 0,
+			fail_requests INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			total_images INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(account_id, model, ep)
+		)`,
+		`INSERT INTO endpoints_v5 (` + endpointCols + `) SELECT ` + endpointCols + ` FROM endpoints`,
+		`DROP TABLE endpoints`,
+		`ALTER TABLE endpoints_v5 RENAME TO endpoints`,
+		`CREATE INDEX IF NOT EXISTS idx_endpoints_account ON endpoints(account_id)`,
+	}
+	for _, st := range steps {
+		if _, err := tx.Exec(st); err != nil {
+			return fmt.Errorf("migrate endpoints unique %q: %w", st, err)
+		}
+	}
+	return tx.Commit()
 }
 
 func nowUnix() int64 { return time.Now().Unix() }
@@ -437,7 +507,7 @@ func scanEndpoint(rows *sql.Rows) (*model.Endpoint, error) {
 func (s *Store) ListEndpoints() ([]*model.Endpoint, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT ` + endpointCols + ` FROM endpoints ORDER BY account_id, model`)
+	rows, err := s.db.Query(`SELECT ` + endpointCols + ` FROM endpoints ORDER BY account_id, model, ep`)
 	if err != nil {
 		return nil, err
 	}
@@ -469,10 +539,10 @@ func (s *Store) GetEndpoint(id string) (*model.Endpoint, error) {
 func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 冲突键是 (account_id, model)，但 id 是主键。为避免「编辑改归属字段时静默
-	// 改到他人行/产生陈旧孤儿行」，先按 id 定位：若该 id 已存在，则直接覆盖该行
-	// （account_id/model 同步更新，触发冲突时同把 id 一起写回，保证前端手里的
-	// id 与库中行一致）；若 id 不存在但 (account_id,model) 撞上既有行，则拒绝并报错。
+	// 冲突键是 (account_id, model, ep) 三元组，id 是主键。为避免「编辑改归属字段时
+	// 静默改到他人行/产生陈旧孤儿行」，先按 id 定位：若该 id 已存在，则直接覆盖该行
+	// （account_id/model/ep 同步更新）；id 不存在时才走插入，撞上同三元组既有行则
+	// 更新那一行的流控字段（同一账号+模型下允许多个不同 ep 并存）。
 	var existingID string
 	if e.ID != "" {
 		err := s.db.QueryRow(`SELECT id FROM endpoints WHERE id=?`, e.ID).Scan(&existingID)
@@ -487,7 +557,7 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
 			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(account_id,model) DO UPDATE SET ep=excluded.ep, enabled=excluded.enabled,
+		ON CONFLICT(account_id,model,ep) DO UPDATE SET enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
 			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
@@ -504,6 +574,21 @@ func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
 		e.AccountID, e.Model, e.EP, boolInt(e.Enabled), e.Weight, e.MaxConcurrency,
 		e.RPMLimit, e.TPMLimit, id)
 	return err
+}
+
+// EndpointIDByTuple 按 (账号, 模型名, 上游标识) 三元组定位映射 id。
+// 供管理端在新建/编辑前判重，给出明确提示而不是暴露 SQLite 约束错误。
+func (s *Store) EndpointIDByTuple(accountID, modelName, ep string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var id string
+	err := s.db.QueryRow(
+		`SELECT id FROM endpoints WHERE account_id=? AND model=? AND ep=?`,
+		accountID, modelName, ep).Scan(&id)
+	if err != nil {
+		return "", false
+	}
+	return id, true
 }
 
 func (s *Store) DeleteEndpoint(id string) error {

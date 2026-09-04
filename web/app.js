@@ -653,6 +653,9 @@ const ModelsPage = {
       models: [], accounts: [], eps: [],
       mModal: null, // 模型弹窗 {name|null, form, catHint}
       eModal: null, // 映射弹窗 {id|null, form}
+      iModal: null, // 从上游导入弹窗 {account_id, loading, list, picked}
+      epOptions: [], // 映射弹窗里「拉取上游模型」的候选 id
+      epLoading: false,
       syncing: false, // 目录补全进行中
     };
   },
@@ -761,6 +764,16 @@ const ModelsPage = {
           ep: "", enabled: true, weight: 0, max_concurrency: 0, rpm_limit: 0, tpm_limit: 0 },
       };
     },
+    // siblingEps 当前弹窗所选「账号 × 模型」下已存在的其它接入点（同模型的不同版本）。
+    siblingEps() {
+      if (!this.eModal) return [];
+      const f = this.eModal.form;
+      return this.eps.filter((e) => e.account_id === f.account_id && e.model === f.model && e.id !== this.eModal.id);
+    },
+    // epCount 某模型已配置的映射数（跨账号），用于目录表一眼看出多版本模型。
+    epCount(name) {
+      return this.eps.filter((e) => e.model === name).length;
+    },
     saveEp() {
       const f = this.eModal.form;
       if (!f.account_id || !f.model || !f.ep.trim()) { toast("请完整填写", false); return; }
@@ -777,6 +790,79 @@ const ModelsPage = {
       if (!confirm("确认删除该映射？")) return;
       req("DELETE", "/api/endpoints/" + e.id).then(() => { toast("已删除"); this.load(); });
     },
+    // ── 从上游拉取模型列表（OpenAI 兼容 GET /models） ──
+    // fetchEpOptions 供映射弹窗填 ep：拉一次候选，之后点选即填。
+    fetchEpOptions() {
+      const acc = this.eModal && this.eModal.form.account_id;
+      if (!acc || this.epLoading) return;
+      this.epLoading = true;
+      req("GET", "/api/upstream/models?account_id=" + encodeURIComponent(acc))
+        .then((d) => {
+          this.epOptions = (d.models || []).map((m) => m.id);
+          toast(this.epOptions.length ? "已拉取 " + this.epOptions.length + " 个上游模型" : "上游返回空列表");
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.epLoading = false; });
+    },
+    openImport() {
+      this.iModal = {
+        account_id: this.accounts.length ? this.accounts[0].id : "",
+        loading: false, saving: false, list: [], picked: {},
+      };
+    },
+    fetchImport() {
+      const m = this.iModal;
+      if (!m || !m.account_id || m.loading) return;
+      m.loading = true;
+      req("GET", "/api/upstream/models?account_id=" + encodeURIComponent(m.account_id))
+        .then((d) => {
+          m.list = d.models || [];
+          m.picked = {};
+          // 已映射到该账号的 ep 默认不勾选，避免重复提交。
+          const mapped = {};
+          this.eps.filter((e) => e.account_id === m.account_id).forEach((e) => { mapped[e.ep] = true; });
+          m.list.forEach((it) => { m.picked[it.id] = !mapped[it.id]; });
+          toast("上游返回 " + m.list.length + " 个模型");
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { m.loading = false; });
+    },
+    importMapped(id) {
+      const m = this.iModal;
+      return this.eps.some((e) => e.account_id === m.account_id && e.ep === id);
+    },
+    togglePick(id) { this.iModal.picked[id] = !this.iModal.picked[id]; },
+    pickAll(v) { this.iModal.list.forEach((it) => { this.iModal.picked[it.id] = v; }); },
+    // doImport 逐个「建模型（同名，走目录自动补全）+ 建映射（ep = 上游 id）」，
+    // 已存在的模型/映射按跳过处理，逐条汇总结果。
+    doImport() {
+      const m = this.iModal;
+      const ids = m.list.map((x) => x.id).filter((id) => m.picked[id]);
+      if (!ids.length) { toast("请先选择要导入的模型", false); return; }
+      m.saving = true;
+      const known = {};
+      this.models.forEach((x) => { known[x.name] = true; });
+      let added = 0, skipped = 0, failed = 0;
+      const step = (i) => {
+        if (i >= ids.length) {
+          m.saving = false;
+          this.iModal = null;
+          toast("导入完成：新增 " + added + " 个映射，跳过 " + skipped + "，失败 " + failed);
+          this.load();
+          return;
+        }
+        const id = ids[i];
+        const ensureModel = known[id]
+          ? Promise.resolve()
+          : req("POST", "/api/models", { name: id, type: "text", display: id }).catch(() => {});
+        ensureModel
+          .then(() => req("POST", "/api/endpoints", { account_id: m.account_id, model: id, ep: id, weight: 0 }))
+          .then(() => { added++; })
+          .catch((e) => { if (String(e.message).indexOf("已存在") >= 0) skipped++; else failed++; })
+          .finally(() => step(i + 1));
+      };
+      step(0);
+    },
   },
   template: `
   <div class="page">
@@ -784,18 +870,20 @@ const ModelsPage = {
     <div class="toolbar">
       <button class="btn btn-primary" @click="openModel(null)">+ 新建模型</button>
       <button class="btn btn-outline" @click="openEp(null)">+ 添加映射</button>
+      <button class="btn btn-outline" @click="openImport">⇩ 从上游导入</button>
       <div class="spacer"></div>
       <button class="btn btn-outline" :disabled="syncing" @click="syncCatalog">{{ syncing ? '补全中…' : '⟳ 从目录补全' }}</button>
     </div>
     <div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>模型名</th><th>类型</th><th>显示名</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
+        <th>模型名</th><th>类型</th><th>显示名</th><th>映射</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
       </tr></thead><tbody>
-        <tr v-if="!models.length"><td colspan="9" class="empty">暂无模型</td></tr>
+        <tr v-if="!models.length"><td colspan="10" class="empty">暂无模型</td></tr>
         <tr v-for="m in models" :key="m.name">
           <td class="mono">{{ m.name }}</td>
           <td><span :class="m.type==='image' ? 'tag tag-purple' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : '文本' }}</span></td>
           <td>{{ m.display }}</td>
+          <td><span :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 个接入点</span></td>
           <td class="mono">
             <template v-if="m.context_tokens || m.max_output_tokens">{{ m.context_tokens ? fmtTokens(m.context_tokens) : '—' }} / {{ m.max_output_tokens ? fmtTokens(m.max_output_tokens) : '—' }}</template>
             <span v-else>—</span>
@@ -814,7 +902,7 @@ const ModelsPage = {
           </div></td>
         </tr>
       </tbody></table></div></div>
-    <div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控）</div></div>
+    <div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控；同一账号 × 同一模型可挂多个接入点，如不同发布版本，按权重分摊）</div></div>
       <div class="table-wrap"><table><thead><tr>
         <th>账号</th><th>模型名</th><th>上游模型 / 接入点</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th>
       </tr></thead><tbody>
@@ -875,7 +963,14 @@ const ModelsPage = {
         <div class="form-item"><label>模型名 <span class="req">*</span></label>
           <select v-model="eModal.form.model"><option v-for="m in models" :key="m.name" :value="m.name">{{ m.name }}</option></select></div>
         <div class="form-item"><label>上游模型 / 接入点 <span class="req">*</span></label>
-          <input v-model="eModal.form.ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/></div>
+          <div style="display:flex;gap:8px">
+            <input v-model="eModal.form.ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/>
+            <button class="btn btn-outline" style="white-space:nowrap" :disabled="epLoading" @click="fetchEpOptions">{{ epLoading ? '拉取中…' : '⇩ 拉取上游' }}</button>
+          </div>
+          <div v-if="epOptions.length" class="ep-picker">
+            <span v-for="o in epOptions" :key="o" class="ep-chip" :class="{active: eModal.form.ep === o}" @click="eModal.form.ep = o">{{ o }}</span>
+          </div>
+          <div v-if="siblingEps().length" class="form-tip">该账号下「{{ eModal.form.model }}」已有 {{ siblingEps().length }} 个接入点：{{ siblingEps().map(x => x.ep).join('、') }}（可继续添加不同发布版本，流量按权重分摊）</div></div>
         <div class="form-row three">
           <div class="form-item"><label>权重</label><input v-model="eModal.form.weight" type="number"/></div>
           <div class="form-item"><label>并发上限</label><input v-model="eModal.form.max_concurrency" type="number"/></div>
@@ -887,6 +982,38 @@ const ModelsPage = {
       </div>
       <div class="modal-foot"><button class="btn btn-outline" @click="eModal=null">取消</button>
         <button class="btn btn-primary" @click="saveEp">保存</button></div>
+      </div></div>
+
+    <!-- 从上游导入弹窗（OpenAI 兼容 GET /models） -->
+    <div v-if="iModal" class="modal-mask" @click.self="iModal=null">
+      <div class="modal"><div class="modal-head"><h3>从上游导入模型</h3><button class="modal-close" @click="iModal=null">×</button></div>
+      <div class="modal-body">
+        <div class="form-item"><label>账号（用其凭据请求上游 GET /models）</label>
+          <div style="display:flex;gap:8px">
+            <select v-model="iModal.account_id">
+              <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }}</option>
+            </select>
+            <button class="btn btn-outline" style="white-space:nowrap" :disabled="iModal.loading" @click="fetchImport">{{ iModal.loading ? '拉取中…' : '⇩ 拉取列表' }}</button>
+          </div>
+          <div class="form-tip">导入会为每个选中项建立「同名模型 + 映射（上游标识 = 模型 id）」，价格与能力上限走目录自动补全；已存在的自动跳过。类型默认文本，图像模型请导入后到目录里改。</div></div>
+        <div v-if="iModal.list.length">
+          <div class="row-actions" style="margin-bottom:8px">
+            <button class="btn btn-outline btn-sm" @click="pickAll(true)">全选</button>
+            <button class="btn btn-outline btn-sm" @click="pickAll(false)">全不选</button>
+            <span class="sh-note">共 {{ iModal.list.length }} 项</span>
+          </div>
+          <div class="import-list">
+            <label v-for="it in iModal.list" :key="it.id" class="import-row">
+              <input type="checkbox" :checked="iModal.picked[it.id]" @change="togglePick(it.id)"/>
+              <span class="mono">{{ it.id }}</span>
+              <span v-if="importMapped(it.id)" class="tag tag-gray">已映射</span>
+            </label>
+          </div>
+        </div>
+        <div v-else class="empty">先选择账号并拉取列表</div>
+      </div>
+      <div class="modal-foot"><button class="btn btn-outline" @click="iModal=null">取消</button>
+        <button class="btn btn-primary" :disabled="iModal.saving || !iModal.list.length" @click="doImport">{{ iModal.saving ? '导入中…' : '导入选中' }}</button></div>
       </div></div>
   </div>`,
 };
@@ -1174,6 +1301,260 @@ const UsagePage = {
   </div>`,
 };
 
+// ── 分流配置（把权重与 fallback 链做成可视化编排） ──
+// 权重口径与后端 model.Endpoint.EffectiveWeight 一致：叶权重 > 账号权重 > 1；
+// 占比只按「启用且未熔断」的叶子折算——这才是真实会承接流量的集合。
+const ROUTE_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ef4444", "#14b8a6", "#ec4899", "#6366f1"];
+
+const RoutingPage = {
+  data() {
+    return {
+      models: [], accounts: [], eps: [], runtime: {},
+      sel: "",            // 当前编辑的模型名
+      wDraft: {},         // 权重草稿：endpointID -> 数值
+      chain: [],          // fallback 链草稿
+      addPick: "",        // 待追加的 fallback 目标
+      savingW: false, savingC: false, loading: false,
+    };
+  },
+  mounted() { this.load(); },
+  computed: {
+    model() { return this.models.find((m) => m.name === this.sel) || null; },
+    // leaves 当前模型的全部叶子（含停用，停用项只展示不参与占比）。
+    leaves() {
+      return this.eps
+        .filter((e) => e.model === this.sel)
+        .map((e, i) => {
+          const rt = this.runtime[e.id] || {};
+          const w = this.effWeight(e);
+          return {
+            ...e, color: ROUTE_COLORS[i % ROUTE_COLORS.length],
+            eff: w, inherited: !(Number(e.weight) > 0),
+            circuit: !!rt.circuit_open, concurrency: rt.concurrency || 0,
+            live: e.enabled && !rt.circuit_open,
+          };
+        });
+    },
+    liveTotal() {
+      return this.leaves.filter((l) => l.live).reduce((s, l) => s + l.eff, 0);
+    },
+    // 候选 fallback：同类型、已存在、非自身、且不在链上。
+    candidates() {
+      const t = (this.model && this.model.type) || "text";
+      return this.models
+        .filter((m) => (m.type || "text") === t && m.name !== this.sel && this.chain.indexOf(m.name) < 0)
+        .map((m) => m.name);
+    },
+    chainDirty() {
+      const orig = ((this.model && this.model.fallback) || []).join("|");
+      return orig !== this.chain.join("|");
+    },
+    weightDirty() {
+      return this.leaves.some((l) => Number(this.wDraft[l.id]) !== Number(l.weight || 0));
+    },
+  },
+  methods: {
+    load() {
+      this.loading = true;
+      Promise.all([
+        req("GET", "/api/models"), req("GET", "/api/accounts"),
+        req("GET", "/api/endpoints"), req("GET", "/api/stats"),
+      ])
+        .then((rs) => {
+          this.models = rs[0] || [];
+          this.accounts = rs[1] || [];
+          this.eps = rs[2] || [];
+          const rt = {};
+          ((rs[3] && rs[3].endpoints) || []).forEach((e) => { rt[e.id] = e.runtime || {}; });
+          this.runtime = rt;
+          if (!this.sel || !this.models.some((m) => m.name === this.sel)) {
+            const first = this.models.find((m) => this.eps.some((e) => e.model === m.name));
+            this.sel = (first && first.name) || (this.models[0] && this.models[0].name) || "";
+          }
+          this.resetDrafts();
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.loading = false; });
+    },
+    resetDrafts() {
+      const w = {};
+      this.eps.filter((e) => e.model === this.sel).forEach((e) => { w[e.id] = Number(e.weight || 0); });
+      this.wDraft = w;
+      this.chain = ((this.model && this.model.fallback) || []).slice();
+      this.addPick = "";
+    },
+    pickModel(name) { this.sel = name; this.resetDrafts(); },
+    accName(id) {
+      const a = this.accounts.find((x) => x.id === id);
+      return (a && a.name) || id;
+    },
+    accWeight(id) {
+      const a = this.accounts.find((x) => x.id === id);
+      return (a && a.weight) || 1;
+    },
+    // effWeight 用草稿值算，让占比随输入实时变化（口径同后端）。
+    effWeight(e) {
+      const draft = this.wDraft[e.id];
+      const own = Number(draft !== undefined ? draft : e.weight || 0);
+      return own > 0 ? own : this.accWeight(e.account_id);
+    },
+    sharePct(l) {
+      if (!l.live || this.liveTotal <= 0) return 0;
+      return (l.eff / this.liveTotal) * 100;
+    },
+    epCountOf(name) { return this.eps.filter((e) => e.model === name).length; },
+    bump(l, delta) {
+      const cur = Number(this.wDraft[l.id] || 0);
+      this.wDraft[l.id] = Math.max(0, cur + delta);
+    },
+    saveWeights() {
+      const changed = this.leaves.filter((l) => Number(this.wDraft[l.id]) !== Number(l.weight || 0));
+      if (!changed.length) { toast("权重没有改动"); return; }
+      this.savingW = true;
+      // 映射 PUT 会无条件覆盖四个流控字段，因此必须整组回传，否则并发/RPM/TPM 被清零。
+      Promise.all(changed.map((l) => req("PUT", "/api/endpoints/" + l.id, {
+        weight: Number(this.wDraft[l.id]) || 0,
+        max_concurrency: l.max_concurrency || 0,
+        rpm_limit: l.rpm_limit || 0,
+        tpm_limit: l.tpm_limit || 0,
+      })))
+        .then(() => { toast("已保存 " + changed.length + " 条权重"); this.load(); })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.savingW = false; });
+    },
+    toggleLeaf(l) {
+      req("PUT", "/api/endpoints/" + l.id, {
+        enabled: !l.enabled,
+        weight: l.weight || 0, max_concurrency: l.max_concurrency || 0,
+        rpm_limit: l.rpm_limit || 0, tpm_limit: l.tpm_limit || 0,
+      })
+        .then(() => { toast(l.enabled ? "已停用该接入点" : "已启用该接入点"); this.load(); })
+        .catch((e) => toast(e.message, false));
+    },
+    addFallback() {
+      if (!this.addPick) return;
+      this.chain.push(this.addPick);
+      this.addPick = "";
+    },
+    moveFallback(i, delta) {
+      const j = i + delta;
+      if (j < 0 || j >= this.chain.length) return;
+      const t = this.chain[i];
+      this.chain[i] = this.chain[j];
+      this.chain[j] = t;
+    },
+    dropFallback(i) { this.chain.splice(i, 1); },
+    saveChain() {
+      if (!this.sel) return;
+      this.savingC = true;
+      req("PUT", "/api/models/" + this.sel, { fallback: this.chain })
+        .then(() => { toast("已保存 fallback 链"); this.load(); })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.savingC = false; });
+    },
+    rateOfLeaf(l) {
+      return l.total_requests ? fmtPct((l.success_requests / l.total_requests) * 100) : "—";
+    },
+  },
+  template: `
+  <div class="page">
+    <div class="page-head">
+      <div class="page-title" style="margin:0">分流配置</div>
+      <div class="row-actions">
+        <button class="btn btn-outline btn-sm" :disabled="loading" @click="load">↻ 刷新</button>
+      </div>
+    </div>
+
+    <div class="route-wrap">
+      <div class="card route-side">
+        <div class="card-head"><div class="card-title">模型</div></div>
+        <div class="route-list">
+          <div v-for="m in models" :key="m.name" class="route-item" :class="{active: sel===m.name}" @click="pickModel(m.name)">
+            <span class="mono">{{ m.name }}</span>
+            <span :class="epCountOf(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCountOf(m.name) }}</span>
+          </div>
+          <div v-if="!models.length" class="empty">暂无模型</div>
+        </div>
+      </div>
+
+      <div class="route-main">
+        <div class="card">
+          <div class="card-head"><div class="card-title">权重分摊 · {{ sel || '—' }}</div>
+            <div class="row-actions">
+              <button class="btn btn-outline btn-sm" :disabled="!weightDirty" @click="resetDrafts">还原</button>
+              <button class="btn btn-primary btn-sm" :disabled="savingW || !weightDirty" @click="saveWeights">{{ savingW ? '保存中…' : '保存权重' }}</button>
+            </div>
+          </div>
+          <div v-if="leaves.length">
+            <div class="share-bar">
+              <div v-for="l in leaves.filter(x => x.live)" :key="l.id" class="share-seg"
+                :style="{width: sharePct(l) + '%', background: l.color}"
+                :title="accName(l.account_id) + ' · ' + l.ep + ' ' + sharePct(l).toFixed(1) + '%'">
+                <span v-if="sharePct(l) >= 8">{{ sharePct(l).toFixed(0) }}%</span>
+              </div>
+              <div v-if="!liveTotal" class="share-empty">当前没有可承接流量的接入点</div>
+            </div>
+            <div class="table-wrap"><table><thead><tr>
+              <th>账号 · 上游标识</th><th>权重</th><th>有效权重</th><th>占比</th><th>状态</th><th>累计请求</th><th>成功率</th><th>操作</th>
+            </tr></thead><tbody>
+              <tr v-for="l in leaves" :key="l.id">
+                <td><span class="dot-color" :style="{background: l.color}"></span>{{ accName(l.account_id) }} · <span class="mono">{{ l.ep }}</span></td>
+                <td><div class="w-edit">
+                  <button class="btn btn-outline btn-sm" @click="bump(l, -1)">−</button>
+                  <input v-model.number="wDraft[l.id]" type="number" min="0"/>
+                  <button class="btn btn-outline btn-sm" @click="bump(l, 1)">+</button>
+                </div></td>
+                <td>{{ l.eff }}<span v-if="l.inherited" class="sh-note">（继承账号）</span></td>
+                <td>{{ l.live ? sharePct(l).toFixed(1) + '%' : '—' }}</td>
+                <td>
+                  <span v-if="!l.enabled" class="tag tag-gray">停用</span>
+                  <span v-else-if="l.circuit" class="tag tag-red">熔断中</span>
+                  <span v-else class="tag tag-green">承接中</span>
+                </td>
+                <td>{{ l.total_requests || 0 }}</td>
+                <td>{{ rateOfLeaf(l) }}</td>
+                <td><button class="btn btn-outline btn-sm" @click="toggleLeaf(l)">{{ l.enabled ? '停用' : '启用' }}</button></td>
+              </tr>
+            </tbody></table></div>
+            <div class="sh-note" style="margin-top:8px">权重 0 = 继承账号权重（当前账号权重见「有效权重」列）；占比只按启用且未熔断的接入点折算，与网关实际选路口径一致。</div>
+          </div>
+          <div v-else class="empty">该模型还没有接入点映射，先到「模型映射」页添加</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div class="card-title">fallback 链 · {{ sel || '—' }}</div>
+            <div class="row-actions">
+              <button class="btn btn-outline btn-sm" :disabled="!chainDirty" @click="resetDrafts">还原</button>
+              <button class="btn btn-primary btn-sm" :disabled="savingC || !chainDirty" @click="saveChain">{{ savingC ? '保存中…' : '保存链路' }}</button>
+            </div>
+          </div>
+          <div class="chain-row">
+            <span class="chip chip-self mono">{{ sel || '—' }}</span>
+            <template v-for="(f, i) in chain" :key="f">
+              <span class="chain-arrow">→</span>
+              <span class="chip">
+                <span class="mono">{{ f }}</span>
+                <button class="chip-btn" title="上移" @click="moveFallback(i, -1)">←</button>
+                <button class="chip-btn" title="下移" @click="moveFallback(i, 1)">→</button>
+                <button class="chip-btn chip-del" title="移除" @click="dropFallback(i)">×</button>
+              </span>
+            </template>
+            <span v-if="!chain.length" class="sh-note">未配置 fallback：该模型全部接入点不可用时直接返回错误</span>
+          </div>
+          <div class="chain-add">
+            <select v-model="addPick" style="width:240px">
+              <option value="">选择要追加的模型…</option>
+              <option v-for="c in candidates" :key="c" :value="c">{{ c }}</option>
+            </select>
+            <button class="btn btn-outline" :disabled="!addPick" @click="addFallback">+ 追加</button>
+            <span class="sh-note">按顺序尝试；仅同类型模型可入链（文本↔图像不混用）。</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`,
+};
+
 // ── 设置（网关运行时 + 本浏览器偏好） ──
 const SettingsPage = {
   data() {
@@ -1280,6 +1661,7 @@ const MENU = [
   { key: "usage", label: "用量分析", icon: "📈", comp: "UsagePage" },
   { key: "accounts", label: "上游账号", icon: "🏛", comp: "AccountsPage" },
   { key: "models", label: "模型映射", icon: "🧩", comp: "ModelsPage" },
+  { key: "routing", label: "分流配置", icon: "🔀", comp: "RoutingPage" },
   { key: "subkeys", label: "子 Key", icon: "🔑", comp: "SubKeysPage" },
   { key: "logs", label: "请求日志", icon: "📄", comp: "LogsPage" },
   { key: "settings", label: "设置", icon: "⚙️", comp: "SettingsPage" },
@@ -1519,6 +1901,7 @@ app.component("OverviewPage", OverviewPage)
   .component("UsagePage", UsagePage)
   .component("AccountsPage", AccountsPage)
   .component("ModelsPage", ModelsPage)
+  .component("RoutingPage", RoutingPage)
   .component("SubKeysPage", SubKeysPage)
   .component("LogsPage", LogsPage)
   .component("SettingsPage", SettingsPage)

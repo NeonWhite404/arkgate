@@ -29,8 +29,9 @@ type Admin struct {
 	store   *store.Store
 	box     *secure.Box
 	bal     *balancer.Balancer
-	cfg     *config.Config   // 运行时配置（超时热改写入其原子字段）
-	catalog *catalog.Catalog // 内置模型元数据目录（价格/能力自动补全来源）
+	cfg     *config.Config    // 运行时配置（超时热改写入其原子字段）
+	catalog *catalog.Catalog  // 内置模型元数据目录（价格/能力自动补全来源）
+	mgr     *provider.Manager // 仅用于「拉取上游模型列表」这类管理侧探测
 	handler http.Handler
 }
 
@@ -45,7 +46,7 @@ const (
 // New 构造管理后端，并把已持久化的运行时设置应用到 cfg
 // （优先级：DB 持久化值 > 环境变量 > 内置默认）。
 func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.Config) *Admin {
-	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New()}
+	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New(), mgr: provider.NewManager()}
 	a.loadPersistedTimeouts()
 	a.handler = a.routes()
 	return a
@@ -135,6 +136,7 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/models/", a.handleModelItem)
 	reg("/api/models/metadata-sync", a.handleMetadataSync)
 	reg("/api/catalog/lookup", a.handleCatalogLookup)
+	reg("/api/upstream/models", a.handleUpstreamModels)
 	reg("/api/endpoints", a.handleEndpointsCollection)
 	reg("/api/endpoints/", a.handleEndpointItem)
 	reg("/api/subkeys", a.handleSubkeysCollection)
@@ -469,6 +471,74 @@ func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
 	return nil
 }
 
+// ─────────────────────────── 上游模型列表探测 ───────────────────────────
+
+// upstreamProbeTimeout 探测上游 /models 的上限：借用请求超时，但不跟随
+// 「0 = 不限」——管理端点击不该无限等待，缺省压到 30s。
+func (a *Admin) upstreamProbeTimeout() time.Duration {
+	t := a.cfg.Timeouts.Request()
+	if t <= 0 || t > 30*time.Second {
+		return 30 * time.Second
+	}
+	return t
+}
+
+// handleUpstreamModels 用指定账号的凭据拉取其上游的 OpenAI 兼容模型列表
+// （GET {base}/models），供「从上游导入」减少手工录入。
+// 上游错误原样透出状态码与错误体摘要，便于区分「未授权」与「不支持该接口」。
+func (a *Admin) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	accountID := r.URL.Query().Get("account_id")
+	if accountID == "" {
+		writeJSON(w, 400, map[string]any{"detail": "缺少 account_id"})
+		return
+	}
+	acc, err := a.store.GetAccount(accountID)
+	if err != nil {
+		writeJSON(w, 404, map[string]any{"detail": "账号不存在"})
+		return
+	}
+	def, ok := provider.Get(acc.Provider)
+	if !ok {
+		def = provider.FallbackDef(acc.Provider)
+	}
+	baseURL, err := def.ResolveBaseURL(acc.BaseURL)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"detail": "该账号未配置 base URL"})
+		return
+	}
+	key, err := a.box.Decrypt(acc.ArkAPIKeyEnc)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": "账号密钥解密失败"})
+		return
+	}
+	rt := provider.Route{Def: def, BaseURL: baseURL, Key: key}
+	list, err := a.mgr.ListModels(r.Context(), rt, a.upstreamProbeTimeout())
+	if err != nil {
+		if he, ok := provider.AsHTTPError(err); ok {
+			writeJSON(w, 502, map[string]any{
+				"detail": fmt.Sprintf("上游返回 %d：%s", he.Code, truncateText(string(he.Body), 300)),
+			})
+			return
+		}
+		writeJSON(w, 502, map[string]any{"detail": "拉取失败：" + err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"base_url": baseURL, "count": len(list), "models": list})
+}
+
+// truncateText 截断上游错误体，避免把长 HTML 页面整页塞进管理端提示。
+func truncateText(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
 // ─────────────────────────── 运行时设置（上游超时） ───────────────────────────
 
 // 超时可设区间（秒）：上限 1 小时够覆盖长推理，0 表示关闭该项超时。
@@ -663,6 +733,9 @@ func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.Type = t
+		if m.Fallback == nil {
+			m.Fallback = []string{} // 统一存 []，避免落库成 null（与「清空链路」口径一致）
+		}
 		if err := a.validateFallbackChain(m.Fallback, t); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
@@ -801,6 +874,12 @@ func (a *Admin) handleEndpointsCollection(w http.ResponseWriter, r *http.Request
 			return
 		}
 		e.EP = strings.TrimSpace(e.EP)
+		// 同一账号 + 同一模型可挂多个不同 ep（同模型的不同发布版本），
+		// 但完全相同的三元组是重复配置：明确拒绝，避免静默改到既有行。
+		if _, dup := a.store.EndpointIDByTuple(e.AccountID, e.Model, e.EP); dup {
+			writeJSON(w, 400, map[string]any{"detail": "该账号下该模型已存在相同的上游标识 " + e.EP})
+			return
+		}
 		if e.ID == "" {
 			e.ID = "ep_" + randHex(6)
 		}
@@ -852,6 +931,12 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 		existing.MaxConcurrency = intField(probe["max_concurrency"])
 		existing.RPMLimit = intField(probe["rpm_limit"])
 		existing.TPMLimit = int64(intField(probe["tpm_limit"]))
+		existing.EP = strings.TrimSpace(existing.EP)
+		// 改归属/标识后若与「另一条」映射三元组相同，明确拒绝（自身不算冲突）。
+		if other, dup := a.store.EndpointIDByTuple(existing.AccountID, existing.Model, existing.EP); dup && other != id {
+			writeJSON(w, 400, map[string]any{"detail": "该账号下该模型已存在相同的上游标识 " + existing.EP})
+			return
+		}
 		if err := a.store.UpsertEndpoint(existing); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
