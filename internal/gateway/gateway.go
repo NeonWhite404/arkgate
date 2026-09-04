@@ -17,6 +17,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -186,7 +187,8 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 }
 
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
-func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, ri routeInfo,
+// ip 为下游调用方地址（由各链路入口用 clientIP(r) 取一次后传入）。
+func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
 	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, start time.Time) {
 	ok := ferr == nil
 	// 客户端请求自身导致的失败（上下文超限等）：统计/日志照记，但不计入端点熔断。
@@ -209,6 +211,7 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, leaf *model.Endpoint, ri route
 		ImageCount:       images,
 		Status:           "ok",
 		LatencyMs:        time.Since(start).Milliseconds(),
+		ClientIP:         ip,
 	}
 	if !ok {
 		l.Status = "error"
@@ -267,6 +270,31 @@ func clampOutput(body []byte, keys []string, limit int64) ([]byte, bool) {
 	return out, true
 }
 
+// clientIP 取下游调用方 IP：优先反代头（X-Forwarded-For 首跳 / X-Real-IP），
+// 否则用连接的 RemoteAddr。
+//
+// 注意：这两个头由调用方可控，只有网关确实部署在受信反代之后才可信。因此该值
+// **只用于日志展示与排查**，不参与鉴权、限流或任何路由判断——否则伪造一个头
+// 就能绕过基于 IP 的策略。
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			v = v[:i]
+		}
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
+		return v
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // 无端口形式（少见）原样记录
+	}
+	return host
+}
+
 // ─────────────────────────── /v1/chat/completions ───────────────────────────
 
 func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +341,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // chatNonStream 非流式：支持失败后排除当前叶子、切换下一个重试。
 func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
 	start := time.Now()
+	ip := clientIP(r)
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -333,7 +362,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -345,7 +374,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
 			// 透传上游真实状态码与 body。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -356,7 +385,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -408,6 +437,7 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 // responsesNonStream 非流式 responses：与 chat 相同的重试语义。
 func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
 	start := time.Now()
+	ip := clientIP(r)
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -425,7 +455,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -437,7 +467,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -447,7 +477,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -502,6 +532,7 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 // imagesNonStream 非流式图像生成：与 chat 相同的重试语义。
 func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
 	start := time.Now()
+	ip := clientIP(r)
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -519,7 +550,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -533,7 +564,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 				images = usage.Count
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, start)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -543,7 +574,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -566,6 +597,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 
 	start := time.Now()
 	modality := modalityOf(api)
+	ip := clientIP(r)
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -591,7 +623,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -600,7 +632,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		// 打开上游流：成功 = 已收到首字节；失败时未写过任何客户端字节，可重试。
 		st, oerr := g.openStream(r.Context(), ri.rt, body, leaf.EP, api)
 		if oerr != nil {
-			g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, 0, 0, 0, oerr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, 0, 0, 0, oerr, start)
 			exclude[leaf.ID] = true
 			lastErr = oerr
 			continue
@@ -634,7 +666,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			// 流已开始，无法更改状态码；用 SSE error 帧收尾。
 			writeSSEError(w, perr)
 		}
-		g.recordAttempt(sk, leaf, ri, modelName, actualModel, modality, pt, ct, images, perr, start)
+		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, pt, ct, images, perr, start)
 		return
 	}
 

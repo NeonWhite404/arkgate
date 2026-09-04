@@ -944,7 +944,7 @@ const ModelsPage = {
           <div class="form-item"><label>上下文窗口（tokens，0=不校验）</label><input v-model="mModal.form.context_tokens" type="number"/></div>
           <div class="form-item"><label>最大输出（tokens，0=不裁剪）</label><input v-model="mModal.form.max_output_tokens" type="number"/></div>
         </div>
-        <div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型）</label>
+        <div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型；不向下传递）</label>
           <input v-model="mModal.form.fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>
         <div class="form-item"><label>描述</label><input v-model="mModal.form.description"/></div>
         <div class="form-item"><label>状态</label>
@@ -1120,31 +1120,77 @@ const SubKeysPage = {
 
 // ── 请求日志 ──
 const LogsPage = {
-  data() { return { logs: [] }; },
+  data() {
+    return {
+      logs: [], total: 0, page: 1,
+      pageSize: Number(localStorage.getItem("arkgate_log_page_size") || 50),
+      sizes: [20, 50, 100, 200, 500],
+      loading: false,
+    };
+  },
   mounted() { this.load(); },
+  computed: {
+    pages() { return Math.max(1, Math.ceil(this.total / this.pageSize)); },
+    rangeFrom() { return this.total ? (this.page - 1) * this.pageSize + 1 : 0; },
+    rangeTo() { return Math.min(this.page * this.pageSize, this.total); },
+  },
   methods: {
     load() {
-      req("GET", "/api/logs?limit=300").then((d) => { this.logs = d || []; }).catch((e) => toast(e.message, false));
+      this.loading = true;
+      const offset = (this.page - 1) * this.pageSize;
+      req("GET", "/api/logs?limit=" + this.pageSize + "&offset=" + offset)
+        .then((d) => {
+          this.logs = (d && d.items) || [];
+          this.total = (d && d.total) || 0;
+          // 末页被清空/缩短时回退到最后一页，避免停在空白页。
+          if (!this.logs.length && this.page > 1 && this.total > 0) {
+            this.page = this.pages;
+            this.load();
+          }
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.loading = false; });
+    },
+    go(p) {
+      const next = Math.min(Math.max(1, p), this.pages);
+      if (next === this.page) return;
+      this.page = next;
+      this.load();
+    },
+    setSize(n) {
+      this.pageSize = Number(n) || 50;
+      localStorage.setItem("arkgate_log_page_size", String(this.pageSize));
+      this.page = 1;
+      this.load();
     },
     clear() {
       if (!confirm("确认清空所有日志？")) return;
-      req("DELETE", "/api/logs").then(() => { toast("已清空"); this.load(); });
+      req("DELETE", "/api/logs").then(() => {
+        toast("已清空");
+        this.page = 1;
+        this.load();
+      });
     },
   },
   template: `
   <div class="page">
     <div class="page-title">请求日志</div>
     <div class="toolbar">
-      <button class="btn btn-outline" @click="load">刷新</button>
+      <button class="btn btn-outline" :disabled="loading" @click="load">{{ loading ? '加载中…' : '刷新' }}</button>
       <button class="btn btn-danger" @click="clear">清空日志</button>
       <div class="spacer"></div>
+      <span class="sh-note">每页</span>
+      <select style="width:90px" :value="pageSize" @change="setSize($event.target.value)">
+        <option v-for="n in sizes" :key="n" :value="n">{{ n }} 条</option>
+      </select>
     </div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>时间</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
+      <th>时间</th><th>来源 IP</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
     </tr></thead><tbody>
-      <tr v-if="!logs.length"><td colspan="14" class="empty">暂无日志</td></tr>
-      <tr v-for="l in logs" :key="l.id">
+      <tr v-if="!logs.length"><td colspan="15" class="empty">暂无日志</td></tr>
+      <tr v-for="l in logs" :key="l.id" class="row-in">
         <td>{{ fmtTime(l.ts) }}</td>
+        <td class="mono">{{ l.client_ip || '—' }}</td>
         <td>{{ l.subkey_name || l.subkey_id }}</td>
         <td>{{ l.account_name || l.account_id }}</td>
         <td>{{ l.provider || '-' }}</td>
@@ -1157,7 +1203,17 @@ const LogsPage = {
         <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
       </tr>
-    </tbody></table></div></div>
+    </tbody></table></div>
+    <div class="pager">
+      <span class="sh-note">共 {{ total }} 条<template v-if="total"> · 当前 {{ rangeFrom }}–{{ rangeTo }}</template></span>
+      <div class="spacer"></div>
+      <button class="btn btn-outline btn-sm" :disabled="page<=1 || loading" @click="go(1)">« 首页</button>
+      <button class="btn btn-outline btn-sm" :disabled="page<=1 || loading" @click="go(page-1)">‹ 上一页</button>
+      <span class="page-ind">{{ page }} / {{ pages }}</span>
+      <button class="btn btn-outline btn-sm" :disabled="page>=pages || loading" @click="go(page+1)">下一页 ›</button>
+      <button class="btn btn-outline btn-sm" :disabled="page>=pages || loading" @click="go(pages)">末页 »</button>
+    </div>
+    </div>
   </div>`,
 };
 
@@ -1541,13 +1597,14 @@ const RoutingPage = {
             </template>
             <span v-if="!chain.length" class="sh-note">未配置 fallback：该模型全部接入点不可用时直接返回错误</span>
           </div>
+          <div class="sh-note" style="padding: 0 16px 8px">这就是网关实际会尝试的完整顺序：链只取本模型配置的这一列，目标自己的 fallback 不会被带进来。</div>
           <div class="chain-add">
             <select v-model="addPick" style="width:240px">
               <option value="">选择要追加的模型…</option>
               <option v-for="c in candidates" :key="c" :value="c">{{ c }}</option>
             </select>
             <button class="btn btn-outline" :disabled="!addPick" @click="addFallback">+ 追加</button>
-            <span class="sh-note">按顺序尝试；仅同类型模型可入链（文本↔图像不混用）。</span>
+            <span class="sh-note">按顺序尝试；只用本模型这一列，不会再向下传递到目标自己的 fallback；仅同类型模型可入链（文本↔图像不混用）。</span>
           </div>
         </div>
       </div>
@@ -1709,7 +1766,9 @@ const AdminShell = {
       </div>
     </aside>
     <main class="main">
-      <component :is="current"></component>
+      <transition name="page" mode="out-in">
+        <component :is="current" :key="view"></component>
+      </transition>
     </main>
   </div>`,
   computed: {
@@ -1881,11 +1940,15 @@ const App = {
   template: `
     <div v-if="prefs.bgUrl" class="app-bg" :style="bgStyle"></div>
     <div v-if="prefs.bgUrl" class="app-bg-shade"></div>
-    <LoginPage v-if="mode==='login'" @admin="onAdmin" @portal="onPortal"/>
-    <AdminShell v-else-if="mode==='admin'" @logout="logoutAdmin"/>
-    <PortalPage v-else-if="mode==='portal'" @logout="logoutPortal"/>
-    <div v-else class="login-wrap"><div class="login-card sub">加载中…</div></div>
-    <div class="toasts"><div v-for="t in toasts" :key="t.id" class="toast" :class="t.ok ? '' : 'err'">{{ t.msg }}</div></div>`,
+    <transition name="shell" mode="out-in">
+      <LoginPage v-if="mode==='login'" @admin="onAdmin" @portal="onPortal"/>
+      <AdminShell v-else-if="mode==='admin'" @logout="logoutAdmin"/>
+      <PortalPage v-else-if="mode==='portal'" @logout="logoutPortal"/>
+      <div v-else class="login-wrap"><div class="login-card sub">加载中…</div></div>
+    </transition>
+    <transition-group name="toast" tag="div" class="toasts">
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="t.ok ? '' : 'err'">{{ t.msg }}</div>
+    </transition-group>`,
 };
 
 const app = createApp(App);

@@ -1087,16 +1087,30 @@ func (a *Admin) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"success": true})
 		return
 	}
-	limit := 200
+	// 分页：limit 为每页条数（store 会把超范围值回落到 200），offset 为偏移。
+	// 返回 {items,total,limit,offset}，让前端能画出「第 x / y 页」。
+	limit, offset := 50, 0
 	if v := r.URL.Query().Get("limit"); v != "" {
-		_ = json.Unmarshal([]byte(v), &limit)
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
 	}
-	logs, err := a.store.ListUsageLogs(limit)
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	logs, err := a.store.ListUsageLogs(limit, offset)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"detail": err.Error()})
 		return
 	}
-	writeJSON(w, 200, logs)
+	total, err := a.store.CountUsageLogs()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": logs, "total": total, "limit": limit, "offset": offset})
 }
 
 func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {

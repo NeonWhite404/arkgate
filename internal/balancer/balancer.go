@@ -349,6 +349,13 @@ func (b *Balancer) accountSupports(accountID string, api API) bool {
 // 空 = 不启用粘性）。粘性命中时直接复用上次的叶节点（仍要求其在可用候选中），
 // 且不扰动 WRR 计数；未命中时正常 WRR 选举并记住结果。
 func (b *Balancer) Select(modelName string, allowed []string, exclude map[string]bool, api API, stickyKey string) (ep *model.Endpoint, err error) {
+	// 模型必须在目录里且处于启用状态才承接流量。b.models 只装启用模型，
+	// 而 modelApps 是按「端点启用」建的索引——少了这道校验，停用（或已从目录
+	// 删除但映射还在）的模型仍会被选中，界面上的「停用」形同虚设。
+	// fallback 链上的目标同样过这一关：链只决定尝试顺序，不豁免启用校验。
+	if !b.modelNameKnown(modelName) {
+		return nil, ErrNoEndpoint
+	}
 	cands, poolKey := b.usableEndpoints(modelName, allowed, exclude, api)
 	if len(cands) == 0 {
 		if b.hasAnyEndpoint(modelName, allowed, api) {
@@ -434,9 +441,11 @@ func (b *Balancer) sessionPut(key, endpointID string) {
 
 // FallbackChain 解析某易读模型名的有序 fallback 链。
 //
-// 按广度优先展开：请求名在前，然后是它 Fallback 列表里的每一项（保持配置顺序），
-// 再依次展开这些模型各自的 Fallback。去重、防环，总长上限 maxFallbackChain。
-// 例如 A.Fallback=[B,C]，B.Fallback=[D] → [A, B, C, D]。
+// **只取该模型自己配置的那一列，不向下传递**：链 = [请求名] + 它 Fallback 列表里
+// 的每一项（保持配置顺序）。即 A.Fallback=[B,C]、B.Fallback=[D] → [A, B, C]，
+// D 不会被拉进来。这样「界面上看到的退避目标」就是「网关实际会尝试的目标」，
+// 不会出现管理员从未为 A 配置过、却因中间模型的配置而被打到的模型。
+// 去重、排除自身，总长上限 maxFallbackChain。
 //
 // 同类型约束：请求模型已知时，链上只保留与其 Type 相同的候选
 // （文本模型永远不会退避到图像模型，反之亦然）。
@@ -446,31 +455,26 @@ func (b *Balancer) FallbackChain(modelName string) []string {
 	if modelName == "" {
 		return nil
 	}
-	root, known := b.models[modelName]
 	chain := []string{modelName}
+	root, known := b.models[modelName]
+	if !known {
+		return chain // 未登记/已停用：无从读取其配置，只保留自身
+	}
 	seen := map[string]bool{modelName: true}
-	for i := 0; i < len(chain) && len(chain) < maxFallbackChain; i++ {
-		m, ok := b.models[chain[i]]
-		if !ok {
+	for _, f := range root.Fallback {
+		if f == "" || seen[f] {
 			continue
 		}
-		for _, f := range m.Fallback {
-			if f == "" || seen[f] {
-				continue
-			}
-			// 同类型约束：已登记且跨类型的目标明确跳过（文本永不退避到图像）。
-			// 未登记/未启用的目标保留在链上——Select 时自然失败并继续，
-			// 维持「配置的每一项都会被尝试」的既有语义。
-			if known {
-				if fm, exists := b.models[f]; exists && fm.Type != root.Type {
-					continue
-				}
-			}
-			seen[f] = true
-			chain = append(chain, f)
-			if len(chain) >= maxFallbackChain {
-				break
-			}
+		// 同类型约束：已登记且跨类型的目标明确跳过（文本永不退避到图像）。
+		// 未登记/未启用的目标保留在链上——Select 时自然失败并继续，
+		// 维持「配置的每一项都会被尝试」的既有语义。
+		if fm, exists := b.models[f]; exists && fm.Type != root.Type {
+			continue
+		}
+		seen[f] = true
+		chain = append(chain, f)
+		if len(chain) >= maxFallbackChain {
+			break
 		}
 	}
 	return chain

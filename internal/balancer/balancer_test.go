@@ -286,6 +286,9 @@ func TestTPMLimitThrottles(t *testing.T) {
 	}
 }
 
+// TestFallbackChain 锁定「fallback 不向下传递」：链只由请求模型自己配置的那一列
+// 构成。曾经的实现按广度优先把「fallback 的 fallback」也拉进来（a 未配置 d，却因
+// b→d 被打到 d），导致日志里出现管理员从未为该模型配置过的「不可能的分流」。
 func TestFallbackChain(t *testing.T) {
 	b := newTestBalancer()
 	b.seed(nil, nil, []*model.Model{
@@ -294,10 +297,32 @@ func TestFallbackChain(t *testing.T) {
 		{Name: "d", Type: model.ModelTypeText, Enabled: true},
 	})
 	got := b.FallbackChain("a")
-	// 广度优先：a 的两个候选 b、c 都要保留（按配置顺序），再展开 b 的 d。
-	want := []string{"a", "b", "c", "d"}
+	// a 的两个候选 b、c 都保留（按配置顺序）；b 的 d 不再被传递进来。
+	want := []string{"a", "b", "c"}
 	if !equalStrs(got, want) {
 		t.Fatalf("want %v, got %v", want, got)
+	}
+	// 从 b 发起时才会尝试 d——即「谁配置的目标，只在请求谁时生效」。
+	if got := b.FallbackChain("b"); !equalStrs(got, []string{"b", "d"}) {
+		t.Fatalf("b's own chain: want [b d], got %v", got)
+	}
+}
+
+// TestSelectSkipsDisabledModel 锁定「停用/未登记模型不承接流量」：
+// modelApps 是按端点启用状态建的索引，若不校验模型自身状态，停用模型
+// （或已从目录删除但映射还在的名字）仍会被选中——界面上的「停用」就失效了。
+func TestSelectSkipsDisabledModel(t *testing.T) {
+	b := newTestBalancer()
+	b.seed([]*model.Account{mkAcc("a1", 1)},
+		[]*model.Endpoint{mkEP("e1", "a1", "off", "ep-off", 1)},
+		[]*model.Model{{Name: "on", Type: model.ModelTypeText, Enabled: true, Fallback: []string{"off"}}})
+
+	if _, err := b.Select("off", nil, nil, APIChat, ""); err != ErrNoEndpoint {
+		t.Fatalf("disabled model must not be selectable, got %v", err)
+	}
+	// fallback 目标同样过启用校验：链上有 off，但它不该承接流量。
+	if _, name, err := b.SelectWithFallback("on", nil, nil, nil, APIChat, ""); err == nil {
+		t.Fatalf("disabled fallback target must not serve traffic, routed to %q", name)
 	}
 }
 

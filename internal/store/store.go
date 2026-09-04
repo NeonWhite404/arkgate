@@ -55,7 +55,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
-const schemaVersion = "5"
+const schemaVersion = "6"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -205,6 +205,8 @@ func (s *Store) migrate() error {
 		// —— v4：模型能力上限（0=未设置，允许目录自动补全） ——
 		`ALTER TABLE models ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE models ADD COLUMN max_output_tokens INTEGER NOT NULL DEFAULT 0`,
+		// —— v6：请求来源 IP（v5 是 endpoints 唯一键放宽，见 relaxEndpointUnique） ——
+		`ALTER TABLE usage_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -730,36 +732,43 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
 		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
-		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error,client_ip)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
 		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
-		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs, l.Error)
+		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs,
+		l.Error, l.ClientIP)
 	return err
 }
 
 const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
 	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
-	cost,status,latency_ms,error`
+	cost,status,latency_ms,error,client_ip`
 
 func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
 	if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
 		&l.Provider, &l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.Modality,
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
-		&l.Cost, &l.Status, &l.LatencyMs, &l.Error); err != nil {
+		&l.Cost, &l.Status, &l.LatencyMs, &l.Error, &l.ClientIP); err != nil {
 		return nil, err
 	}
 	return l, nil
 }
 
-func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
+// ListUsageLogs 按 id 倒序分页读取日志。limit 超范围时回落 200，
+// offset 为负按 0 处理（分页由管理端传入，非法值不该让查询失败）。
+func (s *Store) ListUsageLogs(limit, offset int) ([]*model.UsageLog, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
+	if offset < 0 {
+		offset = 0
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT ` + usageLogCols + ` FROM usage_logs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(
+		`SELECT `+usageLogCols+` FROM usage_logs ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -773,6 +782,15 @@ func (s *Store) ListUsageLogs(limit int) ([]*model.UsageLog, error) {
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+// CountUsageLogs 返回日志总条数，供分页器算总页数。
+func (s *Store) CountUsageLogs() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_logs`).Scan(&n)
+	return n, err
 }
 
 // ClearUsageLogs 清空日志表。

@@ -87,10 +87,11 @@ func TestStoreBasics(t *testing.T) {
 		SubKeyID: "s1", AccountID: "a1", Provider: "custom", EndpointID: "e1",
 		RequestedModel: "img", Model: "img", EP: "doubao-seedream-4-0",
 		Modality: model.ModelTypeImage, ImageCount: 2, Cost: 1.0, Status: "ok",
+		ClientIP: "198.51.100.7",
 	}); err != nil {
 		t.Fatalf("add log: %v", err)
 	}
-	logs, err := s.ListUsageLogs(10)
+	logs, err := s.ListUsageLogs(10, 0)
 	if err != nil || len(logs) != 1 {
 		t.Fatalf("logs = %v (%v)", logs, err)
 	}
@@ -99,6 +100,9 @@ func TestStoreBasics(t *testing.T) {
 	}
 	if logs[0].Cost != 1.0 {
 		t.Fatalf("log cost = %v", logs[0].Cost)
+	}
+	if logs[0].ClientIP != "198.51.100.7" {
+		t.Fatalf("log client ip = %q", logs[0].ClientIP)
 	}
 
 	// 日限额累计：两次 +3/+2 → tokens=5, images=2, requests=2, cost=0.75。
@@ -450,6 +454,64 @@ func TestQueryUsage(t *testing.T) {
 	}
 	if len(resBad.Series) == 0 || len(resBad.Facets) != 0 {
 		t.Fatalf("bad params result: series=%d facets=%d", len(resBad.Series), len(resBad.Facets))
+	}
+}
+
+// TestUsageLogPagination 锁定日志分页：按 id 倒序、offset 翻页不重不漏，
+// 总数独立于分页参数；越界 offset 返回空页而不是报错。
+func TestUsageLogPagination(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for i := 0; i < 25; i++ {
+		if err := s.AddUsageLog(&model.UsageLog{
+			SubKeyID: "s1", Model: "m", Status: "ok", PromptTokens: int64(i),
+		}); err != nil {
+			t.Fatalf("add log %d: %v", i, err)
+		}
+	}
+	total, err := s.CountUsageLogs()
+	if err != nil || total != 25 {
+		t.Fatalf("count = %d (%v)", total, err)
+	}
+
+	first, err := s.ListUsageLogs(10, 0)
+	if err != nil || len(first) != 10 {
+		t.Fatalf("page 1 = %d (%v)", len(first), err)
+	}
+	// 倒序：第一页首条是最后写入的那条（prompt_tokens=24）。
+	if first[0].PromptTokens != 24 {
+		t.Fatalf("page 1 must start at newest, got %d", first[0].PromptTokens)
+	}
+	second, err := s.ListUsageLogs(10, 10)
+	if err != nil || len(second) != 10 || second[0].PromptTokens != 14 {
+		t.Fatalf("page 2 = %d first=%v (%v)", len(second), second[0].PromptTokens, err)
+	}
+	last, err := s.ListUsageLogs(10, 20)
+	if err != nil || len(last) != 5 {
+		t.Fatalf("page 3 = %d (%v)", len(last), err)
+	}
+	// 页间不重叠。
+	seen := map[int64]bool{}
+	for _, l := range append(append(first, second...), last...) {
+		if seen[l.ID] {
+			t.Fatalf("duplicate row across pages: id=%d", l.ID)
+		}
+		seen[l.ID] = true
+	}
+	if len(seen) != 25 {
+		t.Fatalf("pages covered %d rows, want 25", len(seen))
+	}
+	// 越界 offset / 非法参数：空页 + 不报错。
+	if out, err := s.ListUsageLogs(10, 999); err != nil || len(out) != 0 {
+		t.Fatalf("offset past end: %d (%v)", len(out), err)
+	}
+	if out, err := s.ListUsageLogs(0, -5); err != nil || len(out) != 25 {
+		t.Fatalf("illegal params must fall back: %d (%v)", len(out), err)
 	}
 }
 

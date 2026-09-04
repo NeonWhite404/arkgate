@@ -205,4 +205,5 @@ type UsageLog struct {
 	Status           string `json:"status"` // ok | error
 	LatencyMs        int64  `json:"latency_ms"`
 	Error            string `json:"error"`
+	ClientIP         string `json:"client_ip"` // 下游调用方 IP（代理场景取 XFF 首跳）
 }
