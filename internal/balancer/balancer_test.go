@@ -668,3 +668,43 @@ func TestResolveRouterChainAndErrors(t *testing.T) {
 		t.Fatalf("cycle entered mid-way must error, got nil")
 	}
 }
+
+// TestAnthropicProtocolFiltering 供应商类型下沉到模型：Anthropic 协议模型
+// 只承接 chat，responses/images 在模型层判不可用（错误落在 ErrNoCapable）。
+func TestAnthropicProtocolFiltering(t *testing.T) {
+	b := newTestBalancer()
+	acc := mkAcc("a1", 1)
+	acc.CapResponses = 1 // 强制可用，隔离账号层能力，聚焦协议层过滤
+	b.seed([]*model.Account{acc}, []*model.Endpoint{
+		mkEP("e1", "a1", "claude", "ep-1", 1),
+		mkEP("e2", "a1", "gpt", "ep-2", 1),
+	}, []*model.Model{
+		{Name: "claude", Enabled: true, Provider: model.ModelProtocolAnthropic},
+		{Name: "gpt", Enabled: true},
+	})
+
+	// chat 正常；responses/images 被协议过滤挡下。
+	if _, err := b.Select("claude", nil, nil, APIChat, ""); err != nil {
+		t.Fatalf("anthropic chat must work: %v", err)
+	}
+	if _, err := b.Select("claude", nil, nil, APIResponses, ""); err != ErrNoCapable {
+		t.Fatalf("anthropic responses must be ErrNoCapable, got %v", err)
+	}
+	if _, err := b.Select("claude", nil, nil, APIImages, ""); err != ErrNoCapable {
+		t.Fatalf("anthropic images must be ErrNoCapable, got %v", err)
+	}
+	if b.ModelProtocol("claude") != model.ModelProtocolAnthropic || b.ModelProtocol("gpt") != "" {
+		t.Fatalf("ModelProtocol: %q / %q", b.ModelProtocol("claude"), b.ModelProtocol("gpt"))
+	}
+	// OpenAI 协议模型不受影响。
+	if _, err := b.Select("gpt", nil, nil, APIResponses, ""); err != nil {
+		t.Fatalf("openai responses must work: %v", err)
+	}
+	// fallback 链上的 Anthropic 目标在 responses 请求中被跳过：
+	// gpt 链 → claude，responses 请求只应命中 gpt 自己。
+	b.models["gpt"].Fallback = []string{"claude"}
+	ep, name, err := b.SelectWithFallback("gpt", nil, nil, nil, APIResponses, "")
+	if err != nil || name != "gpt" || ep.ID != "e2" {
+		t.Fatalf("fallback must skip anthropic target for responses, got (%v, %q, %v)", ep, name, err)
+	}
+}

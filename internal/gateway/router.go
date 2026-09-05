@@ -78,6 +78,49 @@ func estimateResponsesTokens(body []byte) int64 {
 	return total
 }
 
+// estimateAnthropicInputTokens 估算 /v1/messages 请求的输入 tokens：
+// system（字符串或 text 块数组）+ messages（content 字符串或块数组，
+// tool_result/tool_use 块的文本按 content/text 字段粗取）。
+func estimateAnthropicInputTokens(body []byte) int64 {
+	var v struct {
+		System   json.RawMessage `json:"system"`
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &v) != nil {
+		return 0
+	}
+	total := int64(estBaseTokens) + anthropicContentTokens(v.System)
+	for _, m := range v.Messages {
+		total += anthropicContentTokens(m.Content) + estMsgOverhead
+	}
+	return total
+}
+
+// anthropicContentTokens 计算入站内容（字符串或块数组）的估算 tokens：
+// 块数组取 text 字段（与 contentTokens 同口径，图像等分段忽略）。
+func anthropicContentTokens(raw json.RawMessage) int64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	if n := contentTokens(raw); n > 0 {
+		return n
+	}
+	// contentTokens 不认识的形态可能是 Anthropic 块数组——再按 text 字段兜一次。
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		var n int64
+		for _, b := range blocks {
+			n += textTokens(b.Text)
+		}
+		return n
+	}
+	return 0
+}
+
 // contentTokens 计算一段「内容」的估算 tokens：字符串，或分段数组
 // （[{type:"text", text:"..."}, ...]，只统计 text 字段；图像等分段忽略）。
 // null / 无法识别的形态按 0 处理（粗估不需要兜底报错）。

@@ -180,12 +180,12 @@ func contentType(p string) string {
 	}
 }
 
-// cors 允许前端跨域；允许自定义请求头（X-Auth-Token 等）。
+// cors 允许前端跨域；允许自定义请求头（X-Auth-Token、X-Api-Key 等）。
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Auth-Token")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Auth-Token, X-Api-Key, anthropic-version, anthropic-beta")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

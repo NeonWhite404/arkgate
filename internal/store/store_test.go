@@ -673,3 +673,35 @@ func TestModelRouterRoundTrip(t *testing.T) {
 		t.Fatalf("cleared router must be nil, got %+v", cleared.Router)
 	}
 }
+
+// TestModelProviderRoundTrip v8 上游协议列：空值（OpenAI 兼容）与 anthropic 的读写回环。
+func TestModelProviderRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertModel(&model.Model{Name: "claude-x", Type: model.ModelTypeText, Enabled: true,
+		Provider: model.ModelProtocolAnthropic}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.UpsertModel(&model.Model{Name: "gpt-x", Type: model.ModelTypeText, Enabled: true}); err != nil {
+		t.Fatalf("upsert plain: %v", err)
+	}
+	got, err := s.GetModel("claude-x")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Provider != model.ModelProtocolAnthropic {
+		t.Fatalf("provider = %q", got.Provider)
+	}
+	plain, err := s.GetModel("gpt-x")
+	if err != nil {
+		t.Fatalf("get plain: %v", err)
+	}
+	if plain.Provider != "" {
+		t.Fatalf("default provider must be empty, got %q", plain.Provider)
+	}
+}

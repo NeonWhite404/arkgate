@@ -454,6 +454,18 @@ func validateModelType(t string) (string, error) {
 	return t, nil
 }
 
+// validateModelProvider 校验模型的上游协议字段（供应商类型已从账号下沉到模型）。
+// 空值 = OpenAI 兼容（默认，覆盖 ark/openai/custom 三类账号供应商）；
+// 目前仅支持 anthropic 一个转换协议。注册表里的 ark/openai/custom 是账号层
+// 概念（决定默认 base URL），在模型层等价于 OpenAI 兼容协议，不作为合法取值。
+func validateModelProvider(p string) error {
+	switch p {
+	case model.ModelProtocolOpenAI, model.ModelProtocolAnthropic:
+		return nil
+	}
+	return errors.New("上游协议仅支持空（OpenAI 兼容）/ anthropic")
+}
+
 // validateFallbackChain 校验 fallback 链：所有名字必须已存在且与模型同类型；
 // 路由模型不能作为 fallback 目标（它是虚拟名字，没有接入点，进了链也必失败）。
 func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
@@ -849,6 +861,14 @@ func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.Type = t
+		if perr := validateModelProvider(m.Provider); perr != nil {
+			writeJSON(w, 400, map[string]any{"detail": perr.Error()})
+			return
+		}
+		if m.Type == model.ModelTypeImage && m.Provider == model.ModelProtocolAnthropic {
+			writeJSON(w, 400, map[string]any{"detail": "图像模型不支持 Anthropic 协议（其上游无图像生成 API）"})
+			return
+		}
 		if m.Fallback == nil {
 			m.Fallback = []string{} // 统一存 []，避免落库成 null（与「清空链路」口径一致）
 		}
@@ -919,6 +939,10 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		if raw, ok := probe["fallback"]; ok {
 			existing.Fallback = stringSlice(raw)
 		}
+		// 上游协议（供应商类型下沉到模型）：空 = OpenAI 兼容。
+		if v, ok := probe["provider"].(string); ok {
+			existing.Provider = strings.TrimSpace(v)
+		}
 		// 路由配置（仅 type=router 有语义）：显式带 router 键才更新——
 		// null / 空对象清空，对象则整体替换（规则是数组，无法按条合并）。
 		if raw, ok := probe["router"]; ok {
@@ -954,6 +978,14 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		et := existing.Type
 		if et == "" {
 			et = model.ModelTypeText
+		}
+		if perr := validateModelProvider(existing.Provider); perr != nil {
+			writeJSON(w, 400, map[string]any{"detail": perr.Error()})
+			return
+		}
+		if et == model.ModelTypeImage && existing.Provider == model.ModelProtocolAnthropic {
+			writeJSON(w, 400, map[string]any{"detail": "图像模型不支持 Anthropic 协议（其上游无图像生成 API）"})
+			return
 		}
 		// 类型感知校验：路由模型走分流规则约束，其余走 fallback 链约束。
 		if et == model.ModelTypeRouter {

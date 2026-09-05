@@ -34,6 +34,18 @@ const (
 	ModelTypeRouter = "router"
 )
 
+// 模型的上游协议（Model.Provider）。供应商类型从账号下沉到模型：
+// 同一个上游主机（账号）可能同时供应 OpenAI 协议的 gpt 系与 Anthropic
+// 协议的 claude 系模型，用哪个协议说话由模型决定，账号只提供主机与密钥。
+const (
+	// ModelProtocolOpenAI 是空值的语义：OpenAI 兼容协议（chat/completions），
+	// 覆盖 ark / openai / custom 三类账号供应商——它们在协议层是同一种方言。
+	ModelProtocolOpenAI = ""
+	// ModelProtocolAnthropic 走 Anthropic /v1/messages 协议：
+	// 网关把下游的 OpenAI 请求转换成 messages 格式（响应/流式反向转换）。
+	ModelProtocolAnthropic = "anthropic"
+)
+
 // 虚拟路由模型的配置边界。
 const (
 	// MaxRouterRules 单个路由模型允许的分流规则条数上限（防误配出超大配置）。
@@ -106,8 +118,12 @@ type RouterConfig struct {
 // 价格字段用于成本核算：文本模型填 input/output（每百万 token 单价），
 // 图像模型填 image（每张单价）；0 表示未定价（成本计 0）。
 type Model struct {
-	Name        string   `json:"name"`
-	Type        string   `json:"type"` // text | image | router（默认 text）
+	Name     string   `json:"name"`
+	Type     string   `json:"type"` // text | image | router（默认 text）
+	// Provider 上游协议（供应商类型已从账号下沉到模型）："" = OpenAI 兼容
+	// （默认，覆盖 ark/openai/custom 账号）；"anthropic" = Anthropic /v1/messages，
+	// 由网关做 OpenAI↔Anthropic 双向转换。账号只提供主机（base_url）与密钥。
+	Provider    string   `json:"provider"`
 	Display     string   `json:"display"`
 	Description string   `json:"description"`
 	Enabled     bool     `json:"enabled"`

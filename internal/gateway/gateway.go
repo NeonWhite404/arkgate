@@ -64,6 +64,8 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", g.chatCompletions)
 	mux.HandleFunc("/v1/responses", g.responses)
 	mux.HandleFunc("/v1/images/generations", g.imagesGenerations)
+	mux.HandleFunc("/v1/messages", g.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", g.handleMessagesCountTokens)
 	mux.HandleFunc("/v1/models", g.listModels)
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errBody("invalid_request_error", "不支持的接口"))
@@ -79,9 +81,13 @@ func hashKey(k string) string {
 }
 
 func (g *Gateway) authSubKey(r *http.Request, modality string) (*model.SubKey, error) {
+	// Anthropic 客户端（Claude Code）用 x-api-key 头携带 Key，与 Bearer 同权。
 	token := bearerToken(r)
 	if token == "" {
-		return nil, errors.New("缺少 API Key（Authorization: Bearer sk-xxx）")
+		token = strings.TrimSpace(r.Header.Get("X-Api-Key"))
+	}
+	if token == "" {
+		return nil, errors.New("缺少 API Key（Authorization: Bearer sk-xxx 或 X-Api-Key）")
 	}
 	sk, err := g.store.GetSubKeyByHash(hashKey(token))
 	if err != nil {
@@ -187,14 +193,15 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 }
 
 // applyRouter 把虚拟路由模型（type=router）解析成承接请求的真实目标模型名。
-// 非路由模型原样返回，调用方无感。
+// 非路由模型原样返回，调用方无感。tokens 为调用方按请求形态估算的输入长度
+//（chat/responses/anthropic 各有估算器）。
 //
 // 白名单语义：子 Key 的 AllowedModels 只需包含路由名本身——解析出的目标由网关
 // 补进传给 balancer 的白名单副本，否则「只授权了路由名」的子 Key 会在 Select
 // 阶段被自己的白名单挡掉。目标自身的 fallback 链目标仍需显式授权（与既有
 // 「fallback 不越权」语义一致）。白名单为空（= 全部）时原样透传，不能反向收窄。
-func (g *Gateway) applyRouter(name string, body []byte, allowModels []string, api balancer.API) (string, []string, error) {
-	resolved, err := g.bal.ResolveRouter(name, estimateInputTokens(api, body))
+func (g *Gateway) applyRouter(name string, tokens int64, allowModels []string) (string, []string, error) {
+	resolved, err := g.bal.ResolveRouter(name, tokens)
 	if err != nil || resolved == name {
 		return name, allowModels, err
 	}
@@ -349,7 +356,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 虚拟路由模型解析：type=router 的名字不直接承接流量，先按输入长度
 	// 换算成真实目标模型，之后的选路/裁剪/粘性都针对目标进行。
 	origName := modelName
-	selName, allowModels, rerr := g.applyRouter(modelName, body, sk.AllowedModels, balancer.APIChat)
+	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIChat, body), sk.AllowedModels)
 	if rerr != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
 		return
@@ -406,7 +413,18 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Chat(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
+		// 上游协议分支：Anthropic 协议模型走转换桥（请求/响应双向转换），
+		// 其余 OpenAI 兼容模型走原样字节透传。max_tokens 在此处按实际命中的
+		// 模型解析（Anthropic 必填；fallback 可能命中与请求模型不同的模型）。
+		var respBody []byte
+		var usage *provider.TextUsage
+		var ferr error
+		if g.bal.ModelProtocol(actualModel) == model.ModelProtocolAnthropic {
+			respBody, usage, ferr = g.mgr.AnthropicChat(r.Context(), ri.rt, body, leaf.EP,
+				g.anthropicMaxTokens(body, actualModel), g.cfg.Timeouts.Request())
+		} else {
+			respBody, usage, ferr = g.mgr.Chat(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
+		}
 		if ferr == nil {
 			var pt, ct int64
 			if usage != nil {
@@ -417,6 +435,14 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
+			return
+		}
+		// 协议转换拒绝（tools/图像输入等请求内容问题）：换叶子没有意义，
+		// 直接以 400 收尾，不进入重试循环（recordAttempt 也不计端点熔断）。
+		var convErr *provider.ConversionError
+		if errors.As(ferr, &convErr) {
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, start)
+			writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", ferr.Error()))
 			return
 		}
 		var pt, ct int64
@@ -464,12 +490,18 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	// 虚拟路由模型解析：同 chat（responses 的输入结构不同，估算走对应分支）。
 	origName := modelName
-	selName, allowModels, rerr := g.applyRouter(modelName, body, sk.AllowedModels, balancer.APIResponses)
+	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIResponses, body), sk.AllowedModels)
 	if rerr != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
 		return
 	}
 	modelName = selName
+	// 上游协议校验：Anthropic 协议上游只有 messages（chat）能力，
+	// responses 透传对它没有意义，在入口给出明确错误。
+	if p := g.bal.ModelProtocol(modelName); p == model.ModelProtocolAnthropic {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+origName+" 的上游使用 Anthropic 协议，仅支持 /v1/chat/completions"))
+		return
+	}
 	// 能力前置校验：responses 的输出上限字段是 max_output_tokens；同 chat，
 	// 裁剪依据放在路由解析之后（用目标模型的上限）。
 	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
@@ -686,8 +718,23 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 
 		// 打开上游流：成功 = 已收到首字节；失败时未写过任何客户端字节，可重试。
-		st, oerr := g.openStream(r.Context(), ri.rt, body, leaf.EP, api)
+		// Anthropic 协议模型走转换桥（SSE 重写为 OpenAI chunk），其余原样透传。
+		var st provider.MessageStream
+		var oerr error
+		if g.bal.ModelProtocol(actualModel) == model.ModelProtocolAnthropic {
+			st, oerr = g.mgr.OpenAnthropicChatStream(r.Context(), ri.rt, body, leaf.EP,
+				g.anthropicMaxTokens(body, actualModel), g.cfg.Timeouts.FirstToken())
+		} else {
+			st, oerr = g.openStream(r.Context(), ri.rt, body, leaf.EP, api)
+		}
 		if oerr != nil {
+			// 协议转换拒绝（请求内容问题）：不重试，直接 400（响应头尚未提交）。
+			var convErr *provider.ConversionError
+			if errors.As(oerr, &convErr) {
+				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, start)
+				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", oerr.Error()))
+				return
+			}
 			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, start)
 			exclude[leaf.ID] = true
 			lastErr = oerr
@@ -731,7 +778,8 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 }
 
 // openStream 按目标 API 打开对应的上游流（首 token 超时取自运行时配置，0 = 不限时）。
-func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte, ep string, api balancer.API) (*provider.Stream, error) {
+// 返回值以 MessageStream 接口呈现，与 Anthropic 转换流共用 Pump/Close 签名。
+func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte, ep string, api balancer.API) (provider.MessageStream, error) {
 	timeout := g.cfg.Timeouts.FirstToken()
 	switch api {
 	case balancer.APIResponses:
@@ -741,6 +789,37 @@ func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte
 	default:
 		return g.mgr.OpenChatStream(ctx, rt, body, ep, timeout)
 	}
+}
+
+// anthropicMaxTokens 解析 Anthropic 协议必填的 max_tokens：请求显式携带的值
+//（已经 clampOutput 按目标模型上限裁剪）优先；未携带时用目录里的模型输出上限；
+// 两者都没有时回落保守默认——Anthropic 没有默认值，缺了必然 400。
+func (g *Gateway) anthropicMaxTokens(body []byte, modelName string) int64 {
+	if v := openAIMaxTokensOf(body); v > 0 {
+		return v
+	}
+	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
+		return maxOut
+	}
+	return provider.DefaultAnthropicMaxTokens
+}
+
+// openAIMaxTokensOf 读取 OpenAI 请求体里显式的输出上限（chat 的两个键）。
+func openAIMaxTokensOf(body []byte) int64 {
+	var v struct {
+		MaxTokens          *int64 `json:"max_tokens"`
+		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
+	}
+	if json.Unmarshal(body, &v) != nil {
+		return 0
+	}
+	if v.MaxTokens != nil && *v.MaxTokens > 0 {
+		return *v.MaxTokens
+	}
+	if v.MaxCompletionTokens != nil && *v.MaxCompletionTokens > 0 {
+		return *v.MaxCompletionTokens
+	}
+	return 0
 }
 
 func modalityOf(api balancer.API) string {

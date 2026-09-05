@@ -56,7 +56,8 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
 // v7：虚拟路由模型（models.router JSON 列）+ subkeys.key_hash / usage_logs(subkey_id) 索引。
-const schemaVersion = "7"
+// v8：模型上游协议列（models.provider；供应商类型从账号下沉到模型）。
+const schemaVersion = "8"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -214,6 +215,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE usage_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
 		// —— v7：虚拟路由模型（type=router 的分流配置，JSON；空串 = 无配置） ——
 		`ALTER TABLE models ADD COLUMN router TEXT NOT NULL DEFAULT ''`,
+		// —— v8：模型上游协议（'' = OpenAI 兼容；anthropic = /v1/messages，网关转换） ——
+		`ALTER TABLE models ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -419,7 +422,7 @@ func scanModel(sc scanner) (*model.Model, error) {
 	m := &model.Model{}
 	var fb, routerJSON string
 	if err := sc.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
-		&m.Type, &m.PriceInput, &m.PriceOutput, &m.PriceImage,
+		&m.Type, &m.Provider, &m.PriceInput, &m.PriceOutput, &m.PriceImage,
 		&m.ContextTokens, &m.MaxOutputTokens, &routerJSON); err != nil {
 		return nil, err
 	}
@@ -434,7 +437,7 @@ func scanModel(sc scanner) (*model.Model, error) {
 	return m, nil
 }
 
-const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image,context_tokens,max_output_tokens,router`
+const modelCols = `name,display,description,enabled,fallback,created_at,type,provider,price_input,price_output,price_image,context_tokens,max_output_tokens,router`
 
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
@@ -482,14 +485,15 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
-	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,
+	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,provider,
 			price_input,price_output,price_image,context_tokens,max_output_tokens,router)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
 		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
-		type=excluded.type, price_input=excluded.price_input, price_output=excluded.price_output,
+		type=excluded.type, provider=excluded.provider,
+		price_input=excluded.price_input, price_output=excluded.price_output,
 		price_image=excluded.price_image, context_tokens=excluded.context_tokens,
 		max_output_tokens=excluded.max_output_tokens, router=excluded.router`,
-		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type,
+		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type, m.Provider,
 		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens, routerJSON(m.Router))
 	return err
 }

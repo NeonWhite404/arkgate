@@ -590,6 +590,28 @@ func (b *Balancer) ModelType(name string) string {
 	return ""
 }
 
+// ModelProtocol 返回模型的上游协议（供应商类型下沉到模型层）：
+// "" = OpenAI 兼容（默认），model.ModelProtocolAnthropic = Anthropic /v1/messages。
+// 未知/已停用返回空串（选路阶段自然失败）。
+func (b *Balancer) ModelProtocol(name string) string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if m, ok := b.models[name]; ok {
+		return m.Provider
+	}
+	return ""
+}
+
+// protocolSupportsAPI 判断某上游协议是否支持目标 API：Anthropic 协议上游
+// 只有 messages（chat）能力，responses/images 在模型层直接判不可用——
+// 即使账号能力声明支持（那是账号的 OpenAI 协议能力，与协议转换无关）。
+func protocolSupportsAPI(protocol string, api API) bool {
+	if api == APIChat || protocol != model.ModelProtocolAnthropic {
+		return true
+	}
+	return false
+}
+
 // weightTable 计算每个候选叶子的统一权重（叶.weight > 账号.weight > 1）。
 func (b *Balancer) weightTable(cands []*model.Endpoint) map[string]int {
 	b.mu.RLock()
@@ -615,6 +637,11 @@ func (b *Balancer) usableEndpoints(modelName string, allowed []string, exclude m
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
+	// 协议能力过滤（模型层）：Anthropic 协议模型不承接 responses/images，
+	// fallback 链上的这类目标也会在这里被跳过。
+	if !protocolSupportsAPI(b.protocolOfLocked(modelName), api) {
+		return nil, poolKeyOf(modelName, allowed)
+	}
 	now := time.Now()
 	var cands []*model.Endpoint
 	for _, e := range b.modelApps[modelName] {
@@ -667,6 +694,11 @@ func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string, api API) b
 	if _, known := b.models[modelName]; !known {
 		return false
 	}
+	// 协议能力过滤（模型层）口径与 usableEndpoints 一致，保证错误落在
+	// ErrNoCapable（「没有支持此 API 的映射」）而不是误导性的 ErrAllThrottled。
+	if !protocolSupportsAPI(b.protocolOfLocked(modelName), api) {
+		return false
+	}
 	for _, e := range b.modelApps[modelName] {
 		acc, ok := b.accounts[e.AccountID]
 		if !ok || acc.Status != model.AccountActive {
@@ -681,6 +713,14 @@ func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string, api API) b
 		return true
 	}
 	return false
+}
+
+// protocolOfLocked 读模型上游协议（调用方须持有 b.mu 读锁及以上）。
+func (b *Balancer) protocolOfLocked(modelName string) string {
+	if m, ok := b.models[modelName]; ok {
+		return m.Provider
+	}
+	return ""
 }
 
 // hasAnyEndpointRaw 判断模型是否存在叶节点（不看能力与运行态），

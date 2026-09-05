@@ -59,9 +59,13 @@ var requestFaultHints = []string{
 }
 
 // IsRequestFault 判断 err 是否由客户端请求自身问题导致（上下文超限、
-// max_tokens 超上限、参数非法等 4xx）。这类错误是请求方的错，不是端点故障，
-// 调用方应据此跳过端点熔断计数（透传行为不变）。
+// max_tokens 超上限、参数非法、协议转换不支持的内容等 4xx）。这类错误是
+// 请求方的错，不是端点故障，调用方应据此跳过端点熔断计数（透传行为不变）。
 func IsRequestFault(err error) bool {
+	var ce *ConversionError
+	if errors.As(err, &ce) {
+		return true // 协议转换拒绝的内容（tools/图像输入等）同样是请求方问题
+	}
 	he, ok := AsHTTPError(err)
 	if !ok {
 		return false

@@ -26,12 +26,13 @@
 |---|---|
 | 🔀 **多账号负载均衡** | 多家供应商、十几个账号的 Key 进池子，按**平滑加权轮询 + 会话粘性**自动选路，对下游完全透明。 |
 | 🏷️ **易读模型名映射** | Ark 的 `ep-2025xxx`、OpenAI 的 `gpt-4o`……长短不一的接入点标识统一映射成 `doubao-seed-1-6` 这样的易读名，下游只认名字。 |
+| 🗣️ **多协议双向桥** | 供应商类型下沉到模型层：同一账号可混布 gpt 系（OpenAI 协议）与 claude 系（Anthropic 协议）模型；**入站也是双协议**——Claude Code 用 `/v1/messages` 直连，tools 全量双向转换，Anthropic 上游原生透传，中间层对两侧完全透明（转换语义参照 cc-switch）。 |
 | 🛡️ **叶级熔断与限流** | 并发 / RPM / TPM 限流与熔断只落在「账号 × 接入点」元组上，逐叶独立配置；连续失败指数退避熔断，兄弟叶子自动接管。 |
 | 🧠 **虚拟路由模型** | 参考 auto/router 类模型：按**估算输入长度**把请求自动分流到大小模型——短问题走便宜档，长上下文走旗舰档，一个名字对下游。 |
 | 🔗 **模态感知 fallback** | 模型分文本 / 图像两类，fallback 链只在同类型内退避、不向下传递；失败请求还会跨叶子重试。 |
 | 🔑 **子 Key 体系** | 真实上游 Key 加密落库永不出网关，下发的 `sk-xxx` 可限模型 / 账号 / 当日 Token / 当日图像张数。 |
 | 📊 **用量与成本分析** | 请求级日志（含来源 IP、成本）+ 对齐火山方舟「用量统计」的分析页：日期区间 / 天·小时粒度 / 按模型·子Key·账号·接入点·供应商下钻。 |
-| 🖥️ **内嵌管理界面** | Vue 3 单页应用随二进制内嵌：账号、模型映射、**可视化分流编排（拖拽 fallback 链）**、子 Key、日志、设置，开箱即用。 |
+| 🖥️ **内嵌管理界面** | Vue 3 单页应用随二进制内嵌：账号、模型映射、**可视化分流编排（拖拽 fallback 链 / 路由模型阈值规则）**、子 Key、日志、设置，开箱即用。 |
 | 📥 **从上游导入** | 用账号凭据探测上游 `GET /models`，勾选即批量建映射；模型价格 / 上下文窗口按内置 LiteLLM 目录**自动补全**。 |
 | 🧾 **子 Key 自助门户** | 终端用户用 `sk-xxx` 登录查看自己的限额、用量、成功率与脱敏调用记录——错误细节、账号信息等运维数据严格隔离。 |
 
@@ -100,8 +101,10 @@ curl http://localhost:8002/v1/images/generations \
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/chat/completions` | 对话补全，流式 / 非流式 |
+| `POST /v1/messages` | **Anthropic Messages API**（Claude Code 直连，按上游协议自动转换/透传，tools 完整支持） |
 | `POST /v1/responses` | Responses API，原生透传 |
 | `POST /v1/images/generations` | 文生图 |
+| `POST /v1/messages/count_tokens` | Anthropic token 计数（粗估） |
 | `GET /v1/models` | 模型列表（按子 Key 白名单过滤） |
 | `/api/portal/overview` | 子 Key 自助门户（Bearer sk-xxx） |
 
@@ -188,7 +191,7 @@ flowchart LR
 |---|---|---|
 | 语言 | ![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white) | 单二进制交付、goroutine 天然契合代理转发 |
 | 存储 | ![SQLite](https://img.shields.io/badge/modernc.org%2Fsqlite-纯Go驱动-003B57?logo=sqlite&logoColor=white) | 零 CGO、零外部服务依赖，WAL 模式单写者 |
-| 上游 SDK | ![openai-go](https://img.shields.io/badge/openai%2Fopenai--go-官方SDK-412991) | 请求体字节级透传，跟随官方版本演进 |
+| 上游 SDK | ![openai-go](https://img.shields.io/badge/openai%2Fopenai--go-官方SDK-412991) ![anthropic](https://img.shields.io/badge/anthropic--sdk--go-官方SDK-D97757?logo=anthropic&logoColor=white) | 请求体字节级透传（OpenAI 路径）与 Anthropic 协议转换，跟随官方版本演进 |
 | 前端 | ![Vue 3](https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white) | 免 Node 构建链的全局构建，`go:embed` 内嵌进二进制 |
 | 图表 | 手写 SVG（无图表库依赖） | 柱状 / 堆叠 / 折线，随维度联动重绘 |
 

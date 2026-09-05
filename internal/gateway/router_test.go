@@ -154,3 +154,20 @@ func TestContentTokensNilAndObject(t *testing.T) {
 		t.Fatalf("mixed parts want 1, got %d", got)
 	}
 }
+
+// TestOpenAIMaxTokensOf 覆盖 Anthropic max_tokens 解析的两个键与缺省。
+func TestOpenAIMaxTokensOf(t *testing.T) {
+	if v := openAIMaxTokensOf([]byte(`{"max_tokens":100}`)); v != 100 {
+		t.Fatalf("max_tokens: %d", v)
+	}
+	if v := openAIMaxTokensOf([]byte(`{"max_completion_tokens":200}`)); v != 200 {
+		t.Fatalf("max_completion_tokens: %d", v)
+	}
+	// 两个键同时存在时 max_tokens 优先。
+	if v := openAIMaxTokensOf([]byte(`{"max_tokens":100,"max_completion_tokens":200}`)); v != 100 {
+		t.Fatalf("both: %d", v)
+	}
+	if v := openAIMaxTokensOf([]byte(`{}`)); v != 0 {
+		t.Fatalf("absent: %d", v)
+	}
+}
