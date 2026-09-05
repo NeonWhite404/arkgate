@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -447,13 +448,14 @@ func validateModelType(t string) (string, error) {
 	if t == "" {
 		return model.ModelTypeText, nil
 	}
-	if t != model.ModelTypeText && t != model.ModelTypeImage {
-		return "", errors.New("模型类型仅支持 text / image")
+	if t != model.ModelTypeText && t != model.ModelTypeImage && t != model.ModelTypeRouter {
+		return "", errors.New("模型类型仅支持 text / image / router")
 	}
 	return t, nil
 }
 
-// validateFallbackChain 校验 fallback 链：所有名字必须已存在且与模型同类型。
+// validateFallbackChain 校验 fallback 链：所有名字必须已存在且与模型同类型；
+// 路由模型不能作为 fallback 目标（它是虚拟名字，没有接入点，进了链也必失败）。
 func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
 	for _, f := range chain {
 		fm, err := a.store.GetModel(f)
@@ -464,9 +466,116 @@ func (a *Admin) validateFallbackChain(chain []string, modelType string) error {
 		if ft == "" {
 			ft = model.ModelTypeText
 		}
+		if ft == model.ModelTypeRouter {
+			return errors.New("fallback 模型 " + f + " 是路由模型，不能作为 fallback 目标")
+		}
 		if ft != modelType {
 			return errors.New("fallback 模型 " + f + " 与该模型类型不同（仅允许同类型退避）")
 		}
+	}
+	return nil
+}
+
+// validateRouterModel 校验路由模型（type=router）的整体约束：
+//   - 不使用 fallback 链（分流目标即路由规则，退避语义由目标模型自己的链承担）；
+//   - 必须至少配置一条规则或默认目标，否则该名字解析不出任何真实模型；
+//   - 规则/默认目标的模型必须存在且是文本或路由模型（不能指向图像模型或自身）；
+//   - 规则按阈值升序整理（运行时取第一条满足的），空目标规则剔除；
+//   - 沿路由目标走下去不能绕回自身（成环）。
+func (a *Admin) validateRouterModel(m *model.Model) error {
+	if len(m.Fallback) > 0 {
+		return errors.New("路由模型不使用 fallback 链（请改用分流规则）")
+	}
+	if m.Router == nil || (len(m.Router.Rules) == 0 && m.Router.DefaultTarget == "") {
+		return errors.New("路由模型需要至少一条分流规则或默认目标")
+	}
+	if len(m.Router.Rules) > model.MaxRouterRules {
+		return fmt.Errorf("分流规则最多 %d 条", model.MaxRouterRules)
+	}
+	for _, r := range m.Router.Rules {
+		if r.MaxInputTokens < 0 {
+			return errors.New("分流阈值不能为负")
+		}
+		if err := a.validateRouterTarget(r.Target, m.Name); err != nil {
+			return err
+		}
+	}
+	if m.Router.DefaultTarget != "" {
+		if err := a.validateRouterTarget(m.Router.DefaultTarget, m.Name); err != nil {
+			return err
+		}
+	}
+	// 规则整理：剔除空目标，按阈值升序稳定排序（运行时语义 = 第一条满足的）。
+	rules := make([]model.RouterRule, 0, len(m.Router.Rules))
+	for _, r := range m.Router.Rules {
+		if r.Target != "" {
+			rules = append(rules, r)
+		}
+	}
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].MaxInputTokens < rules[j].MaxInputTokens })
+	m.Router.Rules = rules
+	return a.checkRouterCycle(m.Name)
+}
+
+// validateRouterTarget 校验单个路由目标：必须存在、非自身、且是文本/路由模型
+// （图像模型没有输入长度语义，不能作为分流目标）。
+func (a *Admin) validateRouterTarget(t, self string) error {
+	if t == "" {
+		return errors.New("分流规则缺少目标模型")
+	}
+	if t == self {
+		return errors.New("路由目标不能是自身")
+	}
+	tm, err := a.store.GetModel(t)
+	if err != nil {
+		return errors.New("路由目标模型 " + t + " 不存在")
+	}
+	tt := tm.Type
+	if tt == "" {
+		tt = model.ModelTypeText
+	}
+	if tt == model.ModelTypeImage {
+		return errors.New("路由目标 " + t + " 是图像模型（仅允许文本/路由模型）")
+	}
+	return nil
+}
+
+// checkRouterCycle 从 start 出发沿「路由目标」边做 DFS：任何路径绕回 start
+// 即成环（运行时 ResolveRouter 还有深度/环兜底，这里在保存时就拦下）。
+func (a *Admin) checkRouterCycle(start string) error {
+	all, err := a.store.ListModels()
+	if err != nil {
+		return err
+	}
+	rcOf := map[string]*model.RouterConfig{}
+	for _, m := range all {
+		if m.Type == model.ModelTypeRouter && m.Router != nil {
+			rcOf[m.Name] = m.Router
+		}
+	}
+	visited := map[string]bool{}
+	var walk func(node string) bool
+	walk = func(node string) bool {
+		rc, ok := rcOf[node]
+		if !ok || visited[node] {
+			return false // 走到非路由模型（链终止）或已访问过
+		}
+		visited[node] = true
+		for _, r := range rc.Rules {
+			if r.Target == start {
+				return true
+			}
+			if walk(r.Target) {
+				return true
+			}
+		}
+		if rc.DefaultTarget == start {
+			return true
+		}
+		return walk(rc.DefaultTarget)
+	}
+	if walk(start) {
+		return errors.New("路由配置成环（沿分流目标会绕回 " + start + "）")
 	}
 	return nil
 }
@@ -604,7 +713,11 @@ const catalogDataURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/m
 
 // fillModelFromCatalog 按模型名查内置目录，补全空缺（零值）字段；
 // 人工填写的非零值一律不动。返回被补全的字段名列表。
+// 路由模型不参与补全：它不承接请求，价格/上下文都没有语义。
 func fillModelFromCatalog(c *catalog.Catalog, m *model.Model) []string {
+	if m.Type == model.ModelTypeRouter {
+		return nil
+	}
 	e, ok := c.Lookup(m.Name)
 	if !ok {
 		return nil
@@ -675,6 +788,9 @@ func (a *Admin) handleMetadataSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, m := range models {
+		if m.Type == model.ModelTypeRouter {
+			continue // 路由模型不承接请求，无价格/上下文可补
+		}
 		fields := fillModelFromCatalog(a.catalog, m)
 		if len(fields) == 0 {
 			continue
@@ -736,9 +852,17 @@ func (a *Admin) handleModelsCollection(w http.ResponseWriter, r *http.Request) {
 		if m.Fallback == nil {
 			m.Fallback = []string{} // 统一存 []，避免落库成 null（与「清空链路」口径一致）
 		}
-		if err := a.validateFallbackChain(m.Fallback, t); err != nil {
-			writeJSON(w, 400, map[string]any{"detail": err.Error()})
-			return
+		if m.Type == model.ModelTypeRouter {
+			// 路由模型：走自己的约束（不使用 fallback 链；目标存在且非环）。
+			if err := a.validateRouterModel(&m); err != nil {
+				writeJSON(w, 400, map[string]any{"detail": err.Error()})
+				return
+			}
+		} else {
+			if err := a.validateFallbackChain(m.Fallback, t); err != nil {
+				writeJSON(w, 400, map[string]any{"detail": err.Error()})
+				return
+			}
 		}
 		// 目录自动补全：按模型名查内置目录，只填空缺（零值）字段，人工填写优先。
 		filled := fillModelFromCatalog(a.catalog, &m)
@@ -795,6 +919,21 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		if raw, ok := probe["fallback"]; ok {
 			existing.Fallback = stringSlice(raw)
 		}
+		// 路由配置（仅 type=router 有语义）：显式带 router 键才更新——
+		// null / 空对象清空，对象则整体替换（规则是数组，无法按条合并）。
+		if raw, ok := probe["router"]; ok {
+			if raw == nil {
+				existing.Router = nil
+			} else {
+				rb, merr := json.Marshal(raw)
+				rc := &model.RouterConfig{}
+				if merr != nil || json.Unmarshal(rb, rc) != nil {
+					writeJSON(w, 400, map[string]any{"detail": "router 配置无法解析"})
+					return
+				}
+				existing.Router = rc
+			}
+		}
 		// 价格字段（成本核算）：0 表示未定价。
 		if v, ok := probe["price_input"]; ok {
 			existing.PriceInput = floatField(v)
@@ -816,9 +955,17 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		if et == "" {
 			et = model.ModelTypeText
 		}
-		if err := a.validateFallbackChain(existing.Fallback, et); err != nil {
-			writeJSON(w, 400, map[string]any{"detail": err.Error()})
-			return
+		// 类型感知校验：路由模型走分流规则约束，其余走 fallback 链约束。
+		if et == model.ModelTypeRouter {
+			if err := a.validateRouterModel(existing); err != nil {
+				writeJSON(w, 400, map[string]any{"detail": err.Error()})
+				return
+			}
+		} else {
+			if err := a.validateFallbackChain(existing.Fallback, et); err != nil {
+				writeJSON(w, 400, map[string]any{"detail": err.Error()})
+				return
+			}
 		}
 		if err := a.store.UpsertModel(existing); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -1127,8 +1274,8 @@ func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
 func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 	accs := a.bal.SnapshotAccounts()
 	eps := a.bal.SnapshotEndpoints()
-	models, _ := a.store.ListModels()
-	subs, _ := a.store.ListSubKeys()
+	modelCount, _ := a.store.CountModels()
+	subkeyCount, _ := a.store.CountSubKeys()
 
 	var totalReq, totalTokens int64
 	var active, disabled int64
@@ -1161,8 +1308,8 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"endpoint_total":   len(eps),
 		"endpoint_enabled": epEnabled,
 		"endpoint_circuit": epCircuit,
-		"model_count":      len(models),
-		"subkey_count":     len(subs),
+		"model_count":      modelCount,
+		"subkey_count":     subkeyCount,
 		"total_requests":   totalReq,
 		"total_tokens":     totalTokens,
 		"total_cost":       totalCost,

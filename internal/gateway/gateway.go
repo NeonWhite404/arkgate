@@ -186,6 +186,24 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 	}, nil
 }
 
+// applyRouter 把虚拟路由模型（type=router）解析成承接请求的真实目标模型名。
+// 非路由模型原样返回，调用方无感。
+//
+// 白名单语义：子 Key 的 AllowedModels 只需包含路由名本身——解析出的目标由网关
+// 补进传给 balancer 的白名单副本，否则「只授权了路由名」的子 Key 会在 Select
+// 阶段被自己的白名单挡掉。目标自身的 fallback 链目标仍需显式授权（与既有
+// 「fallback 不越权」语义一致）。白名单为空（= 全部）时原样透传，不能反向收窄。
+func (g *Gateway) applyRouter(name string, body []byte, allowModels []string, api balancer.API) (string, []string, error) {
+	resolved, err := g.bal.ResolveRouter(name, estimateInputTokens(api, body))
+	if err != nil || resolved == name {
+		return name, allowModels, err
+	}
+	if len(allowModels) > 0 {
+		allowModels = append(append([]string{}, allowModels...), resolved)
+	}
+	return resolved, allowModels, nil
+}
+
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
 // ip 为下游调用方地址（由各链路入口用 clientIP(r) 取一次后传入）。
 func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
@@ -322,7 +340,23 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
 		return
 	}
+	// 模态正向校验：图像模型不能打 chat 接口（在打上游之前给出明确错误，
+	// 而不是转发后被上游 4xx 且记一次「客户端超限」）。
+	if mt := g.bal.ModelType(modelName); mt == model.ModelTypeImage {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是图像模型，不支持 chat 接口"))
+		return
+	}
+	// 虚拟路由模型解析：type=router 的名字不直接承接流量，先按输入长度
+	// 换算成真实目标模型，之后的选路/裁剪/粘性都针对目标进行。
+	origName := modelName
+	selName, allowModels, rerr := g.applyRouter(modelName, body, sk.AllowedModels, balancer.APIChat)
+	if rerr != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
+		return
+	}
+	modelName = selName
 	// 能力前置校验：目录设置了最大输出时裁剪输出上限字段，省掉注定失败的上游调用。
+	// 放在路由解析之后：路由模型自身不设上限，裁剪依据是最终承接请求的目标模型。
 	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
 		if nb, changed := clampOutput(body, chatOutputKeys, maxOut); changed {
 			body = nb
@@ -332,14 +366,18 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if wantsStream(body) {
 		// 流式：首字节之前未向客户端写过数据，失败可换叶子重试；
 		// 首字节到手后才提交 SSE 响应头，之后单次尝试到流结束。
-		g.streamForward(w, r, sk, body, modelName, balancer.APIChat)
+		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIChat)
 		return
 	}
-	g.chatNonStream(w, r, sk, body, modelName)
+	g.chatNonStream(w, r, sk, body, origName, modelName, allowModels)
 }
 
 // chatNonStream 非流式：支持失败后排除当前叶子、切换下一个重试。
-func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
+// origName 是客户端请求的模型名（路由解析前），selName 是实际选路用的名字
+// （路由解析后）；日志里 requested_model 记 origName，让「路由模型 → 真实模型」
+// 的分流在日志里可见。
+func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
+	origName, selName string, allowModels []string) {
 	start := time.Now()
 	ip := clientIP(r)
 	var lastErr error
@@ -351,7 +389,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if attempt == 0 {
 			sticky = sk.ID
 		}
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIChat, sticky)
+		leaf, actualModel, err := g.bal.SelectWithFallback(selName, sk.AllowedAccounts, allowModels, exclude, balancer.APIChat, sticky)
 		if err != nil {
 			// 已有具体尝试失败（上游错误/超时）时保留它：排除集导致的全忙错误
 			// 只是重试的副产品，不如真实失败原因有信息量。
@@ -362,7 +400,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -374,7 +412,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
 			// 透传上游真实状态码与 body。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -385,7 +423,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -420,7 +458,20 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
 		return
 	}
-	// 能力前置校验：同 chat，responses 的输出上限字段是 max_output_tokens。
+	if mt := g.bal.ModelType(modelName); mt == model.ModelTypeImage {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是图像模型，不支持 responses 接口"))
+		return
+	}
+	// 虚拟路由模型解析：同 chat（responses 的输入结构不同，估算走对应分支）。
+	origName := modelName
+	selName, allowModels, rerr := g.applyRouter(modelName, body, sk.AllowedModels, balancer.APIResponses)
+	if rerr != nil {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
+		return
+	}
+	modelName = selName
+	// 能力前置校验：responses 的输出上限字段是 max_output_tokens；同 chat，
+	// 裁剪依据放在路由解析之后（用目标模型的上限）。
 	if _, maxOut := g.bal.ModelLimits(modelName); maxOut > 0 {
 		if nb, changed := clampOutput(body, responsesOutputKeys, maxOut); changed {
 			body = nb
@@ -428,14 +479,15 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		g.streamForward(w, r, sk, body, modelName, balancer.APIResponses)
+		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIResponses)
 		return
 	}
-	g.responsesNonStream(w, r, sk, body, modelName)
+	g.responsesNonStream(w, r, sk, body, origName, modelName, allowModels)
 }
 
-// responsesNonStream 非流式 responses：与 chat 相同的重试语义。
-func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
+// responsesNonStream 非流式 responses：与 chat 相同的重试语义（origName/selName 见 chatNonStream）。
+func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
+	origName, selName string, allowModels []string) {
 	start := time.Now()
 	ip := clientIP(r)
 	var lastErr error
@@ -446,7 +498,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if attempt == 0 {
 			sticky = sk.ID
 		}
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, balancer.APIResponses, sticky)
+		leaf, actualModel, err := g.bal.SelectWithFallback(selName, sk.AllowedAccounts, allowModels, exclude, balancer.APIResponses, sticky)
 		if err != nil {
 			if lastErr == nil {
 				lastErr = err
@@ -455,7 +507,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -467,7 +519,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -477,7 +529,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -511,19 +563,20 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
 		return
 	}
-	// 类型校验：文本模型不允许打图像接口（反之图像模型打 chat/responses 会在
-	// 路由层被同类型 fallback 约束挡下，这里先做正向校验给出明确错误）。
-	if m, err := g.store.ListModels(); err == nil {
-		for _, mm := range m {
-			if mm.Name == modelName && mm.Type == model.ModelTypeText {
-				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 不是图像模型"))
-				return
-			}
-		}
+	// 类型正向校验（在打上游之前给出明确错误，而不是转发后被上游 4xx）：
+	// 文本模型不能打图像接口；路由模型按输入文本长度设计分流语义，同样不承接图像。
+	// 口径：balancer 的启用模型目录（停用/未知名走后面的 Select 报错）。
+	switch g.bal.ModelType(modelName) {
+	case model.ModelTypeText:
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 不是图像模型"))
+		return
+	case model.ModelTypeRouter:
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是路由模型，不支持图像生成接口"))
+		return
 	}
 
 	if wantsStream(body) {
-		g.streamForward(w, r, sk, body, modelName, balancer.APIImages)
+		g.streamForward(w, r, sk, body, modelName, modelName, sk.AllowedModels, balancer.APIImages)
 		return
 	}
 	g.imagesNonStream(w, r, sk, body, modelName)
@@ -586,6 +639,9 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 
 // streamForward 流式转发：首字节之前可跨叶子重试。
 //
+// origName/selName 的语义见 chatNonStream：requested_model 记请求名（路由解析前），
+// 实际选路用 selName（路由解析后）。
+//
 // 每一轮先选叶、解析路由，再经 provider 打开上游流并等待首 token：
 //   - 打开失败（建连失败 / 非 2xx / 首 token 超时）时未向客户端写过任何字节，
 //     记一次失败统计后排除当前叶子，换下一个继续；
@@ -593,7 +649,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 //     SSE error 帧收尾；
 //   - 所有叶子都失败时，以普通 HTTP 错误透传（此时响应头尚未提交）。
 func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
-	modelName string, api balancer.API) {
+	origName, selName string, allowModels []string, api balancer.API) {
 
 	start := time.Now()
 	modality := modalityOf(api)
@@ -612,7 +668,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		if attempt == 0 {
 			sticky = sk.ID
 		}
-		leaf, actualModel, err := g.bal.SelectWithFallback(modelName, sk.AllowedAccounts, sk.AllowedModels, exclude, api, sticky)
+		leaf, actualModel, err := g.bal.SelectWithFallback(selName, sk.AllowedAccounts, allowModels, exclude, api, sticky)
 		if err != nil {
 			// 同非流式：保留已有的具体失败原因（如首 token 超时），避免被
 			// 排除集导致的全忙错误掩盖。
@@ -623,7 +679,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, derr, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -632,7 +688,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		// 打开上游流：成功 = 已收到首字节；失败时未写过任何客户端字节，可重试。
 		st, oerr := g.openStream(r.Context(), ri.rt, body, leaf.EP, api)
 		if oerr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, 0, 0, 0, oerr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, start)
 			exclude[leaf.ID] = true
 			lastErr = oerr
 			continue
@@ -666,7 +722,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			// 流已开始，无法更改状态码；用 SSE error 帧收尾。
 			writeSSEError(w, perr)
 		}
-		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, modality, pt, ct, images, perr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, start)
 		return
 	}
 

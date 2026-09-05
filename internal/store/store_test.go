@@ -549,10 +549,11 @@ func TestSubKeyScopedQueries(t *testing.T) {
 			t.Fatalf("add log: %v", err)
 		}
 	}
-	// 一条失败日志（s1）。
+	// 一条失败日志（s1），带具体错误文本——门户查询必须把它剥掉。
 	if err := s.AddUsageLog(&model.UsageLog{
 		TS: now, SubKeyID: "s1", RequestedModel: "m", Model: "m",
-		Modality: model.ModelTypeText, Status: "error", Error: "boom",
+		Modality: model.ModelTypeText, Status: "error",
+		Error: "upstream http 400: {\"message\":\"ep-2025xxxx not found\"}",
 	}); err != nil {
 		t.Fatalf("add fail log: %v", err)
 	}
@@ -585,9 +586,24 @@ func TestSubKeyScopedQueries(t *testing.T) {
 		if l.AccountID != "" || l.AccountName != "" || l.Provider != "" || l.EndpointID != "" || l.EP != "" || l.SubKeyID != "" {
 			t.Fatalf("portal log must be sanitized, got %+v", l)
 		}
+		// 错误文本同样是越权信息（可能带 ep-xxx / 账号线索 / 上游请求 id）：
+		// 只能通过 status 体现成败，具体原因不出查询层。
+		if l.Error != "" {
+			t.Fatalf("portal log must not carry error text, got %q", l.Error)
+		}
 		if l.Cost != 0.25 && l.Status != "error" {
 			t.Fatalf("log fields: %+v", l)
 		}
+	}
+	// 失败那条仍要能被识别为失败（脱敏不等于丢掉成败信息）。
+	sawErrStatus := false
+	for _, l := range logs {
+		if l.Status == "error" {
+			sawErrStatus = true
+		}
+	}
+	if !sawErrStatus {
+		t.Fatalf("portal log must keep status=error for failed calls")
 	}
 	if logs[0].RequestedModel != "m" {
 		t.Fatalf("portal log fields: %+v", logs[0])
@@ -602,5 +618,58 @@ func TestSubKeyScopedQueries(t *testing.T) {
 	}
 	if last24h <= 0 {
 		t.Fatalf("24h cost = %v", last24h)
+	}
+}
+
+// TestModelRouterRoundTrip v7 路由配置列的读写回环：nil ↔ 空串、对象整体替换。
+func TestModelRouterRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	rc := &model.RouterConfig{
+		Rules: []model.RouterRule{
+			{MaxInputTokens: 4096, Target: "small"},
+			{MaxInputTokens: 32768, Target: "big"},
+		},
+		DefaultTarget: "huge",
+	}
+	if err := s.UpsertModel(&model.Model{Name: "auto", Type: model.ModelTypeRouter, Enabled: true, Router: rc}); err != nil {
+		t.Fatalf("upsert router model: %v", err)
+	}
+	got, err := s.GetModel("auto")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Router == nil || len(got.Router.Rules) != 2 || got.Router.DefaultTarget != "huge" ||
+		got.Router.Rules[0].Target != "small" || got.Router.Rules[1].MaxInputTokens != 32768 {
+		t.Fatalf("router roundtrip: %+v", got.Router)
+	}
+
+	// 无配置模型读出来必须是 nil（而不是空对象），网关据此走「非路由」快路径。
+	if err := s.UpsertModel(&model.Model{Name: "plain", Enabled: true}); err != nil {
+		t.Fatalf("upsert plain: %v", err)
+	}
+	plain, err := s.GetModel("plain")
+	if err != nil {
+		t.Fatalf("get plain: %v", err)
+	}
+	if plain.Router != nil {
+		t.Fatalf("plain model router must be nil, got %+v", plain.Router)
+	}
+
+	// 清空：把 Router 置 nil 再保存，读回应为 nil。
+	if err := s.UpsertModel(&model.Model{Name: "auto", Type: model.ModelTypeText, Enabled: true}); err != nil {
+		t.Fatalf("clear router: %v", err)
+	}
+	cleared, err := s.GetModel("auto")
+	if err != nil {
+		t.Fatalf("get cleared: %v", err)
+	}
+	if cleared.Router != nil {
+		t.Fatalf("cleared router must be nil, got %+v", cleared.Router)
 	}
 }

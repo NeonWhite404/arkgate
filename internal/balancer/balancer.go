@@ -23,6 +23,7 @@ package balancer
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -277,11 +278,12 @@ func (b *Balancer) Refresh() {
 	b.limits = limitMap
 	b.mu.Unlock()
 
-	// 清理指向已不存在叶子的粘性会话（TTL 过期在读侧惰性淘汰）。
+	// 清理粘性会话：指向已不存在叶子的、以及超过 TTL 的过期项
+	// （读侧只清理被再次访问的键，这里兜底清剩余的，防止长期运行下缓慢膨胀）。
 	if b.sessionTTL > 0 {
 		b.sessMu.Lock()
 		for k, s := range b.sessions {
-			if _, ok := epMap[s.endpointID]; !ok {
+			if _, ok := epMap[s.endpointID]; !ok || time.Since(s.ts) > b.sessionTTL {
 				delete(b.sessions, k)
 			}
 		}
@@ -380,13 +382,14 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 		}
 	}
 
-	state := b.getWrrState(poolKey, cands)
+	// 权重表只算一次，供 WRR 累计与总数两处共用（此前 getWrrState 与 Select
+	// 各算一遍，每次选举多走一轮读锁）。
+	weights := b.weightTable(cands)
+	state := b.getWrrState(poolKey, weights)
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	// 由 getWrrState 一次性算出统一权重，Select 与其读取同一张权重表，避免两次取值不一致破坏平滑 WRR。
-	weights := b.weightTable(cands)
 	var picked *model.Endpoint
 	for _, e := range cands {
 		w := weights[e.ID]
@@ -521,6 +524,70 @@ func selectErrPriority(err error) int {
 	default:
 		return 0 // ErrNoEndpoint 等
 	}
+}
+
+// ─────────────────────────── 虚拟路由模型 ───────────────────────────
+
+// ResolveRouter 解析虚拟路由模型（type=router）：按估算的输入 tokens 选出
+// 承接请求的真实目标模型名。非路由模型原样返回（resolved == name，调用方
+// 无需区分）。估算口径见 gateway 的 estimateInputTokens——只用于选路，
+// 不参与计量计费。
+//
+// 解析「沿路由链走到底」：目标本身也可以是路由模型（链式分流）。管理端
+// 保存时已做环校验，这里再加运行时防线（深度上限 + 回到起点的环检测），
+// 防手改数据库造成死循环。任何一跳的目标不存在或已停用（不在启用模型
+// 集合 b.models 中）都直接报错，让客户端拿到明确原因，而不是一个含糊的
+// 「没有对应的接入点」。
+func (b *Balancer) ResolveRouter(name string, inputTokens int64) (string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if m, ok := b.models[name]; !ok || m.Type != model.ModelTypeRouter {
+		return name, nil
+	}
+	cur := name
+	for depth := 0; depth < model.MaxRouterDepth; depth++ {
+		m := b.models[cur]
+		if m == nil || m.Type != model.ModelTypeRouter {
+			return cur, nil // 已落到真实模型，解析结束
+		}
+		next := pickRouterTarget(m.Router, inputTokens)
+		if next == "" {
+			return "", fmt.Errorf("路由模型 %s 未配置可用的分流规则", cur)
+		}
+		if _, ok := b.models[next]; !ok {
+			return "", fmt.Errorf("路由目标 %s 不存在或已停用", next)
+		}
+		if next == name {
+			return "", fmt.Errorf("路由配置成环（绕回 %s）", name)
+		}
+		cur = next
+	}
+	return "", fmt.Errorf("路由链超过 %d 层，拒绝解析（%s）", model.MaxRouterDepth, name)
+}
+
+// pickRouterTarget 按估算输入 tokens 命中规则：规则按阈值升序，取第一条
+// 「输入 ≤ 阈值」的；输入超过全部阈值时用默认目标。无可用目标返回空串。
+func pickRouterTarget(rc *model.RouterConfig, inputTokens int64) string {
+	if rc == nil {
+		return ""
+	}
+	for _, r := range rc.Rules {
+		if r.Target != "" && inputTokens <= r.MaxInputTokens {
+			return r.Target
+		}
+	}
+	return rc.DefaultTarget
+}
+
+// ModelType 返回模型类型（仅查启用中的目录；未知/已停用返回空串）。
+// 网关入口用它在打上游之前拦截「图像模型打 chat 接口」这类模态错配。
+func (b *Balancer) ModelType(name string) string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if m, ok := b.models[name]; ok {
+		return m.Type
+	}
+	return ""
 }
 
 // weightTable 计算每个候选叶子的统一权重（叶.weight > 账号.weight > 1）。
@@ -660,8 +727,9 @@ func poolKeyOf(modelName string, allowed []string) string {
 	return modelName + "|" + strings.Join(cp, ",")
 }
 
-func (b *Balancer) getWrrState(poolKey string, cands []*model.Endpoint) *wrrState {
-	weights := b.weightTable(cands)
+// getWrrState 取（或建）该选举池的 WRR 状态，并按给定权重表刷新总权重。
+// weights 由调用方（Select）算好传入，保证与选举用的是同一张表。
+func (b *Balancer) getWrrState(poolKey string, weights map[string]int) *wrrState {
 	b.wrrMu.Lock()
 	defer b.wrrMu.Unlock()
 	st, ok := b.wrrState[poolKey]
@@ -670,8 +738,8 @@ func (b *Balancer) getWrrState(poolKey string, cands []*model.Endpoint) *wrrStat
 		b.wrrState[poolKey] = st
 	}
 	total := 0
-	for _, e := range cands {
-		total += weights[e.ID]
+	for _, w := range weights {
+		total += w
 	}
 	st.total = total
 	return st

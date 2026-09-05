@@ -25,8 +25,22 @@ const (
 
 // 模型类型
 const (
-	ModelTypeText  = "text"
-	ModelTypeImage = "image"
+	ModelTypeText   = "text"
+	ModelTypeImage  = "image"
+	// ModelTypeRouter 虚拟路由模型：不承接上游流量（没有接入点映射），
+	// 网关按「估算输入长度」把发往该名字的请求分流到其它真实模型。
+	// 参考 OpenAI 的 auto / 各家 router 类模型：客户端只管请求这个名字，
+	// 具体打哪个模型由网关在入口解析决定。
+	ModelTypeRouter = "router"
+)
+
+// 虚拟路由模型的配置边界。
+const (
+	// MaxRouterRules 单个路由模型允许的分流规则条数上限（防误配出超大配置）。
+	MaxRouterRules = 32
+	// MaxRouterDepth 路由链解析深度上限：目标本身也可以是路由模型（链式），
+	// 超过该层数视为配置异常，拒绝解析而非无限递归。
+	MaxRouterDepth = 8
 )
 
 // 熔断与冷却相关常量。
@@ -68,15 +82,32 @@ type Account struct {
 	TotalImages      int64 `json:"total_images"`
 }
 
+// RouterRule 虚拟路由模型的一条分流规则：估算输入 tokens ≤ MaxInputTokens 时，
+// 请求被交给 Target（易读模型名）。规则按阈值升序保存，命中取第一条满足的；
+// 输入超过全部阈值时使用 RouterConfig.DefaultTarget。
+type RouterRule struct {
+	MaxInputTokens int64  `json:"max_input_tokens"` // 阈值（估算输入 tokens，0 = 仅空输入命中）
+	Target         string `json:"target"`           // 目标易读模型名（文本或路由模型）
+}
+
+// RouterConfig 虚拟路由模型（Type=router）的分流配置。
+// 输入长度为粗估（见 gateway 的估算规则），只用于选路，不参与计量计费。
+type RouterConfig struct {
+	Rules         []RouterRule `json:"rules"`          // 按阈值升序；命中取第一条满足的
+	DefaultTarget string       `json:"default_target"` // 超过全部阈值时的目标
+}
+
 // Model 易读模型名目录（下游看到的名字，例如 doubao-seed-1-6）。
-// Type 区分文本/图像：图像模型只能被 /v1/images/generations 调用，反之亦然。
+// Type 区分文本/图像/路由：图像模型只能被 /v1/images/generations 调用，
+// 文本模型只能被 chat/responses 调用；路由模型是虚拟名字，由网关在入口
+// 按输入长度解析成真实目标后再走正常路由。
 // Fallback 是该模型在所有账号都不可用时的有序 fallback 链（仅限同 Type）：
 // 请求该模型 → 若所有 {账号, 模型标识} 元组均不可用 → 按顺序尝试 Fallback 里的模型。
 // 价格字段用于成本核算：文本模型填 input/output（每百万 token 单价），
 // 图像模型填 image（每张单价）；0 表示未定价（成本计 0）。
 type Model struct {
 	Name        string   `json:"name"`
-	Type        string   `json:"type"` // text | image（默认 text）
+	Type        string   `json:"type"` // text | image | router（默认 text）
 	Display     string   `json:"display"`
 	Description string   `json:"description"`
 	Enabled     bool     `json:"enabled"`
@@ -88,8 +119,11 @@ type Model struct {
 	PriceImage  float64 `json:"price_image"`  // 图像单价：$ / 张
 
 	// 能力上限（0 = 未设置：不校验，允许目录按模型名自动补全；人工填写的值优先）。
-	ContextTokens   int64 `json:"context_tokens"`   // 上下文窗口（tokens）
+	ContextTokens   int64 `json:"context_tokens"`    // 上下文窗口（tokens）
 	MaxOutputTokens int64 `json:"max_output_tokens"` // 单次最大输出（tokens），非 0 时网关裁剪 max_tokens
+
+	// 虚拟路由配置（仅 Type=router 使用；nil = 无配置）。
+	Router *RouterConfig `json:"router,omitempty"`
 }
 
 // Endpoint 是树上的叶节点：账号（父）× 上游模型标识 EP，服务某个易读模型名。

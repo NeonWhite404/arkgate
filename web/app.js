@@ -660,6 +660,16 @@ const ModelsPage = {
     };
   },
   mounted() { this.load(); },
+  computed: {
+    // routerTargets 路由目标候选：文本模型（排除自身）。UI 限定目标为文本模型；
+    // 链式分流（路由 → 路由）由后端支持，但不在这里鼓励，避免配置难排查。
+    routerTargets() {
+      if (!this.mModal) return [];
+      return this.models
+        .filter((m) => (m.type || "text") === "text" && m.name !== this.mModal.name)
+        .map((m) => m.name);
+    },
+  },
   methods: {
     load() {
       Promise.all([req("GET", "/api/models"), req("GET", "/api/accounts"), req("GET", "/api/endpoints")])
@@ -674,21 +684,32 @@ const ModelsPage = {
     },
     // ── 模型 ──
     openModel(m) {
+      // 路由配置深拷贝进草稿（规则行可就地编辑，保存时整体替换）。
+      const router = (m && m.router) ? {
+        rules: (m.router.rules || []).map((r) => ({ max_input_tokens: r.max_input_tokens || 0, target: r.target || "" })),
+        default_target: m.router.default_target || "",
+      } : { rules: [], default_target: "" };
       this.mModal = m ? {
         name: m.name,
         form: { type: m.type || "text", display: m.display, description: m.description || "",
           fallback: (m.fallback || []).join(", "), enabled: m.enabled,
           price_input: m.price_input || 0, price_output: m.price_output || 0, price_image: m.price_image || 0,
-          context_tokens: m.context_tokens || 0, max_output_tokens: m.max_output_tokens || 0 },
+          context_tokens: m.context_tokens || 0, max_output_tokens: m.max_output_tokens || 0,
+          router },
         catHint: "",
       } : {
         name: null,
         form: { type: "text", display: "", description: "", fallback: "", enabled: true,
           price_input: 0, price_output: 0, price_image: 0,
-          context_tokens: 0, max_output_tokens: 0 },
+          context_tokens: 0, max_output_tokens: 0,
+          router: { rules: [], default_target: "" } },
         catHint: "",
       };
-      if (m) this.lookupCat(m.name); // 编辑态：即时显示目录命中情况
+      if (m && m.type !== "router") this.lookupCat(m.name); // 编辑态：即时显示目录命中情况（路由模型无价格/上下文语义，不查）
+    },
+    // addRouterRule 在草稿末尾补一条空规则行。
+    addRouterRule() {
+      this.mModal.form.router.rules.push({ max_input_tokens: 0, target: "" });
     },
     // lookupCat 按模型名查内置目录，提示将自动补全的价格/能力（人工填写优先）。
     lookupCat(name) {
@@ -721,6 +742,23 @@ const ModelsPage = {
         price_image: Number(f.price_image) || 0,
         context_tokens: Number(f.context_tokens) || 0, max_output_tokens: Number(f.max_output_tokens) || 0,
       };
+      if (f.type === "router") {
+        // 路由模型：fallback 链无意义，置空；规则去掉未选目标的行后整体回传。
+        payload.fallback = [];
+        payload.router = {
+          rules: (f.router.rules || [])
+            .filter((r) => r.target)
+            .map((r) => ({ max_input_tokens: Number(r.max_input_tokens) || 0, target: r.target })),
+          default_target: f.router.default_target || "",
+        };
+        if (!payload.router.rules.length && !payload.router.default_target) {
+          toast("路由模型需要至少一条分流规则或默认目标", false);
+          return;
+        }
+      } else {
+        // 非 router：显式清空路由配置（从 router 改回其它类型时）。
+        payload.router = null;
+      }
       if (!name) {
         if (!f.name0 || !f.name0.trim()) { toast("请输入模型名", false); return; }
       }
@@ -874,26 +912,30 @@ const ModelsPage = {
       <div class="spacer"></div>
       <button class="btn btn-outline" :disabled="syncing" @click="syncCatalog">{{ syncing ? '补全中…' : '⟳ 从目录补全' }}</button>
     </div>
-    <div class="card"><div class="card-head"><div class="card-title">模型目录（可配置跨模型 fallback 链，仅限同类型）</div></div>
+    <div class="card"><div class="card-head"><div class="card-title">模型目录（文本/图像承接流量，路由模型按输入长度虚拟分流；fallback 仅限同类型）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>模型名</th><th>类型</th><th>显示名</th><th>映射</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback</th><th>描述</th><th>状态</th><th>操作</th>
+        <th>模型名</th><th>类型</th><th>显示名</th><th>映射</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback / 分流</th><th>描述</th><th>状态</th><th>操作</th>
       </tr></thead><tbody>
         <tr v-if="!models.length"><td colspan="10" class="empty">暂无模型</td></tr>
         <tr v-for="m in models" :key="m.name">
           <td class="mono">{{ m.name }}</td>
-          <td><span :class="m.type==='image' ? 'tag tag-purple' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : '文本' }}</span></td>
+          <td><span :class="m.type==='image' ? 'tag tag-purple' : m.type==='router' ? 'tag tag-orange' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : m.type==='router' ? '路由' : '文本' }}</span></td>
           <td>{{ m.display }}</td>
-          <td><span :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 个接入点</span></td>
+          <td><span v-if="m.type==='router'" class="tag tag-gray">虚拟</span><span v-else :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 个接入点</span></td>
           <td class="mono">
             <template v-if="m.context_tokens || m.max_output_tokens">{{ m.context_tokens ? fmtTokens(m.context_tokens) : '—' }} / {{ m.max_output_tokens ? fmtTokens(m.max_output_tokens) : '—' }}</template>
             <span v-else>—</span>
           </td>
           <td class="cost">
             <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
+            <template v-else-if="m.type==='router'">—</template>
             <template v-else-if="m.price_input || m.price_output">{{ fmtCost(m.price_input) }} / {{ fmtCost(m.price_output) }} per 1M</template>
             <span v-else class="tag tag-gray">未定价</span>
           </td>
-          <td class="mono">{{ (m.fallback && m.fallback.length) ? m.fallback.join(' → ') : '—' }}</td>
+          <td class="mono">
+            <template v-if="m.type==='router'">→ {{ (m.router && m.router.rules.length) || 0 }} 条规则<template v-if="m.router && m.router.default_target"> · 默认 {{ m.router.default_target }}</template></template>
+            <template v-else>{{ (m.fallback && m.fallback.length) ? m.fallback.join(' → ') : '—' }}</template>
+          </td>
           <td>{{ m.description }}</td>
           <td><span :class="m.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ m.enabled ? '启用' : '停用' }}</span></td>
           <td><div class="row-actions">
@@ -931,20 +973,41 @@ const ModelsPage = {
           <select v-model="mModal.form.type">
             <option value="text">文本（chat / responses）</option>
             <option value="image">图像（images/generations）</option>
+            <option value="router">路由（虚拟分流，按输入长度）</option>
           </select></div>
         <div class="form-item"><label>显示名</label><input v-model="mModal.form.display"/></div>
         <div class="form-row three" v-if="mModal.form.type==='image'">
           <div class="form-item"><label>图像单价（$ / 张）</label><input v-model="mModal.form.price_image" type="number" step="0.0001"/></div>
         </div>
-        <div class="form-row" v-else>
+        <div class="form-row" v-else-if="mModal.form.type!=='router'">
           <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model="mModal.form.price_input" type="number" step="0.0001"/></div>
           <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model="mModal.form.price_output" type="number" step="0.0001"/></div>
         </div>
-        <div class="form-row" v-if="mModal.form.type!=='image'">
+        <div class="form-row" v-if="mModal.form.type==='text'">
           <div class="form-item"><label>上下文窗口（tokens，0=不校验）</label><input v-model="mModal.form.context_tokens" type="number"/></div>
           <div class="form-item"><label>最大输出（tokens，0=不裁剪）</label><input v-model="mModal.form.max_output_tokens" type="number"/></div>
         </div>
-        <div class="form-item"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型；不向下传递）</label>
+        <template v-if="mModal.form.type==='router'">
+          <div class="form-item"><label>分流规则（按估算输入 tokens 取第一条满足的阈值）</label>
+            <div class="router-rule" v-for="(r, i) in mModal.form.router.rules" :key="i">
+              <span class="sh-note">输入 ≤</span>
+              <input v-model.number="r.max_input_tokens" type="number" min="0" style="width:130px"/>
+              <span class="sh-note">tokens →</span>
+              <select v-model="r.target" style="width:210px">
+                <option value="">选择目标模型…</option>
+                <option v-for="t in routerTargets" :key="t" :value="t">{{ t }}</option>
+              </select>
+              <button class="btn btn-outline btn-sm" @click="mModal.form.router.rules.splice(i, 1)">移除</button>
+            </div>
+            <div><button class="btn btn-outline btn-sm" @click="addRouterRule">+ 添加规则</button></div>
+            <div class="form-tip">估算口径：中日韩约 1 字 = 1 token，其它约 4 字符 = 1 token（偏保守，仅用于选路，计费仍按上游真实用量）。超过全部阈值的请求走「默认目标」。路由模型自身没有接入点，也不参与 fallback。</div></div>
+          <div class="form-item"><label>默认目标（输入超过全部阈值时）</label>
+            <select v-model="mModal.form.router.default_target" style="width:260px">
+              <option value="">（不设默认）</option>
+              <option v-for="t in routerTargets" :key="t" :value="t">{{ t }}</option>
+            </select></div>
+        </template>
+        <div class="form-item" v-if="mModal.form.type!=='router'"><label>fallback 链（逗号分隔，按顺序尝试；仅限同类型且已存在的模型；不向下传递）</label>
           <input v-model="mModal.form.fallback" placeholder="例如 doubao-seed-1-5, doubao-lite"/></div>
         <div class="form-item"><label>描述</label><input v-model="mModal.form.description"/></div>
         <div class="form-item"><label>状态</label>
@@ -1194,7 +1257,7 @@ const LogsPage = {
         <td>{{ l.subkey_name || l.subkey_id }}</td>
         <td>{{ l.account_name || l.account_id }}</td>
         <td>{{ l.provider || '-' }}</td>
-        <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="fallback">↓</span></td>
+        <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="实际模型与请求模型不同（fallback 或虚拟路由）">↓</span></td>
         <td class="mono">{{ l.model }}</td>
         <td>{{ l.prompt_tokens }}</td><td>{{ l.completion_tokens }}</td><td>{{ l.total_tokens }}</td>
         <td>{{ l.modality === 'image' ? (l.image_count || 0) + ' 张' : '—' }}</td>
@@ -1369,13 +1432,20 @@ const RoutingPage = {
       sel: "",            // 当前编辑的模型名
       wDraft: {},         // 权重草稿：endpointID -> 数值
       chain: [],          // fallback 链草稿
-      addPick: "",        // 待追加的 fallback 目标
+      dragIdx: -1,        // 拖拽编排：正在拖动的链内下标（-1 = 未拖）
+      dragPool: "",       // 拖拽编排：来自候选区的候选模型名（空 = 非候选拖拽）
+      overIdx: -1,        // 拖拽编排：悬停目标下标（仅作视觉提示）
       savingW: false, savingC: false, loading: false,
     };
   },
   mounted() { this.load(); },
   computed: {
     model() { return this.models.find((m) => m.name === this.sel) || null; },
+    // routableModels 参与分流编排的模型：路由模型是虚拟名字（无接入点、
+    // 无 fallback），权重与链路两块编排对它都没有意义，从列表里排除。
+    routableModels() {
+      return this.models.filter((m) => (m.type || "text") !== "router");
+    },
     // leaves 当前模型的全部叶子（含停用，停用项只展示不参与占比）。
     leaves() {
       return this.eps
@@ -1398,7 +1468,7 @@ const RoutingPage = {
     candidates() {
       const t = (this.model && this.model.type) || "text";
       return this.models
-        .filter((m) => (m.type || "text") === t && m.name !== this.sel && this.chain.indexOf(m.name) < 0)
+        .filter((m) => (m.type || "text") === t && m.type !== "router" && m.name !== this.sel && this.chain.indexOf(m.name) < 0)
         .map((m) => m.name);
     },
     chainDirty() {
@@ -1424,8 +1494,8 @@ const RoutingPage = {
           ((rs[3] && rs[3].endpoints) || []).forEach((e) => { rt[e.id] = e.runtime || {}; });
           this.runtime = rt;
           if (!this.sel || !this.models.some((m) => m.name === this.sel)) {
-            const first = this.models.find((m) => this.eps.some((e) => e.model === m.name));
-            this.sel = (first && first.name) || (this.models[0] && this.models[0].name) || "";
+            const first = this.routableModels.find((m) => this.eps.some((e) => e.model === m.name));
+            this.sel = (first && first.name) || (this.routableModels[0] && this.routableModels[0].name) || "";
           }
           this.resetDrafts();
         })
@@ -1437,7 +1507,6 @@ const RoutingPage = {
       this.eps.filter((e) => e.model === this.sel).forEach((e) => { w[e.id] = Number(e.weight || 0); });
       this.wDraft = w;
       this.chain = ((this.model && this.model.fallback) || []).slice();
-      this.addPick = "";
     },
     pickModel(name) { this.sel = name; this.resetDrafts(); },
     accName(id) {
@@ -1487,17 +1556,58 @@ const RoutingPage = {
         .then(() => { toast(l.enabled ? "已停用该接入点" : "已启用该接入点"); this.load(); })
         .catch((e) => toast(e.message, false));
     },
-    addFallback() {
-      if (!this.addPick) return;
-      this.chain.push(this.addPick);
-      this.addPick = "";
+    // ── fallback 链：拖拽编排 ──
+    // HTML5 DnD：dataTransfer 只放一个标记串给浏览器（Firefox 起拖必需），
+    // 真状态（链内下标 / 候选名）留在组件里。dragend 统一复位，拖放取消也干净。
+    chainDragStart(i, e) {
+      this.dragIdx = i;
+      this.dragPool = "";
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", "chain:" + i);
     },
-    moveFallback(i, delta) {
-      const j = i + delta;
-      if (j < 0 || j >= this.chain.length) return;
-      const t = this.chain[i];
-      this.chain[i] = this.chain[j];
-      this.chain[j] = t;
+    // poolDragStart 从候选区起拖：落进链路时按「插入」处理而不是换位。
+    poolDragStart(name, e) {
+      this.dragPool = name;
+      this.dragIdx = -1;
+      e.dataTransfer.effectAllowed = "copy";
+      e.dataTransfer.setData("text/plain", "pool:" + name);
+    },
+    chainDragOver(i) {
+      if (this.dragIdx >= 0 || this.dragPool) this.overIdx = i;
+    },
+    chainDragEnd() {
+      this.dragIdx = -1;
+      this.dragPool = "";
+      this.overIdx = -1;
+    },
+    // chainDrop 把拖动项插入到下标 i：候选拖拽 = 插入；链内拖拽 = 换位
+    //（先删后插，从后往前拖时目标左移一位，插到 i 前先校正）。
+    chainDrop(i) {
+      if (this.dragPool) {
+        if (!this.chain.includes(this.dragPool)) this.chain.splice(i, 0, this.dragPool);
+        this.chainDragEnd();
+        return;
+      }
+      if (this.dragIdx < 0 || this.dragIdx === i) { this.chainDragEnd(); return; }
+      const from = this.dragIdx;
+      const [item] = this.chain.splice(from, 1);
+      this.chain.splice(from < i ? i - 1 : i, 0, item);
+      this.chainDragEnd();
+    },
+    // chainRowDrop 拖到链路空白处：候选拖到末尾追加，链内拖拽移到末尾。
+    chainRowDrop() {
+      if (this.dragPool) {
+        if (!this.chain.includes(this.dragPool)) this.chain.push(this.dragPool);
+      } else if (this.dragIdx >= 0) {
+        const [item] = this.chain.splice(this.dragIdx, 1);
+        this.chain.push(item);
+      }
+      this.chainDragEnd();
+    },
+    // appendFallback 点击候选直接追加到链尾（与拖拽等价的快捷方式）。
+    appendFallback(name) {
+      if (!name || this.chain.includes(name)) return;
+      this.chain.push(name);
     },
     dropFallback(i) { this.chain.splice(i, 1); },
     saveChain() {
@@ -1525,11 +1635,11 @@ const RoutingPage = {
       <div class="card route-side">
         <div class="card-head"><div class="card-title">模型</div></div>
         <div class="route-list">
-          <div v-for="m in models" :key="m.name" class="route-item" :class="{active: sel===m.name}" @click="pickModel(m.name)">
+          <div v-for="m in routableModels" :key="m.name" class="route-item" :class="{active: sel===m.name}" @click="pickModel(m.name)">
             <span class="mono">{{ m.name }}</span>
             <span :class="epCountOf(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCountOf(m.name) }}</span>
           </div>
-          <div v-if="!models.length" class="empty">暂无模型</div>
+          <div v-if="!routableModels.length" class="empty">暂无模型</div>
         </div>
       </div>
 
@@ -1584,27 +1694,31 @@ const RoutingPage = {
               <button class="btn btn-primary btn-sm" :disabled="savingC || !chainDirty" @click="saveChain">{{ savingC ? '保存中…' : '保存链路' }}</button>
             </div>
           </div>
-          <div class="chain-row">
+          <div class="chain-row" @dragover.prevent @drop.prevent="chainRowDrop">
             <span class="chip chip-self mono">{{ sel || '—' }}</span>
             <template v-for="(f, i) in chain" :key="f">
               <span class="chain-arrow">→</span>
-              <span class="chip">
+              <span class="chip chip-drag" draggable="true"
+                :class="{dragging: dragIdx === i, 'drag-over': overIdx === i && dragIdx !== i}"
+                :title="'拖拽调整 ' + f + ' 的位置'"
+                @dragstart="chainDragStart(i, $event)" @dragend="chainDragEnd"
+                @dragover.prevent="chainDragOver(i)" @drop.prevent.stop="chainDrop(i)">
                 <span class="mono">{{ f }}</span>
-                <button class="chip-btn" title="上移" @click="moveFallback(i, -1)">←</button>
-                <button class="chip-btn" title="下移" @click="moveFallback(i, 1)">→</button>
                 <button class="chip-btn chip-del" title="移除" @click="dropFallback(i)">×</button>
               </span>
             </template>
             <span v-if="!chain.length" class="sh-note">未配置 fallback：该模型全部接入点不可用时直接返回错误</span>
           </div>
-          <div class="sh-note" style="padding: 0 16px 8px">这就是网关实际会尝试的完整顺序：链只取本模型配置的这一列，目标自己的 fallback 不会被带进来。</div>
+          <div class="sh-note" style="padding: 0 16px 8px">拖拽链上的模型调整顺序（顺序 = 网关的尝试顺序），拖到空白处移到末尾，× 移除。链只取本模型配置的这一列，目标自己的 fallback 不会被带进来。</div>
           <div class="chain-add">
-            <select v-model="addPick" style="width:240px">
-              <option value="">选择要追加的模型…</option>
-              <option v-for="c in candidates" :key="c" :value="c">{{ c }}</option>
-            </select>
-            <button class="btn btn-outline" :disabled="!addPick" @click="addFallback">+ 追加</button>
-            <span class="sh-note">按顺序尝试；只用本模型这一列，不会再向下传递到目标自己的 fallback；仅同类型模型可入链（文本↔图像不混用）。</span>
+            <div class="chain-pool" v-if="candidates.length">
+              <span v-for="c in candidates" :key="c" class="ep-chip" draggable="true"
+                title="点击追加到链尾，或拖到链上任意位置"
+                @dragstart="poolDragStart(c, $event)" @dragend="chainDragEnd"
+                @click="appendFallback(c)">{{ c }}</span>
+            </div>
+            <span v-else class="sh-note">没有可追加的同类型候选模型</span>
+            <span class="sh-note">点击或拖拽候选模型入链；仅同类型模型可入链（文本↔图像不混用）。</span>
           </div>
         </div>
       </div>
@@ -1860,21 +1974,21 @@ const PortalPage = {
       <div class="card">
         <div class="card-head"><div class="card-title">最近调用（最多 100 条）</div></div>
         <div class="table-wrap"><table><thead><tr>
-          <th>时间</th><th>模型</th><th>模态</th><th>输入</th><th>输出</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
+          <th>时间</th><th>模型</th><th>模态</th><th>输入</th><th>输出</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th>
         </tr></thead><tbody>
-          <tr v-if="!d.logs.length"><td colspan="10" class="empty">暂无调用记录</td></tr>
+          <tr v-if="!d.logs.length"><td colspan="9" class="empty">暂无调用记录</td></tr>
           <tr v-for="l in d.logs" :key="l.id">
             <td>{{ fmtTime(l.ts) }}</td>
-            <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="fallback">↓</span></td>
+            <td><span class="mono">{{ l.requested_model || l.model }}</span> <span v-if="l.requested_model && l.requested_model !== l.model" class="tag tag-orange" title="实际模型与请求模型不同（fallback 或虚拟路由）">↓</span></td>
             <td>{{ l.modality === 'image' ? '图像' : '文本' }}</td>
             <td>{{ l.prompt_tokens }}</td><td>{{ l.completion_tokens }}</td>
             <td>{{ l.image_count || '—' }}</td>
             <td class="cost">{{ fmtCost(l.cost) }}</td>
             <td>{{ l.latency_ms }}ms</td>
             <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
-            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
           </tr>
         </tbody></table></div>
+        <div class="sh-note" style="padding:0 16px 14px">失败原因涉及上游细节，不在此展示；如需排查请联系管理员。</div>
       </div>
     </div>
   </div>`,

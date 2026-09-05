@@ -55,7 +55,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // ─────────────────────────── 建表 & 迁移 ───────────────────────────
 
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
-const schemaVersion = "6"
+// v7：虚拟路由模型（models.router JSON 列）+ subkeys.key_hash / usage_logs(subkey_id) 索引。
+const schemaVersion = "7"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -138,6 +139,10 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_endpoints_account ON endpoints(account_id)`,
+		// 子 Key 鉴权按 key_hash 等值查（每个 /v1 请求都会走一次）。
+		`CREATE INDEX IF NOT EXISTS idx_subkeys_hash ON subkeys(key_hash)`,
+		// 门户按子 Key 拉日志（WHERE subkey_id ORDER BY id DESC）。
+		`CREATE INDEX IF NOT EXISTS idx_usage_subkey ON usage_logs(subkey_id, id)`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -207,6 +212,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE models ADD COLUMN max_output_tokens INTEGER NOT NULL DEFAULT 0`,
 		// —— v6：请求来源 IP（v5 是 endpoints 唯一键放宽，见 relaxEndpointUnique） ——
 		`ALTER TABLE usage_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''`,
+		// —— v7：虚拟路由模型（type=router 的分流配置，JSON；空串 = 无配置） ——
+		`ALTER TABLE models ADD COLUMN router TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -310,9 +317,15 @@ func nonzero(v, def int64) int64 {
 
 // ─────────────────────────── Account ───────────────────────────
 
-func scanAccount(rows *sql.Rows) (*model.Account, error) {
+// scanner 抽象 *sql.Rows 与 *sql.Row 共有的 Scan，让单行查询与列表查询
+// 复用同一套列扫描函数（列清单只有一份，改列不会漏改）。
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAccount(sc scanner) (*model.Account, error) {
 	a := &model.Account{}
-	if err := rows.Scan(&a.ID, &a.Name, &a.ArkAPIKeyEnc, &a.KeyHint, &a.Status, &a.Weight,
+	if err := sc.Scan(&a.ID, &a.Name, &a.ArkAPIKeyEnc, &a.KeyHint, &a.Status, &a.Weight,
 		&a.CreatedAt, &a.LastUsedAt, &a.TotalRequests, &a.SuccessRequests, &a.FailRequests,
 		&a.PromptTokens, &a.CompletionTokens, &a.TotalTokens,
 		&a.Provider, &a.BaseURL, &a.CapResponses, &a.CapImages, &a.TotalImages); err != nil {
@@ -344,17 +357,12 @@ func (s *Store) ListAccounts() ([]*model.Account, error) {
 	return out, rows.Err()
 }
 
+// GetAccount 按主键直查账号（网关每次转发都要解析账号 Key，
+// 不能退化为「全表加载再过滤」——账号多时每请求都是 O(n) 扫描）。
 func (s *Store) GetAccount(id string) (*model.Account, error) {
-	all, err := s.ListAccounts()
-	if err != nil {
-		return nil, err
-	}
-	for _, a := range all {
-		if a.ID == id {
-			return a, nil
-		}
-	}
-	return nil, sql.ErrNoRows
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanAccount(s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id=?`, id))
 }
 
 func (s *Store) UpsertAccount(a *model.Account) error {
@@ -407,19 +415,26 @@ func (s *Store) AccumulateAccount(id string, ok bool, pt, ct int64) error {
 
 // ─────────────────────────── Model ───────────────────────────
 
-func scanModel(rows *sql.Rows) (*model.Model, error) {
+func scanModel(sc scanner) (*model.Model, error) {
 	m := &model.Model{}
-	var fb string
-	if err := rows.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
+	var fb, routerJSON string
+	if err := sc.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
 		&m.Type, &m.PriceInput, &m.PriceOutput, &m.PriceImage,
-		&m.ContextTokens, &m.MaxOutputTokens); err != nil {
+		&m.ContextTokens, &m.MaxOutputTokens, &routerJSON); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(fb), &m.Fallback)
+	// router 列为空 = 无配置；损坏的 JSON 按「无配置」处理（宁可路由不动，不可整体失联）。
+	if routerJSON != "" {
+		rc := &model.RouterConfig{}
+		if json.Unmarshal([]byte(routerJSON), rc) == nil {
+			m.Router = rc
+		}
+	}
 	return m, nil
 }
 
-const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image,context_tokens,max_output_tokens`
+const modelCols = `name,display,description,enabled,fallback,created_at,type,price_input,price_output,price_image,context_tokens,max_output_tokens,router`
 
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
@@ -444,18 +459,20 @@ func (s *Store) ListModels() ([]*model.Model, error) {
 func (s *Store) GetModel(name string) (*model.Model, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m := &model.Model{}
-	var fb string
-	err := s.db.QueryRow(
-		`SELECT `+modelCols+` FROM models WHERE name=?`, name,
-	).Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt, &m.Type,
-		&m.PriceInput, &m.PriceOutput, &m.PriceImage,
-		&m.ContextTokens, &m.MaxOutputTokens)
-	if err != nil {
-		return nil, err
+	return scanModel(s.db.QueryRow(
+		`SELECT `+modelCols+` FROM models WHERE name=?`, name))
+}
+
+// routerJSON 序列化路由配置：nil 序列化为空串（列默认值口径，避免落库成 "null"）。
+func routerJSON(rc *model.RouterConfig) string {
+	if rc == nil {
+		return ""
 	}
-	_ = json.Unmarshal([]byte(fb), &m.Fallback)
-	return m, nil
+	b, err := json.Marshal(rc)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func (s *Store) UpsertModel(m *model.Model) error {
@@ -466,14 +483,14 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
 	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,
-			price_input,price_output,price_image,context_tokens,max_output_tokens)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+			price_input,price_output,price_image,context_tokens,max_output_tokens,router)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
 		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
 		type=excluded.type, price_input=excluded.price_input, price_output=excluded.price_output,
 		price_image=excluded.price_image, context_tokens=excluded.context_tokens,
-		max_output_tokens=excluded.max_output_tokens`,
+		max_output_tokens=excluded.max_output_tokens, router=excluded.router`,
 		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type,
-		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens)
+		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens, routerJSON(m.Router))
 	return err
 }
 
@@ -495,9 +512,9 @@ const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concu
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
 	total_images`
 
-func scanEndpoint(rows *sql.Rows) (*model.Endpoint, error) {
+func scanEndpoint(sc scanner) (*model.Endpoint, error) {
 	e := &model.Endpoint{}
-	if err := rows.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
+	if err := sc.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
 		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages); err != nil {
@@ -525,17 +542,11 @@ func (s *Store) ListEndpoints() ([]*model.Endpoint, error) {
 	return out, rows.Err()
 }
 
+// GetEndpoint 按主键直查映射（同 GetAccount：管理端热路径不走全表加载）。
 func (s *Store) GetEndpoint(id string) (*model.Endpoint, error) {
-	all, err := s.ListEndpoints()
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range all {
-		if e.ID == id {
-			return e, nil
-		}
-	}
-	return nil, sql.ErrNoRows
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanEndpoint(s.db.QueryRow(`SELECT `+endpointCols+` FROM endpoints WHERE id=?`, id))
 }
 
 func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
@@ -646,10 +657,10 @@ const subkeyCols = `id,name,key_text,key_hash,enabled,allowed_models,allowed_acc
 	daily_limit_tokens,daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,
 	total_images`
 
-func scanSubKey(rows *sql.Rows) (*model.SubKey, error) {
+func scanSubKey(sc scanner) (*model.SubKey, error) {
 	sk := &model.SubKey{}
 	var am, aa string
-	if err := rows.Scan(&sk.ID, &sk.Name, &sk.Key, &sk.KeyHash, &sk.Enabled, &am, &aa,
+	if err := sc.Scan(&sk.ID, &sk.Name, &sk.Key, &sk.KeyHash, &sk.Enabled, &am, &aa,
 		&sk.DailyLimitTokens, &sk.DailyLimitImages, &sk.ExpiresAt, &sk.CreatedAt,
 		&sk.LastUsedAt, &sk.TotalRequests, &sk.TotalTokens, &sk.TotalImages); err != nil {
 		return nil, err
@@ -678,17 +689,13 @@ func (s *Store) ListSubKeys() ([]*model.SubKey, error) {
 	return out, rows.Err()
 }
 
+// GetSubKeyByHash 按哈希直查子 Key。这是 /v1 每个请求的鉴权热路径：
+// 必须走 key_hash 索引（idx_subkeys_hash）单行查询，
+// 而不是把整张子 Key 表加载进内存再逐行比对。
 func (s *Store) GetSubKeyByHash(hash string) (*model.SubKey, error) {
-	all, err := s.ListSubKeys()
-	if err != nil {
-		return nil, err
-	}
-	for _, sk := range all {
-		if sk.KeyHash == hash {
-			return sk, nil
-		}
-	}
-	return nil, sql.ErrNoRows
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanSubKey(s.db.QueryRow(`SELECT `+subkeyCols+` FROM subkeys WHERE key_hash=?`, hash))
 }
 
 func (s *Store) UpsertSubKey(sk *model.SubKey) error {
@@ -790,6 +797,24 @@ func (s *Store) CountUsageLogs() (int64, error) {
 	defer s.mu.RUnlock()
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_logs`).Scan(&n)
+	return n, err
+}
+
+// CountModels / CountSubKeys 返回模型/子 Key 数量。总览页只需要计数，
+// 不必为两个数字把整表拉进内存（总览可能开启自动刷新轮询）。
+func (s *Store) CountModels() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM models`).Scan(&n)
+	return n, err
+}
+
+func (s *Store) CountSubKeys() (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM subkeys`).Scan(&n)
 	return n, err
 }
 
@@ -936,14 +961,18 @@ func (s *Store) SubKeyLogStats(subkeyID string, since int64) (*SubKeyStats, erro
 // ListUsageLogsBySubKey 返回某子 Key 自己的近期日志。
 // 列特意收窄（不含 account/provider/ep 等管理侧字段），供自助门户展示，
 // 保证终端用户拿不到任何超出自身调用视角的数据。
+// subKeyLogCols 门户可见列白名单。**不含 error**：上游错误体里可能带上游模型
+// 标识（ep-xxx）、账号线索、请求 id 等运维信息，属于越权数据；终端用户看
+// status（ok/error）与成功率即可判断成败，具体原因去找管理员。
+// 同样不含 account/provider/ep/endpoint 等字段。
 const subKeyLogCols = `id,ts,requested_model,model,modality,
-	prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error`
+	prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms`
 
 func scanSubKeyUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
 	if err := rows.Scan(&l.ID, &l.TS, &l.RequestedModel, &l.Model, &l.Modality,
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
-		&l.Cost, &l.Status, &l.LatencyMs, &l.Error); err != nil {
+		&l.Cost, &l.Status, &l.LatencyMs); err != nil {
 		return nil, err
 	}
 	return l, nil

@@ -100,6 +100,9 @@ func modelAllowed(sk *model.SubKey, name string) bool {
 }
 
 // logEntry 门户日志条目：列级白名单，只含终端用户可见数据。
+// 刻意**不含 error**——上游错误体可能带上游模型标识（ep-xxx）、账号线索、
+// 请求 id 等运维信息，属于越权数据；终端用户看 status 判断成败即可，
+// 具体原因找管理员（store.subKeyLogCols 已在查询层先拦一道）。
 type logEntry struct {
 	TS               int64   `json:"ts"`
 	RequestedModel   string  `json:"requested_model"`
@@ -112,7 +115,6 @@ type logEntry struct {
 	Cost             float64 `json:"cost"`
 	Status           string  `json:"status"`
 	LatencyMs        int64   `json:"latency_ms"`
-	Error            string  `json:"error"`
 }
 
 // handleOverview 返回登录子 Key 的完整自助视图。
@@ -166,7 +168,6 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 			Cost:             l.Cost,
 			Status:           l.Status,
 			LatencyMs:        l.LatencyMs,
-			Error:            l.Error,
 		})
 	}
 

@@ -109,15 +109,6 @@ func getenv(k, def string) string {
 	return def
 }
 
-func getenvInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
 // defaultDataDir 默认把运行时数据放在可执行文件同级目录，
 // 避免污染用户主目录等其它位置。ARKGATE_DATA_DIR 可显式覆盖。
 func defaultDataDir() string {

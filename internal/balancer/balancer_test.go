@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -565,4 +566,105 @@ func TestComputeCost(t *testing.T) {
 	}
 	<-b.statCh
 	<-b.logCh
+}
+
+// ─────────────────────────── 虚拟路由模型 ───────────────────────────
+
+// TestResolveRouter 锁定按输入长度分流的解析语义：阈值升序取第一条满足的、
+// 超阈值用默认目标、非路由模型原样返回、路由链可级联、坏配置给出明确错误。
+func TestResolveRouter(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "small", Enabled: true},
+		{Name: "big", Enabled: true},
+		{Name: "huge", Enabled: true},
+		{
+			Name: "auto", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{
+				Rules: []model.RouterRule{
+					{MaxInputTokens: 1000, Target: "small"},
+					{MaxInputTokens: 100000, Target: "big"},
+				},
+				DefaultTarget: "huge",
+			},
+		},
+	})
+
+	// 阈值内 → small；超第一档 → big；超全部 → 默认目标。
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{50, "small"},
+		{1000, "small"},
+		{1001, "big"},
+		{1 << 30, "huge"},
+	}
+	for _, c := range cases {
+		got, err := b.ResolveRouter("auto", c.in)
+		if err != nil || got != c.want {
+			t.Fatalf("ResolveRouter(auto, %d) = (%q, %v), want %q", c.in, got, err, c.want)
+		}
+	}
+
+	// 非路由模型 / 未知模型：原样返回，不报错。
+	if got, err := b.ResolveRouter("small", 10); err != nil || got != "small" {
+		t.Fatalf("non-router must pass through, got (%q, %v)", got, err)
+	}
+	if got, err := b.ResolveRouter("no-such", 10); err != nil || got != "no-such" {
+		t.Fatalf("unknown must pass through, got (%q, %v)", got, err)
+	}
+
+	// 路由模型但无配置：报明确错误（而不是落到 Select 的「没有对应的接入点」）。
+	b.mu.Lock()
+	b.models["empty"] = &model.Model{Name: "empty", Type: model.ModelTypeRouter, Enabled: true}
+	b.mu.Unlock()
+	if _, err := b.ResolveRouter("empty", 10); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("router without config must error with its name, got %v", err)
+	}
+}
+
+// TestResolveRouterChainAndErrors 路由链级联 + 坏配置（目标停用/成环/无规则）的报错。
+func TestResolveRouterChainAndErrors(t *testing.T) {
+	b := newTestBalancer()
+	b.seed(nil, nil, []*model.Model{
+		{Name: "leaf", Enabled: true},
+		{
+			Name: "r1", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{DefaultTarget: "r2"},
+		},
+		{
+			Name: "r2", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{DefaultTarget: "leaf"},
+		},
+		{
+			Name: "stale", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{DefaultTarget: "gone"},
+		},
+		{
+			Name: "loop1", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{DefaultTarget: "loop2"},
+		},
+		{
+			Name: "loop2", Type: model.ModelTypeRouter, Enabled: true,
+			Router: &model.RouterConfig{DefaultTarget: "loop1"},
+		},
+	})
+
+	// 级联：r1 → r2 → leaf。
+	if got, err := b.ResolveRouter("r1", 10); err != nil || got != "leaf" {
+		t.Fatalf("chain want leaf, got (%q, %v)", got, err)
+	}
+	// 目标已停用/不存在 → 明确报错，而不是落到 Select 的「没有接入点」。
+	if _, err := b.ResolveRouter("stale", 10); err == nil || !strings.Contains(err.Error(), "gone") {
+		t.Fatalf("stale target must error with name, got %v", err)
+	}
+	// 环（经过起点）→ 报错。
+	if _, err := b.ResolveRouter("loop1", 10); err == nil || !strings.Contains(err.Error(), "环") {
+		t.Fatalf("cycle must error, got %v", err)
+	}
+	// 从环中间进入同样要能被深度/环检测拦下。
+	if _, err := b.ResolveRouter("loop2", 10); err == nil {
+		t.Fatalf("cycle entered mid-way must error, got nil")
+	}
 }

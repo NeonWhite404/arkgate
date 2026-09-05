@@ -369,6 +369,16 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
 .chip-btn { border: none; background: none; cursor: pointer; color: var(--color-text-3); font-size: 11px; padding: 0 2px; }
 .chip-btn:hover { color: rgb(var(--primary-6)); }
 .chip-btn.chip-del:hover { color: rgb(var(--red-6)); }
+/* fallback 链拖拽编排：链内 chip 可拖动换位，候选 chip 可拖入插入 */
+.chip-drag { cursor: grab; transition: border-color .12s ease, box-shadow .12s ease, opacity .12s ease; }
+.chip-drag:active { cursor: grabbing; }
+.chip.dragging { opacity: .35; }
+.chip.drag-over { border-color: rgb(var(--primary-6)); box-shadow: 0 0 0 2px rgba(var(--primary-6), .22); }
+.chain-pool { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chain-pool .ep-chip { cursor: grab; }
+.chain-pool .ep-chip:active { cursor: grabbing; }
+/* 模型弹窗：路由模型的分流规则编辑行 */
+.router-rule { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
 .chain-add { display: flex; align-items: center; gap: 8px; padding: 0 16px 16px; flex-wrap: wrap; }
 .chain-add select { width: 240px; }
 
