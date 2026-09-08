@@ -825,14 +825,16 @@ func (a *Admin) testRegisteredModel(ctx context.Context, name string) testModelR
 	return result
 }
 
-// finishModelProbe 发送最小请求并写入探测结果。max_tokens=1 只验证链路与模型
-// 是否能接受请求，不把响应内容/用量写入网关统计。
+// finishModelProbe 发送探测请求并写入结果。探测请求体保持最小：不设
+// max_tokens / reasoning_effort 等易被上游拒绝或影响响应的参数，只要求模型
+// 以固定短语回应，验证链路与模型能否正常对话。不做用量统计。
 func (a *Admin) finishModelProbe(ctx context.Context, result *testModelResult, rt provider.Route, ep, protocol string) {
-	const probeBody = `{"model":"probe","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`
+	const probeBody = `{"messages":[{"role":"user","content":"Reply with exactly PONG and nothing else."}]}`
 	started := time.Now()
 	var err error
 	if protocol == model.ModelProtocolAnthropic {
-		_, _, err = a.mgr.AnthropicChat(ctx, rt, []byte(probeBody), ep, 1, a.upstreamProbeTimeout())
+		// Anthropic 协议的 max_tokens 是协议必填项（不能省略），用兜底默认值。
+		_, _, err = a.mgr.AnthropicChat(ctx, rt, []byte(probeBody), ep, provider.DefaultAnthropicMaxTokens, a.upstreamProbeTimeout())
 	} else {
 		_, _, err = a.mgr.Chat(ctx, rt, []byte(probeBody), ep, a.upstreamProbeTimeout())
 	}
