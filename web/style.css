@@ -341,10 +341,17 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
 .import-row:last-child { border-bottom: none; }
 .import-row:hover { background: var(--color-fill-1); }
 .import-row input[type=checkbox] { width: auto; margin: 0; }
+.import-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.probe-test { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.probe-result { font-size: 11px; font-variant-numeric: tabular-nums; }
+.probe-result.ok { color: rgb(var(--green-6)); }
+.probe-result.err { color: rgb(var(--red-6)); max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
 
 /* 分流配置页：左侧模型列表 + 右侧权重条与链路编排 */
 .route-wrap { display: grid; grid-template-columns: 260px 1fr; gap: 16px; align-items: start; }
 .route-side { padding-bottom: 8px; }
+.route-search { padding: 0 12px 8px; }
+.route-search input { width: 100%; }
 .route-list { max-height: 520px; overflow-y: auto; }
 .route-item { display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 8px 16px; cursor: pointer; font-size: 13px; border-left: 2px solid transparent; }

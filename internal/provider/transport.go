@@ -106,6 +106,42 @@ func prepareBody(down []byte, upstreamModel string) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
+// isMaxTokensCompatibilityError 只识别上游明确要求用 max_completion_tokens
+// 替代 max_tokens 的参数错误。不能把所有 400 都重写，否则会掩盖真实的客户端错误。
+func isMaxTokensCompatibilityError(err error) bool {
+	he, ok := AsHTTPError(err)
+	if !ok || (he.Code != 400 && he.Code != 422) {
+		return false
+	}
+	body := strings.ToLower(string(he.Body))
+	return strings.Contains(body, "max_tokens") &&
+		strings.Contains(body, "max_completion_tokens") &&
+		(strings.Contains(body, "unsupported parameter") || strings.Contains(body, "not supported"))
+}
+
+// useMaxCompletionTokens 把 chat 请求的 max_tokens 迁移为
+// max_completion_tokens。兼容上游已经同时收到两个字段的情况：删除旧字段，
+// 保留调用方显式提供的 max_completion_tokens。
+func useMaxCompletionTokens(body []byte) ([]byte, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body, false
+	}
+	value, hasOld := raw["max_tokens"]
+	if !hasOld {
+		return body, false
+	}
+	if _, hasNew := raw["max_completion_tokens"]; !hasNew {
+		raw["max_completion_tokens"] = value
+	}
+	delete(raw, "max_tokens")
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // prepareStreamBody 在 prepareBody 基础上强制流式 + include_usage
 // （用量从 final chunk 提取；保留下游 stream_options 的其它字段）。
 func prepareStreamBody(down []byte, upstreamModel string) ([]byte, error) {

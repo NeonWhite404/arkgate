@@ -2,6 +2,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -138,6 +139,7 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/models/metadata-sync", a.handleMetadataSync)
 	reg("/api/catalog/lookup", a.handleCatalogLookup)
 	reg("/api/upstream/models", a.handleUpstreamModels)
+	reg("/api/test/model", a.handleTestModel)
 	reg("/api/endpoints", a.handleEndpointsCollection)
 	reg("/api/endpoints/", a.handleEndpointItem)
 	reg("/api/subkeys", a.handleSubkeysCollection)
@@ -498,7 +500,12 @@ func (a *Admin) validateRouterModel(m *model.Model) error {
 	if len(m.Fallback) > 0 {
 		return errors.New("路由模型不使用 fallback 链（请改用分流规则）")
 	}
-	if m.Router == nil || (len(m.Router.Rules) == 0 && m.Router.DefaultTarget == "") {
+	// 路由规则独立在「分流配置」页维护；新建模型时允许暂时没有配置，
+	// 未配置模型运行时会返回明确的「未配置可用分流规则」错误。
+	if m.Router == nil {
+		return nil
+	}
+	if len(m.Router.Rules) == 0 && m.Router.DefaultTarget == "" {
 		return errors.New("路由模型需要至少一条分流规则或默认目标")
 	}
 	if len(m.Router.Rules) > model.MaxRouterRules {
@@ -622,21 +629,15 @@ func (a *Admin) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"detail": "账号不存在"})
 		return
 	}
-	def, ok := provider.Get(acc.Provider)
-	if !ok {
-		def = provider.FallbackDef(acc.Provider)
-	}
-	baseURL, err := def.ResolveBaseURL(acc.BaseURL)
+	rt, err := a.routeForAccount(acc)
 	if err != nil {
-		writeJSON(w, 400, map[string]any{"detail": "该账号未配置 base URL"})
+		if errors.Is(err, provider.ErrNoBaseURL) {
+			writeJSON(w, 400, map[string]any{"detail": "该账号未配置 base URL"})
+			return
+		}
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
 		return
 	}
-	key, err := a.box.Decrypt(acc.ArkAPIKeyEnc)
-	if err != nil {
-		writeJSON(w, 500, map[string]any{"detail": "账号密钥解密失败"})
-		return
-	}
-	rt := provider.Route{Def: def, BaseURL: baseURL, Key: key}
 	list, err := a.mgr.ListModels(r.Context(), rt, a.upstreamProbeTimeout())
 	if err != nil {
 		if he, ok := provider.AsHTTPError(err); ok {
@@ -648,7 +649,204 @@ func (a *Admin) handleUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 502, map[string]any{"detail": "拉取失败：" + err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"base_url": baseURL, "count": len(list), "models": list})
+	writeJSON(w, 200, map[string]any{"base_url": rt.BaseURL, "count": len(list), "models": list})
+}
+
+// routeForAccount 解析账号的可发送路由（供应商定义、最终 base URL 与解密后的 Key）。
+func (a *Admin) routeForAccount(acc *model.Account) (provider.Route, error) {
+	def, ok := provider.Get(acc.Provider)
+	if !ok {
+		def = provider.FallbackDef(acc.Provider)
+	}
+	baseURL, err := def.ResolveBaseURL(acc.BaseURL)
+	if err != nil {
+		return provider.Route{}, err
+	}
+	key, err := a.box.Decrypt(acc.ArkAPIKeyEnc)
+	if err != nil {
+		return provider.Route{}, errors.New("账号密钥解密失败")
+	}
+	return provider.Route{Def: def, BaseURL: baseURL, Key: key}, nil
+}
+
+// testModelRequest 快速测试请求。account_id + ep 直接探测上游标识；model
+// 按已注册模型解析接入点（路由模型会先解析到真实目标）。
+type testModelRequest struct {
+	Model     string `json:"model"`
+	AccountID string `json:"account_id"`
+	EP        string `json:"ep"`
+	Protocol  string `json:"protocol"`
+}
+
+type testModelResult struct {
+	OK          bool   `json:"ok"`
+	LatencyMS   int64  `json:"latency_ms"`
+	Model       string `json:"model,omitempty"`
+	Resolved    string `json:"resolved,omitempty"`
+	AccountID   string `json:"account_id,omitempty"`
+	AccountName string `json:"account_name,omitempty"`
+	EP          string `json:"ep,omitempty"`
+	Protocol    string `json:"protocol,omitempty"`
+	Status      int    `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// handleTestModel 用最小 chat 请求快速探测模型/接入点可用性。
+// 探测是管理侧诊断，不进入限流、熔断与用量统计；上游失败也返回 200 + ok=false，
+// 让前端可以把失败结果显示在对应模型旁边。
+func (a *Admin) handleTestModel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	var p testModelRequest
+	if err := decode(r, &p); err != nil {
+		writeJSON(w, 400, map[string]any{"detail": "无效请求"})
+		return
+	}
+	p.Model = strings.TrimSpace(p.Model)
+	p.AccountID = strings.TrimSpace(p.AccountID)
+	p.EP = strings.TrimSpace(p.EP)
+	p.Protocol = strings.TrimSpace(p.Protocol)
+	if p.Protocol != "" && p.Protocol != model.ModelProtocolAnthropic && p.Protocol != model.ModelProtocolOpenAI {
+		writeJSON(w, 400, map[string]any{"detail": "上游协议仅支持空（OpenAI 兼容）/ anthropic"})
+		return
+	}
+	if p.AccountID == "" || p.EP == "" {
+		if p.Model == "" {
+			writeJSON(w, 400, map[string]any{"detail": "缺少 model 或 account_id + ep"})
+			return
+		}
+		result := a.testRegisteredModel(r.Context(), p.Model)
+		writeJSON(w, 200, result)
+		return
+	}
+
+	acc, err := a.store.GetAccount(p.AccountID)
+	if err != nil {
+		writeJSON(w, 404, map[string]any{"detail": "账号不存在"})
+		return
+	}
+	result := testModelResult{Model: p.Model, AccountID: acc.ID, AccountName: acc.Name, EP: p.EP, Protocol: p.Protocol}
+	if p.Model != "" {
+		if registered, merr := a.store.GetModel(p.Model); merr == nil {
+			if registered.Type == model.ModelTypeImage {
+				result.Error = "图像模型不支持快速测试（避免产生真实生成费用）"
+				writeJSON(w, 200, result)
+				return
+			}
+			if result.Protocol == "" {
+				result.Protocol = registered.Provider
+			}
+		}
+	}
+	rt, err := a.routeForAccount(acc)
+	if err != nil {
+		result.Error = err.Error()
+		writeJSON(w, 200, result)
+		return
+	}
+	a.finishModelProbe(r.Context(), &result, rt, p.EP, p.Protocol)
+	writeJSON(w, 200, result)
+}
+
+// testRegisteredModel 从启用账号与接入点中挑一条，对已注册模型执行探测。
+func (a *Admin) testRegisteredModel(ctx context.Context, name string) testModelResult {
+	result := testModelResult{Model: name}
+	m, err := a.store.GetModel(name)
+	if err != nil {
+		result.Error = "模型不存在"
+		return result
+	}
+	if m.Type == model.ModelTypeImage {
+		result.Error = "图像模型不支持快速测试（避免产生真实生成费用）"
+		return result
+	}
+	target := name
+	if m.Type == model.ModelTypeRouter {
+		resolved, rerr := a.bal.ResolveRouter(name, 0)
+		if rerr != nil {
+			result.Error = rerr.Error()
+			return result
+		}
+		result.Resolved = resolved
+		target = resolved
+		m, err = a.store.GetModel(target)
+		if err != nil {
+			result.Error = "路由目标模型不存在"
+			return result
+		}
+		if m.Type == model.ModelTypeImage {
+			result.Error = "路由目标是图像模型，不支持快速测试"
+			return result
+		}
+	}
+	result.Model = name
+	result.Protocol = m.Provider
+
+	endpoints, err := a.store.ListEndpoints()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	accounts, err := a.store.ListAccounts()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	accOf := make(map[string]*model.Account, len(accounts))
+	for _, acc := range accounts {
+		accOf[acc.ID] = acc
+	}
+	var chosen *model.Endpoint
+	var chosenAcc *model.Account
+	for _, ep := range endpoints {
+		if ep.Model != target || !ep.Enabled {
+			continue
+		}
+		acc := accOf[ep.AccountID]
+		if acc == nil || acc.Status != model.AccountActive {
+			continue
+		}
+		chosen, chosenAcc = ep, acc
+		break
+	}
+	if chosen == nil {
+		result.Error = "该模型没有可用接入点（未配置或全部停用）"
+		return result
+	}
+	result.AccountID, result.AccountName, result.EP = chosenAcc.ID, chosenAcc.Name, chosen.EP
+	rt, err := a.routeForAccount(chosenAcc)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	a.finishModelProbe(ctx, &result, rt, chosen.EP, m.Provider)
+	return result
+}
+
+// finishModelProbe 发送最小请求并写入探测结果。max_tokens=1 只验证链路与模型
+// 是否能接受请求，不把响应内容/用量写入网关统计。
+func (a *Admin) finishModelProbe(ctx context.Context, result *testModelResult, rt provider.Route, ep, protocol string) {
+	const probeBody = `{"model":"probe","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`
+	started := time.Now()
+	var err error
+	if protocol == model.ModelProtocolAnthropic {
+		_, _, err = a.mgr.AnthropicChat(ctx, rt, []byte(probeBody), ep, 1, a.upstreamProbeTimeout())
+	} else {
+		_, _, err = a.mgr.Chat(ctx, rt, []byte(probeBody), ep, a.upstreamProbeTimeout())
+	}
+	result.LatencyMS = time.Since(started).Milliseconds()
+	if err == nil {
+		result.OK = true
+		return
+	}
+	if he, ok := provider.AsHTTPError(err); ok {
+		result.Status = he.Code
+		result.Error = fmt.Sprintf("上游返回 %d：%s", he.Code, truncateText(string(he.Body), 300))
+		return
+	}
+	result.Error = err.Error()
 }
 
 // truncateText 截断上游错误体，避免把长 HTML 页面整页塞进管理端提示。
@@ -1279,12 +1477,20 @@ func (a *Admin) handleLogs(w http.ResponseWriter, r *http.Request) {
 			offset = n
 		}
 	}
-	logs, err := a.store.ListUsageLogs(limit, offset)
-	if err != nil {
-		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+	// 要素筛选（零值 = 不过滤）：ip/model 模糊子串，subkey/account/status 精确。
+	qv := r.URL.Query()
+	f := store.LogFilter{
+		IP:        strings.TrimSpace(qv.Get("ip")),
+		Model:     strings.TrimSpace(qv.Get("model")),
+		SubKeyID:  qv.Get("subkey"),
+		AccountID: qv.Get("account"),
+		Status:    qv.Get("status"),
+	}
+	if f.Status != "" && f.Status != "ok" && f.Status != "error" {
+		writeJSON(w, 400, map[string]any{"detail": "status 仅支持 ok / error"})
 		return
 	}
-	total, err := a.store.CountUsageLogs()
+	logs, total, err := a.store.QueryUsageLogs(f, limit, offset)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"detail": err.Error()})
 		return

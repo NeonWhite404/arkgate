@@ -1,8 +1,8 @@
 package provider
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -230,11 +230,11 @@ func TestAnthropicStreamConvert(t *testing.T) {
 // 两种形态都必须得到正确的 /v1/messages 地址（同一账号混布两种协议的前提）。
 func TestAnthropicEndpoint(t *testing.T) {
 	cases := map[string]string{
-		"http://proxy:8000/v1":        "http://proxy:8000/v1/messages",
-		"http://proxy:8000/v1/":       "http://proxy:8000/v1/messages",
-		"https://api.anthropic.com":   "https://api.anthropic.com/v1/messages",
-		"https://api.anthropic.com/":  "https://api.anthropic.com/v1/messages",
-		"http://localhost:9000":       "http://localhost:9000/v1/messages",
+		"http://proxy:8000/v1":       "http://proxy:8000/v1/messages",
+		"http://proxy:8000/v1/":      "http://proxy:8000/v1/messages",
+		"https://api.anthropic.com":  "https://api.anthropic.com/v1/messages",
+		"https://api.anthropic.com/": "https://api.anthropic.com/v1/messages",
+		"http://localhost:9000":      "http://localhost:9000/v1/messages",
 	}
 	for base, want := range cases {
 		if got := anthropicEndpoint(base); got != want {
@@ -342,6 +342,39 @@ func TestOpenAnthropicChatStream(t *testing.T) {
 	}
 }
 
+// TestAnthropicStreamWithoutBlankLines 兼容省略 SSE 空行的上游：每个完整 data JSON
+// 都应单独解析，不把相邻事件拼成 unexpected end/extra JSON 错误。
+func TestAnthropicStreamWithoutBlankLines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":7}}}`+"\n")
+		fmt.Fprint(w, `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}`+"\n")
+		fmt.Fprint(w, `data: {"type":"message_delta","usage":{"input_tokens":7,"output_tokens":2},"delta":{"stop_reason":"end_turn"}}`+"\n")
+		fmt.Fprint(w, `data: {"type":"message_stop"}`+"\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{BaseURL: srv.URL, Key: "k"}
+	st, err := m.OpenAnthropicChatStream(context.Background(), rt, []byte(`{"model":"m","messages":[{"role":"user","content":"x"}]}`), "claude-ep", 64, time.Second)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	var out bytes.Buffer
+	pt, ct, err := st.Pump(&out)
+	if err != nil {
+		t.Fatalf("pump: %v; output=%s", err, out.String())
+	}
+	if pt != 7 || ct != 2 {
+		t.Fatalf("usage: pt=%d ct=%d", pt, ct)
+	}
+	if !strings.Contains(out.String(), "ok") || !strings.HasSuffix(out.String(), "data: [DONE]\n\n") {
+		t.Fatalf("output: %s", out.String())
+	}
+}
+
 // TestAnthropicChatUpstreamError 上游错误体被包装成 OpenAI 结构并保留状态码。
 func TestAnthropicChatUpstreamError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -387,7 +420,7 @@ func TestAnthropicStreamFirstTokenTimeout(t *testing.T) {
 }
 
 // TestAnthropicStreamToolsToOpenAI 出站流式 tools：Anthropic tool_use 块
-//（content_block_start/input_json_delta/stop_reason tool_use）→ OpenAI
+// （content_block_start/input_json_delta/stop_reason tool_use）→ OpenAI
 // tool_calls 增量 chunk（id/name 起始 + arguments 片段 + finish_reason）。
 func TestAnthropicStreamToolsToOpenAI(t *testing.T) {
 	st := &anthropicStreamState{model: "claude-x"}
@@ -465,7 +498,7 @@ func TestAnthropicRequestEmptyContent(t *testing.T) {
 }
 
 // TestAnthropicStreamEmptyToolArgs 出站流式：tool_use 块没有 input_json_delta
-//（空 input）时，块关闭补一段 "{}"，避免 OpenAI 客户端拿到空 arguments。
+// （空 input）时，块关闭补一段 "{}"，避免 OpenAI 客户端拿到空 arguments。
 func TestAnthropicStreamEmptyToolArgs(t *testing.T) {
 	st := &anthropicStreamState{model: "claude-x"}
 	events := []string{

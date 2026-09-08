@@ -9,7 +9,7 @@
 //
 // 供应商类型已从账号下沉到模型（同一上游主机可同时供应 gpt 系与 claude 系），
 // 账号只提供 base_url 与密钥；模型声明协议。非流式走官方 anthropic-sdk-go
-//（认证头 X-Api-Key、anthropic-version、重试与错误类型都由 SDK 负责），
+// （认证头 X-Api-Key、anthropic-version、重试与错误类型都由 SDK 负责），
 // 流式与 OpenAI 路径同架构：自研 HTTP 拿原始 SSE，在 Pump 里逐事件转换——
 // Anthropic 的事件流与 OpenAI chunk 不同构，字节透传不成立，必须重写。
 //
@@ -47,7 +47,7 @@ const DefaultAnthropicMaxTokens = 8192
 const anthropicVersion = "2023-06-01"
 
 // MessageStream 是「已打开、可泵出」的上游流抽象：OpenAI 路径的原样字节流
-//（*Stream）与 Anthropic 路径的转换流（*AnthropicStream）共用同一签名，
+// （*Stream）与 Anthropic 路径的转换流（*AnthropicStream）共用同一签名，
 // 网关据此统一处理首字节重试与用量结算。
 type MessageStream interface {
 	Pump(sink io.Writer) (pt, ct int64, err error)
@@ -58,12 +58,12 @@ type MessageStream interface {
 
 // openAIChatRequest 只解析转换需要的字段（其余字段对 Anthropic 无对应语义，忽略）。
 type openAIChatRequest struct {
-	Messages    []openAIMessage  `json:"messages"`
-	Temperature *float64         `json:"temperature"`
-	TopP        *float64         `json:"top_p"`
-	Stop        json.RawMessage  `json:"stop"` // string 或 []string
-	Tools       json.RawMessage  `json:"tools"`
-	ToolChoice  json.RawMessage  `json:"tool_choice"`
+	Messages    []openAIMessage `json:"messages"`
+	Temperature *float64        `json:"temperature"`
+	TopP        *float64        `json:"top_p"`
+	Stop        json.RawMessage `json:"stop"` // string 或 []string
+	Tools       json.RawMessage `json:"tools"`
+	ToolChoice  json.RawMessage `json:"tool_choice"`
 }
 
 type openAIMessage struct {
@@ -103,22 +103,22 @@ type openAITextPart struct {
 // anthropicMessagesRequest 是发给上游的 /v1/messages 请求体（手拼结构而非
 // SDK 类型化参数：这里的字段集合是我们转换语义的唯一真源）。
 type anthropicMessagesRequest struct {
-	Model         string                `json:"model"`
-	MaxTokens     int64                 `json:"max_tokens"`
-	System        string                `json:"system,omitempty"`
-	Messages      []anthropicMessage    `json:"messages"`
-	Temperature   *float64              `json:"temperature,omitempty"`
-	TopP          *float64              `json:"top_p,omitempty"`
-	StopSequences []string              `json:"stop_sequences,omitempty"`
-	Tools         []anthropicToolDef    `json:"tools,omitempty"`
-	ToolChoice    json.RawMessage       `json:"tool_choice,omitempty"`
-	Stream        bool                  `json:"stream"`
+	Model         string             `json:"model"`
+	MaxTokens     int64              `json:"max_tokens"`
+	System        string             `json:"system,omitempty"`
+	Messages      []anthropicMessage `json:"messages"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	TopP          *float64           `json:"top_p,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Tools         []anthropicToolDef `json:"tools,omitempty"`
+	ToolChoice    json.RawMessage    `json:"tool_choice,omitempty"`
+	Stream        bool               `json:"stream"`
 }
 
 // anthropicToolDef 是 Anthropic 的工具声明（OpenAI parameters ↔ input_schema）。
 type anthropicToolDef struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
@@ -618,17 +618,17 @@ type anthropicStreamState struct {
 
 // openAIChunk 是流式产出的 chat.completion.chunk。
 type openAIChunk struct {
-	ID      string             `json:"id"`
-	Object  string             `json:"object"`
-	Created int64              `json:"created"`
-	Model   string             `json:"model"`
+	ID      string              `json:"id"`
+	Object  string              `json:"object"`
+	Created int64               `json:"created"`
+	Model   string              `json:"model"`
 	Choices []openAIChunkChoice `json:"choices"`
 }
 
 type openAIChunkChoice struct {
-	Index        int          `json:"index"`
+	Index        int              `json:"index"`
 	Delta        openAIChunkDelta `json:"delta"`
-	FinishReason *string      `json:"finish_reason"`
+	FinishReason *string          `json:"finish_reason"`
 }
 
 type openAIChunkDelta struct {
@@ -645,13 +645,13 @@ func (s *anthropicStreamState) emit(choices []openAIChunkChoice) ([]byte, error)
 }
 
 // convertEvent 转换单个 Anthropic SSE 事件，返回要写给客户端的字节
-//（可能为空 = 该事件无需产出）。
+// （可能为空 = 该事件无需产出）。
 func (s *anthropicStreamState) convertEvent(data []byte) ([]byte, error) {
 	var evt struct {
 		Type    string `json:"type"`
 		Message *struct {
-			ID    string `json:"id"`
-			Model string `json:"model"`
+			ID    string         `json:"id"`
+			Model string         `json:"model"`
 			Usage anthropicUsage `json:"usage"`
 		} `json:"message"`
 		Index        int `json:"index"`
@@ -762,11 +762,11 @@ func (s *anthropicStreamState) convertEvent(data []byte) ([]byte, error) {
 // AnthropicStream 是一条已打开（已收到 message_start）的 Anthropic 上游流，
 // Pump 时把事件流转换成 OpenAI chunk 写给 sink。
 type AnthropicStream struct {
-	resp   *http.Response
-	rdr    *bufio.Reader
-	first  []byte // openStream 已缓冲的首个 data 载荷（message_start）
-	st     *anthropicStreamState
-	cancel context.CancelFunc // 首 token 超时场景创建的子 ctx（可能为 nil）
+	resp     *http.Response
+	rdr      *bufio.Reader
+	firstOut []byte // 首个 message_start 已预解析后的 OpenAI chunk
+	st       *anthropicStreamState
+	cancel   context.CancelFunc // 首 token 超时场景创建的子 ctx（可能为 nil）
 }
 
 // Close 关闭流并释放底层资源。
@@ -782,44 +782,101 @@ func (s *AnthropicStream) Close() {
 	}
 }
 
-// Pump 把剩余事件转换为 OpenAI chunk 写给 sink（含已缓冲的首个事件），
+// Pump 把剩余 SSE 事件转换为 OpenAI chunk 写给 sink（首事件已在打开阶段转换），
 // 返回流中提取的用量（input→prompt，output→completion）。
 func (s *AnthropicStream) Pump(sink io.Writer) (pt, ct int64, err error) {
 	st := s.st
-	line := s.first
-	for {
-		if len(line) > 0 {
-			out, cerr := st.convertEvent(line)
-			if cerr != nil {
-				return st.pt, st.ct, cerr
-			}
-			if len(out) > 0 {
-				if _, werr := sink.Write(out); werr != nil {
-					return st.pt, st.ct, werr
-				}
-			}
-			if st.done {
-				return st.pt, st.ct, nil
-			}
-		}
-		line, err = s.rdr.ReadBytes('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// 上游没发 message_stop 就断流：与 OpenAI 路径对齐，
-				// 不伪造收尾帧，原样结束（已完成的内容有效）。
-				return st.pt, st.ct, nil
-			}
+	if len(s.firstOut) > 0 {
+		if _, err := sink.Write(s.firstOut); err != nil {
 			return st.pt, st.ct, err
 		}
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue // event: / 注释 / 空行
+	}
+	for {
+		frame, rerr := readSSEFrame(s.rdr)
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return st.pt, st.ct, nil
+			}
+			return st.pt, st.ct, rerr
 		}
-		payload := bytes.TrimSpace(line[len("data:"):])
+		payload := sseFrameData(frame)
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
 		}
-		line = payload
+		out, cerr := st.convertEvent(payload)
+		if cerr != nil {
+			return st.pt, st.ct, cerr
+		}
+		if len(out) > 0 {
+			if _, werr := sink.Write(out); werr != nil {
+				return st.pt, st.ct, werr
+			}
+		}
+		if st.done {
+			return st.pt, st.ct, nil
+		}
 	}
+}
+
+// readSSEFrame 读取一个完整 SSE 事件帧。data 允许跨多行，按 SSE 规范用换行
+// 拼接后再交给 JSON 解析，避免把半截 JSON 提前送入 Unmarshal。
+func readSSEFrame(r *bufio.Reader) ([]byte, error) {
+	var frame []byte
+	var data []byte
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			frame = append(frame, line...)
+			trimmed := bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
+			if bytes.HasPrefix(trimmed, []byte("data:")) {
+				value := bytes.TrimPrefix(trimmed, []byte("data:"))
+				value = bytes.TrimPrefix(value, []byte(" "))
+				data = append(data, value...)
+				// 部分兼容实现省略事件间空行；一条完整 JSON data 行仍可视为事件边界。
+				if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) || json.Valid(bytes.TrimSpace(data)) {
+					return frame, nil
+				}
+				data = append(data, '\n')
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(bytes.TrimSpace(frame)) == 0 {
+				return nil, io.EOF
+			}
+			if errors.Is(err, io.EOF) {
+				return frame, nil
+			}
+			return nil, err
+		}
+		if len(line) == 1 && line[0] == '\n' {
+			return frame, nil
+		}
+		if len(line) >= 2 && line[len(line)-2] == '\r' && line[len(line)-1] == '\n' && len(line) == 2 {
+			return frame, nil
+		}
+	}
+}
+
+func sseFrameData(frame []byte) []byte {
+	var data []byte
+	for len(frame) > 0 {
+		line := frame
+		if i := bytes.IndexByte(frame, '\n'); i >= 0 {
+			line, frame = frame[:i], frame[i+1:]
+		} else {
+			frame = nil
+		}
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if bytes.HasPrefix(line, []byte("data:")) {
+			value := bytes.TrimPrefix(line, []byte("data:"))
+			value = bytes.TrimPrefix(value, []byte(" "))
+			if len(data) > 0 {
+				data = append(data, '\n')
+			}
+			data = append(data, value...)
+		}
+	}
+	return bytes.TrimSpace(data)
 }
 
 // anthropicEndpoint 解析 {base}/v1/messages 完整 URL。与 SDK 的相对路径
@@ -910,7 +967,7 @@ func (m *Manager) AnthropicChat(ctx context.Context, rt Route, down []byte, upst
 }
 
 // OpenAnthropicChatStream 打开 Anthropic 协议的流式请求并等待首个数据事件
-//（message_start）。成功返回后未向客户端写过任何字节，失败可换叶子重试；
+// （message_start）。成功返回后未向客户端写过任何字节，失败可换叶子重试；
 // 首字节超时语义与 OpenAI 路径一致（CAS 抢占，宁弃流不杀好流）。
 func (m *Manager) OpenAnthropicChatStream(ctx context.Context, rt Route, down []byte, upstreamModel string,
 	maxTokens int64, firstTokenTimeout time.Duration) (_ *AnthropicStream, err error) {
@@ -963,26 +1020,24 @@ func (m *Manager) OpenAnthropicChatStream(ctx context.Context, rt Route, down []
 		return nil, &HTTPError{Code: resp.StatusCode, Body: openAIErrorBody(AnthropicErrorMessage(respBody, "上游返回 "+strconv.Itoa(resp.StatusCode)))}
 	}
 
-	// 等首个 data 行（message_start）：期间的任何失败都可安全重试。
+	// 等首个完整 SSE 事件（message_start）：期间的任何失败都可安全重试。
 	reader := bufio.NewReader(resp.Body)
 	var first []byte
 	for {
-		line, rerr := reader.ReadBytes('\n')
-		if rerr != nil && len(bytes.TrimSpace(line)) == 0 {
+		frame, rerr := readSSEFrame(reader)
+		if rerr != nil {
 			resp.Body.Close()
 			if timer != nil && fired.Load() {
 				return nil, fmt.Errorf("%w（等待 %s 无输出）", ErrFirstToken, firstTokenTimeout)
 			}
 			return nil, fmt.Errorf("上游未返回任何数据: %w", rerr)
 		}
-		if bytes.HasPrefix(line, []byte("data:")) {
-			payload := bytes.TrimSpace(line[len("data:"):])
-			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
-				first = payload
-				break
-			}
+		payload := sseFrameData(frame)
+		if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+			first = payload
+			break
 		}
-		// event: 行 / ping 注释行：继续读（仍在首 token 等待窗口内）
+		// ping/comment/空事件：继续读（仍在首 token 等待窗口内）。
 		if timer != nil && fired.Load() {
 			resp.Body.Close()
 			return nil, fmt.Errorf("%w（等待 %s 无输出）", ErrFirstToken, firstTokenTimeout)
@@ -999,9 +1054,10 @@ func (m *Manager) OpenAnthropicChatStream(ctx context.Context, rt Route, down []
 	}
 	st := &anthropicStreamState{model: upstreamModel}
 	// 首事件必须是 message_start（错误事件在 convertEvent 里转为错误返回）。
-	if _, err := st.convertEvent(first); err != nil {
+	firstOut, err := st.convertEvent(first)
+	if err != nil {
 		resp.Body.Close()
 		return nil, err
 	}
-	return &AnthropicStream{resp: resp, rdr: reader, first: first, st: st, cancel: cancel}, nil
+	return &AnthropicStream{resp: resp, rdr: reader, firstOut: firstOut, st: st, cancel: cancel}, nil
 }

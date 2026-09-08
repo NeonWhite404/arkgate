@@ -60,8 +60,8 @@ type anthropicInboundBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 	// tool_use（assistant 历史轮）
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input"`
 	// tool_result（user 工具结果回填）
 	ToolUseID string          `json:"tool_use_id"`
@@ -74,15 +74,15 @@ type anthropicInboundBlock struct {
 // openAIInboundChatRequest 是转换产出的 OpenAI chat 请求体。model 字段填
 // 客户端请求的易读名，转发前由 prepareBody 统一替换为上游标识。
 type openAIInboundChatRequest struct {
-	Model       string               `json:"model"`
-	Messages    []openAIInboundMsg   `json:"messages"`
-	MaxTokens   *int64               `json:"max_tokens,omitempty"`
-	Temperature *float64             `json:"temperature,omitempty"`
-	TopP        *float64             `json:"top_p,omitempty"`
-	Stop        []string             `json:"stop,omitempty"`
-	Tools       []openAIInboundTool  `json:"tools,omitempty"`
-	ToolChoice  any                  `json:"tool_choice,omitempty"`
-	Stream      bool                 `json:"stream"`
+	Model       string              `json:"model"`
+	Messages    []openAIInboundMsg  `json:"messages"`
+	MaxTokens   *int64              `json:"max_tokens,omitempty"`
+	Temperature *float64            `json:"temperature,omitempty"`
+	TopP        *float64            `json:"top_p,omitempty"`
+	Stop        []string            `json:"stop,omitempty"`
+	Tools       []openAIInboundTool `json:"tools,omitempty"`
+	ToolChoice  any                 `json:"tool_choice,omitempty"`
+	Stream      bool                `json:"stream"`
 }
 
 type openAIInboundMsg struct {
@@ -93,10 +93,10 @@ type openAIInboundMsg struct {
 }
 
 type openAIInboundTool struct {
-	Type     string   `json:"type"`
+	Type     string `json:"type"`
 	Function struct {
-		Name        string        `json:"name"`
-		Description string        `json:"description,omitempty"`
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
 		Parameters  json.RawMessage `json:"parameters"`
 	} `json:"function"`
 }
@@ -397,7 +397,7 @@ func AnthropicResponseFromOpenAI(raw []byte, fallbackModel string) ([]byte, *Tex
 }
 
 // openaiFinishToStopReason 把 OpenAI finish_reason 映射为 Anthropic stop_reason
-//（参照 cc-switch：Anthropic 没有 content_filter，统一落 end_turn）。
+// （参照 cc-switch：Anthropic 没有 content_filter，统一落 end_turn）。
 func openaiFinishToStopReason(finish string, hasToolUse bool) string {
 	if hasToolUse {
 		return "tool_use"
@@ -557,7 +557,7 @@ func (m *Manager) OpenAnthropicNativeStream(ctx context.Context, rt Route, down 
 // message_start 带 input_tokens，message_delta 带 output_tokens。
 func anthropicSSESniff(payload []byte) (pt, ct int64, ok bool) {
 	var evt struct {
-		Type    string         `json:"type"`
+		Type    string `json:"type"`
 		Message *struct {
 			Usage anthropicUsage `json:"usage"`
 		} `json:"message"`
@@ -573,7 +573,7 @@ func anthropicSSESniff(payload []byte) (pt, ct int64, ok bool) {
 		}
 	case "message_delta":
 		if evt.Usage != nil {
-			return 0, evt.Usage.OutputTokens, true
+			return evt.Usage.InputTokens, evt.Usage.OutputTokens, true
 		}
 	}
 	return 0, 0, false
@@ -611,10 +611,10 @@ type openAIToAnthropicState struct {
 	nonToolIndex int
 	nonToolOpen  bool
 	// 工具块：openai tool index → anthropic 块号与懒启动状态。
-	nextBlockIndex  int
-	toolBlocks      map[int]*toolBlockState
-	pendingDelta    *anthropicDeltaPayload // message_delta 缓存（usage 完整后再发）
-	deltaEmitted    bool
+	nextBlockIndex int
+	toolBlocks     map[int]*toolBlockState
+	pendingDelta   *anthropicDeltaPayload // message_delta 缓存（usage 完整后再发）
+	deltaEmitted   bool
 }
 
 type toolBlockState struct {
@@ -644,35 +644,39 @@ func (s *anthropicFromOpenAIStream) Pump(sink io.Writer) (pt, ct int64, err erro
 
 func (s *anthropicFromOpenAIStream) pumpLines(sink io.Writer) (int64, int64, error) {
 	st, state := s.st, s.s
-	line := st.first
-	for {
-		if len(line) > 0 {
-			if bytes.HasPrefix(line, []byte("data:")) {
-				payload := bytes.TrimSpace(line[len("data:"):])
-				if bytes.Equal(payload, []byte("[DONE]")) {
-					return state.finalize(sink)
-				}
-				if len(payload) > 0 {
-					done, err := state.handleChunk(payload, sink)
-					if err != nil {
-						return state.pt, state.ct, err
-					}
-					if done {
-						return state.pt, state.ct, nil
-					}
+	if len(st.first) > 0 {
+		if bytes.HasPrefix(st.first, []byte("data:")) {
+			payload := bytes.TrimSpace(st.first[len("data:"):])
+			if !bytes.Equal(payload, []byte("[DONE]")) && len(payload) > 0 {
+				done, err := state.handleChunk(payload, sink)
+				if err != nil || done {
+					return state.pt, state.ct, err
 				}
 			}
-			// 非 data 行（注释/空行）跳过
 		}
-		next, rerr := st.rdr.ReadBytes('\n')
+	}
+	for {
+		frame, rerr := readSSEFrame(st.rdr)
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
-				// 未收到 [DONE]：补发缓存的 message_delta/message_stop。
 				return state.finalize(sink)
 			}
 			return state.pt, state.ct, rerr
 		}
-		line = next
+		payload := sseFrameData(frame)
+		if len(payload) == 0 {
+			continue
+		}
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			return state.finalize(sink)
+		}
+		done, err := state.handleChunk(payload, sink)
+		if err != nil {
+			return state.pt, state.ct, err
+		}
+		if done {
+			return state.pt, state.ct, nil
+		}
 	}
 }
 
@@ -731,8 +735,8 @@ func (s *openAIToAnthropicState) handleChunk(payload []byte, sink io.Writer) (bo
 			"type": "message_start",
 			"message": map[string]any{
 				"id": s.id, "type": "message", "role": "assistant", "model": s.model,
-				"content":      []any{},
-				"stop_reason":  nil, "stop_sequence": nil,
+				"content":     []any{},
+				"stop_reason": nil, "stop_sequence": nil,
 				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 			},
 		})); err != nil {
@@ -891,7 +895,7 @@ func (s *openAIToAnthropicState) finalize(sink io.Writer) (int64, int64, error) 
 	}
 	delta.Usage = anthropicUsage{InputTokens: s.pt, OutputTokens: s.ct}
 	if err := writeSSE(sink, anthropicSSEEvent("message_delta", map[string]any{
-		"type": "message_delta",
+		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": delta.StopReason, "stop_sequence": nil},
 		"usage": delta.Usage,
 	})); err != nil {
@@ -913,8 +917,8 @@ func writeSSE(sink io.Writer, frame []byte) error {
 }
 
 // OpenChatStreamAsAnthropic 打开 OpenAI 上游流并包装成 Anthropic 事件流
-//（/v1/messages + OpenAI 协议上游的流式路径）。down 是已转换的 OpenAI 请求体
-//（prepareStreamBody 会强制 stream + include_usage）。
+// （/v1/messages + OpenAI 协议上游的流式路径）。down 是已转换的 OpenAI 请求体
+// （prepareStreamBody 会强制 stream + include_usage）。
 func (m *Manager) OpenChatStreamAsAnthropic(ctx context.Context, rt Route, down []byte,
 	upstreamModel string, firstTokenTimeout time.Duration) (*anthropicFromOpenAIStream, error) {
 	body, err := prepareStreamBody(down, upstreamModel)
@@ -928,4 +932,3 @@ func (m *Manager) OpenChatStreamAsAnthropic(ctx context.Context, rt Route, down 
 	return &anthropicFromOpenAIStream{st: st,
 		s: &openAIToAnthropicState{toolBlocks: map[int]*toolBlockState{}}}, nil
 }
-

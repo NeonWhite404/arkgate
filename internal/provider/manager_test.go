@@ -84,6 +84,93 @@ func TestChatPassthroughAndModelSwap(t *testing.T) {
 	}
 }
 
+// TestChatMaxTokensCompatibilityRetry 覆盖新模型只接受 max_completion_tokens 的兼容路径：
+// 第一次保持原始 max_tokens，只有上游明确返回兼容提示后才改名重试。
+func TestChatMaxTokensCompatibilityRetry(t *testing.T) {
+	var calls int
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		var got map[string]any
+		_ = json.Unmarshal(b, &got)
+		bodies = append(bodies, got)
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"model":"ep-new","usage":{"prompt_tokens":2,"completion_tokens":1},"choices":[]}`)
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "openai"), BaseURL: srv.URL, Key: "k"}
+	raw, usage, err := m.Chat(context.Background(), rt, []byte(`{"model":"m","max_tokens":8}`), "ep-new", time.Second)
+	if err != nil {
+		t.Fatalf("chat compatibility retry: %v", err)
+	}
+	if calls != 2 || len(bodies) != 2 {
+		t.Fatalf("upstream calls = %d, bodies = %d; want 2", calls, len(bodies))
+	}
+	if bodies[0]["max_tokens"] != float64(8) {
+		t.Fatalf("first request max_tokens = %v", bodies[0]["max_tokens"])
+	}
+	if _, ok := bodies[0]["max_completion_tokens"]; ok {
+		t.Fatal("first request must not add max_completion_tokens")
+	}
+	if bodies[1]["max_completion_tokens"] != float64(8) {
+		t.Fatalf("retry max_completion_tokens = %v", bodies[1]["max_completion_tokens"])
+	}
+	if _, ok := bodies[1]["max_tokens"]; ok {
+		t.Fatal("retry must remove max_tokens")
+	}
+	if usage == nil || usage.PromptTokens != 2 || usage.CompletionTokens != 1 || !strings.Contains(string(raw), "ep-new") {
+		t.Fatalf("response = %s usage = %+v", raw, usage)
+	}
+}
+
+// TestOpenChatStreamMaxTokensCompatibilityRetry 覆盖流式 chat 的同一兼容策略。
+func TestOpenChatStreamMaxTokensCompatibilityRetry(t *testing.T) {
+	var calls int
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		var got map[string]any
+		_ = json.Unmarshal(b, &got)
+		bodies = append(bodies, got)
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}`)
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "openai"), BaseURL: srv.URL, Key: "k"}
+	st, err := m.OpenChatStream(context.Background(), rt, []byte(`{"model":"m","max_tokens":8,"stream":true}`), "ep-new", time.Second)
+	if err != nil {
+		t.Fatalf("open stream compatibility retry: %v", err)
+	}
+	defer st.Close()
+	var sink strings.Builder
+	pt, ct, err := st.Pump(&sink)
+	if err != nil || pt != 2 || ct != 1 {
+		t.Fatalf("pump: pt=%d ct=%d err=%v", pt, ct, err)
+	}
+	if calls != 2 || bodies[1]["max_completion_tokens"] != float64(8) {
+		t.Fatalf("stream retry calls=%d body=%v", calls, bodies)
+	}
+	if _, ok := bodies[1]["max_tokens"]; ok {
+		t.Fatal("stream retry must remove max_tokens")
+	}
+}
+
 // TestBaseURLKeepsVersionSegment：base URL 带 /v1 版本段时相对路径拼接必须保留它。
 func TestBaseURLKeepsVersionSegment(t *testing.T) {
 	var gotPath string

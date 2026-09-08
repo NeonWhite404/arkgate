@@ -515,6 +515,67 @@ func TestUsageLogPagination(t *testing.T) {
 	}
 }
 
+// TestUsageLogFiltering 锁定管理日志筛选：IP/模型按子串匹配，模型同时覆盖
+// requested_model 与实际 model，状态/账号/子 Key 精确过滤，total 与筛选页一致。
+func TestUsageLogFiltering(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	logs := []model.UsageLog{
+		{SubKeyID: "sk-a", AccountID: "acc-a", ClientIP: "192.0.2.10", RequestedModel: "route-small", Model: "gpt-4o-mini", Status: "ok"},
+		{SubKeyID: "sk-a", AccountID: "acc-b", ClientIP: "192.0.2.11", RequestedModel: "gpt-4o", Model: "gpt-4o", Status: "error"},
+		{SubKeyID: "sk-b", AccountID: "acc-a", ClientIP: "198.51.100.7", RequestedModel: "claude", Model: "claude", Status: "ok"},
+	}
+	for i := range logs {
+		if err := s.AddUsageLog(&logs[i]); err != nil {
+			t.Fatalf("add log %d: %v", i, err)
+		}
+	}
+
+	cases := []struct {
+		name  string
+		f     LogFilter
+		want  int
+		first string
+	}{
+		{"ip", LogFilter{IP: "192.0.2.1"}, 2, "gpt-4o"},
+		{"actual model", LogFilter{Model: "gpt-4o-mini"}, 1, "gpt-4o-mini"},
+		{"requested model", LogFilter{Model: "route-small"}, 1, "gpt-4o-mini"},
+		{"status and account", LogFilter{Status: "ok", AccountID: "acc-a"}, 2, "claude"},
+		{"subkey", LogFilter{SubKeyID: "sk-a"}, 2, "gpt-4o"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, total, err := s.QueryUsageLogs(tc.f, 1, 0)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if total != int64(tc.want) || len(got) != min(tc.want, 1) {
+				t.Fatalf("got len=%d total=%d, want len=%d total=%d", len(got), total, min(tc.want, 1), tc.want)
+			}
+			if got[0].Model != tc.first {
+				t.Fatalf("first model=%q, want %q", got[0].Model, tc.first)
+			}
+		})
+	}
+	// LIKE 元字符按字面值匹配，不会把筛选扩大成全表。
+	got, total, err := s.QueryUsageLogs(LogFilter{IP: "%"}, 10, 0)
+	if err != nil || total != 0 || len(got) != 0 {
+		t.Fatalf("escaped wildcard filter: len=%d total=%d err=%v", len(got), total, err)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // modelLog 仅为 TestQueryUsage 服务的构造辅助（返回一条日志）。
 func modelLog(ts int64, name, sub, acc string, pt, ct int64, status string, cost float64) model.UsageLog {
 	return model.UsageLog{

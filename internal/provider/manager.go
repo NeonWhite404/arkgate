@@ -100,6 +100,13 @@ func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel
 		return nil, nil, err
 	}
 	raw, err := m.post(ctx, rt, "chat/completions", body, timeout)
+	if err != nil && isMaxTokensCompatibilityError(err) {
+		// 部分新模型拒绝 max_tokens，只接受 max_completion_tokens。
+		// 仅在上游明确给出该建议时重试，旧模型保持原始透传行为。
+		if compatBody, changed := useMaxCompletionTokens(body); changed {
+			raw, err = m.post(ctx, rt, "chat/completions", compatBody, timeout)
+		}
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -355,7 +362,14 @@ func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, ups
 	if err != nil {
 		return nil, err
 	}
-	return m.openStream(ctx, rt, "chat/completions", body, firstTokenTimeout, chatUsageFromChunk)
+	st, err := m.openStream(ctx, rt, "chat/completions", body, firstTokenTimeout, chatUsageFromChunk)
+	if err != nil && isMaxTokensCompatibilityError(err) {
+		if compatBody, changed := useMaxCompletionTokens(body); changed {
+			// 与非流式一致：只对明确的 max_tokens 兼容错误重试一次。
+			st, err = m.openStream(ctx, rt, "chat/completions", compatBody, firstTokenTimeout, chatUsageFromChunk)
+		}
+	}
+	return st, err
 }
 
 // OpenResponsesStream 打开 responses 流（从 response.completed 提取用量）。
@@ -448,7 +462,7 @@ func chatUsageFromChunk(payload []byte) (int64, int64, bool) {
 // responsesUsageFromEvent 从 response.completed 事件提取用量。
 func responsesUsageFromEvent(payload []byte) (int64, int64, bool) {
 	var parsed struct {
-		Type string `json:"type"`
+		Type     string `json:"type"`
 		Response *struct {
 			Usage *struct {
 				InputTokens  int64 `json:"input_tokens"`

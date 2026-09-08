@@ -767,41 +767,96 @@ func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	return l, nil
 }
 
-// ListUsageLogs 按 id 倒序分页读取日志。limit 超范围时回落 200，
-// offset 为负按 0 处理（分页由管理端传入，非法值不该让查询失败）。
-func (s *Store) ListUsageLogs(limit, offset int) ([]*model.UsageLog, error) {
+// LogFilter 请求日志筛选条件（零值字段 = 不过滤）。
+// IP 与 Model 为模糊子串匹配（LIKE 特殊字符转义，用户输入不当通配符处理）；
+// Model 命中「实际模型」或「请求模型」任一即算（路由/fallback 前后的名字都能搜到）；
+// 其余为精确匹配。
+type LogFilter struct {
+	IP        string
+	Model     string
+	SubKeyID  string
+	AccountID string
+	Status    string // ok | error
+}
+
+// likeEscape 转义 LIKE 的模式特殊字符（含转义符自身），使筛选输入按字面子串匹配。
+func likeEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// logFilterWhere 构造 WHERE 子句与绑定参数（列表与计数共用，保证翻页与总数一致）。
+func logFilterWhere(f LogFilter) (string, []any) {
+	where := "1=1"
+	var args []any
+	if f.IP != "" {
+		where += ` AND client_ip LIKE ? ESCAPE '\'`
+		args = append(args, "%"+likeEscape(f.IP)+"%")
+	}
+	if f.Model != "" {
+		where += ` AND (model LIKE ? ESCAPE '\' OR requested_model LIKE ? ESCAPE '\')`
+		p := "%" + likeEscape(f.Model) + "%"
+		args = append(args, p, p)
+	}
+	if f.SubKeyID != "" {
+		where += " AND subkey_id = ?"
+		args = append(args, f.SubKeyID)
+	}
+	if f.AccountID != "" {
+		where += " AND account_id = ?"
+		args = append(args, f.AccountID)
+	}
+	if f.Status != "" {
+		where += " AND status = ?"
+		args = append(args, f.Status)
+	}
+	return where, args
+}
+
+// QueryUsageLogs 按筛选条件、id 倒序分页读取日志，并返回满足条件的总条数
+// （一次调用同时给出 items 与 total，二者共用同一 WHERE）。
+// limit 超范围时回落 200，offset 为负按 0 处理（分页由管理端传入，非法值不该让查询失败）。
+func (s *Store) QueryUsageLogs(f LogFilter, limit, offset int) ([]*model.UsageLog, int64, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	if offset < 0 {
 		offset = 0
 	}
+	where, args := logFilterWhere(f)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	var total int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_logs WHERE `+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
 	rows, err := s.db.Query(
-		`SELECT `+usageLogCols+` FROM usage_logs ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+		`SELECT `+usageLogCols+` FROM usage_logs WHERE `+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
+		append(args, limit, offset)...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	out := []*model.UsageLog{}
 	for rows.Next() {
 		l, err := scanUsageLog(rows)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, l)
 	}
-	return out, rows.Err()
+	return out, total, rows.Err()
+}
+
+// ListUsageLogs 按 id 倒序分页读取全部日志（无筛选）。
+func (s *Store) ListUsageLogs(limit, offset int) ([]*model.UsageLog, error) {
+	logs, _, err := s.QueryUsageLogs(LogFilter{}, limit, offset)
+	return logs, err
 }
 
 // CountUsageLogs 返回日志总条数，供分页器算总页数。
 func (s *Store) CountUsageLogs() (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var n int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_logs`).Scan(&n)
-	return n, err
+	_, total, err := s.QueryUsageLogs(LogFilter{}, 1, 0)
+	return total, err
 }
 
 // CountModels / CountSubKeys 返回模型/子 Key 数量。总览页只需要计数，
