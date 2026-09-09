@@ -142,6 +142,71 @@ func useMaxCompletionTokens(body []byte) ([]byte, bool) {
 	return out, true
 }
 
+// isThinkingCompatibilityError 识别上游明确要求用 reasoning_effort 替代 thinking
+// 的参数错误（OpenAI 新模型不接受 Ark/DeepSeek 风格的 thinking 开关）。
+// 只匹配错误体同时提到 thinking 与 reasoning_effort 的明确提示，避免误伤其它 400。
+func isThinkingCompatibilityError(err error) bool {
+	he, ok := AsHTTPError(err)
+	if !ok || he.Code != 400 {
+		return false
+	}
+	body := strings.ToLower(string(he.Body))
+	return strings.Contains(body, "thinking") &&
+		strings.Contains(body, "reasoning_effort") &&
+		(strings.Contains(body, "not supported") || strings.Contains(body, "unsupported"))
+}
+
+// thinkingEffort 把 thinking.type 映射为 reasoning_effort。遵循 OpenAI 规范中
+// reasoning_effort 的合法取值（none/minimal/low/medium/high/xhigh/max）：
+// 同名值原样透传，不做降级或换算；仅 Ark/DeepSeek 风格的布尔开关
+// （enabled/disabled/auto）做明确的语义桥接。
+func thinkingEffort(raw json.RawMessage) string {
+	var t struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &t) != nil {
+		return ""
+	}
+	v := strings.ToLower(strings.TrimSpace(t.Type))
+	switch v {
+	// reasoning_effort 自身的合法取值：原样透传。
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return v
+	// Ark/DeepSeek 布尔开关：enabled/auto/disabled 的明确语义。
+	case "enabled":
+		return "high"
+	case "auto":
+		return "medium"
+	case "disabled":
+		return "none"
+	}
+	return ""
+}
+
+// useReasoningEffort 把请求体的 thinking 字段迁移为 reasoning_effort。
+// thinking 无法识别时仅删除该字段（不再发送上游拒绝的参数）。
+func useReasoningEffort(body []byte) ([]byte, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return body, false
+	}
+	tv, hasThinking := raw["thinking"]
+	if !hasThinking {
+		return body, false
+	}
+	delete(raw, "thinking")
+	if effort := thinkingEffort(tv); effort != "" {
+		if b, merr := json.Marshal(effort); merr == nil {
+			raw["reasoning_effort"] = b
+		}
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // prepareStreamBody 在 prepareBody 基础上强制流式 + include_usage
 // （用量从 final chunk 提取；保留下游 stream_options 的其它字段）。
 func prepareStreamBody(down []byte, upstreamModel string) ([]byte, error) {

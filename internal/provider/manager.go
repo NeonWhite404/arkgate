@@ -104,6 +104,14 @@ func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel
 		// 部分新模型拒绝 max_tokens，只接受 max_completion_tokens。
 		// 仅在上游明确给出该建议时重试，旧模型保持原始透传行为。
 		if compatBody, changed := useMaxCompletionTokens(body); changed {
+			body = compatBody
+			raw, err = m.post(ctx, rt, "chat/completions", body, timeout)
+		}
+	}
+	if err != nil && isThinkingCompatibilityError(err) {
+		// 部分 OpenAI 兼容上游不接受 Ark/DeepSeek 风格的 thinking 开关，
+		// 明确建议改用 reasoning_effort 时迁移该字段后重试一次。
+		if compatBody, changed := useReasoningEffort(body); changed {
 			raw, err = m.post(ctx, rt, "chat/completions", compatBody, timeout)
 		}
 	}
@@ -366,6 +374,13 @@ func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, ups
 	if err != nil && isMaxTokensCompatibilityError(err) {
 		if compatBody, changed := useMaxCompletionTokens(body); changed {
 			// 与非流式一致：只对明确的 max_tokens 兼容错误重试一次。
+			body = compatBody
+			st, err = m.openStream(ctx, rt, "chat/completions", body, firstTokenTimeout, chatUsageFromChunk)
+		}
+	}
+	if err != nil && isThinkingCompatibilityError(err) {
+		// 流式同样兼容 thinking → reasoning_effort 的参数迁移。
+		if compatBody, changed := useReasoningEffort(body); changed {
 			st, err = m.openStream(ctx, rt, "chat/completions", compatBody, firstTokenTimeout, chatUsageFromChunk)
 		}
 	}

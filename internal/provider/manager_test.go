@@ -171,6 +171,79 @@ func TestOpenChatStreamMaxTokensCompatibilityRetry(t *testing.T) {
 	}
 }
 
+// TestChatThinkingCompatibilityRetry 覆盖 thinking 不被上游接受时的迁移：
+// 第一次保留 thinking，仅当上游明确建议 reasoning_effort 时才删除并迁移。
+func TestChatThinkingCompatibilityRetry(t *testing.T) {
+	var calls int
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		var got map[string]any
+		_ = json.Unmarshal(b, &got)
+		bodies = append(bodies, got)
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"'thinking' is not supported on /v1/chat/completions and was not applied. Use 'reasoning_effort' (or 'reasoning.effort') to control thinking.","type":"invalid_request_error","param":"thinking","code":"unsupported_parameter"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"model":"ep-new","usage":{"prompt_tokens":2,"completion_tokens":1},"choices":[]}`)
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+	raw, usage, err := m.Chat(context.Background(), rt, []byte(`{"model":"m","thinking":{"type":"enabled"}}`), "ep-new", time.Second)
+	if err != nil {
+		t.Fatalf("chat thinking compatibility retry: %v", err)
+	}
+	if calls != 2 || len(bodies) != 2 {
+		t.Fatalf("upstream calls = %d, bodies = %d; want 2", calls, len(bodies))
+	}
+	if bodies[0]["thinking"] == nil {
+		t.Fatal("first request must keep thinking")
+	}
+	if _, ok := bodies[0]["reasoning_effort"]; ok {
+		t.Fatal("first request must not add reasoning_effort")
+	}
+	if bodies[1]["reasoning_effort"] != "high" {
+		t.Fatalf("retry reasoning_effort = %v", bodies[1]["reasoning_effort"])
+	}
+	if _, ok := bodies[1]["thinking"]; ok {
+		t.Fatal("retry must drop thinking")
+	}
+	if usage == nil || usage.PromptTokens != 2 || usage.CompletionTokens != 1 || !strings.Contains(string(raw), "ep-new") {
+		t.Fatalf("response = %s usage = %+v", raw, usage)
+	}
+}
+
+// TestThinkingEffortMapping 锁定 thinking.type 到 reasoning_effort 的映射，
+// 严格遵循 OpenAI 规范枚举（none/minimal/low/medium/high/xhigh/max 原样透传，
+// 布尔开关 enabled/auto/disabled 做明确桥接）。
+func TestThinkingEffortMapping(t *testing.T) {
+	cases := map[string]string{
+		`{"type":"none"}`:     "none",
+		`{"type":"minimal"}`:  "minimal",
+		`{"type":"low"}`:      "low",
+		`{"type":"medium"}`:   "medium",
+		`{"type":"high"}`:     "high",
+		`{"type":"xhigh"}`:    "xhigh",
+		`{"type":"max"}`:      "max",
+		`{"type":"enabled"}`:  "high",
+		`{"type":"auto"}`:     "medium",
+		`{"type":"disabled"}`: "none",
+	}
+	for raw, want := range cases {
+		if got := thinkingEffort(json.RawMessage(raw)); got != want {
+			t.Fatalf("thinkingEffort(%s) = %q, want %q", raw, got, want)
+		}
+	}
+	if got := thinkingEffort(json.RawMessage(`{"type":"unknown"}`)); got != "" {
+		t.Fatalf("unknown type must map to empty, got %q", got)
+	}
+}
+
 // TestBaseURLKeepsVersionSegment：base URL 带 /v1 版本段时相对路径拼接必须保留它。
 func TestBaseURLKeepsVersionSegment(t *testing.T) {
 	var gotPath string
