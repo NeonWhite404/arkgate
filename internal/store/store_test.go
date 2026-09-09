@@ -87,7 +87,7 @@ func TestStoreBasics(t *testing.T) {
 		SubKeyID: "s1", AccountID: "a1", Provider: "custom", EndpointID: "e1",
 		RequestedModel: "img", Model: "img", EP: "doubao-seedream-4-0",
 		Modality: model.ModelTypeImage, ImageCount: 2, Cost: 1.0, Status: "ok",
-		ClientIP: "198.51.100.7",
+		LatencyMs: 812, FirstTokenMs: 91, ClientIP: "198.51.100.7",
 	}); err != nil {
 		t.Fatalf("add log: %v", err)
 	}
@@ -100,6 +100,9 @@ func TestStoreBasics(t *testing.T) {
 	}
 	if logs[0].Cost != 1.0 {
 		t.Fatalf("log cost = %v", logs[0].Cost)
+	}
+	if logs[0].LatencyMs != 812 || logs[0].FirstTokenMs != 91 {
+		t.Fatalf("log timing = %d/%d, want 812/91", logs[0].LatencyMs, logs[0].FirstTokenMs)
 	}
 	if logs[0].ClientIP != "198.51.100.7" {
 		t.Fatalf("log client ip = %q", logs[0].ClientIP)

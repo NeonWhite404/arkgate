@@ -194,7 +194,7 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 
 // applyRouter 把虚拟路由模型（type=router）解析成承接请求的真实目标模型名。
 // 非路由模型原样返回，调用方无感。tokens 为调用方按请求形态估算的输入长度
-//（chat/responses/anthropic 各有估算器）。
+// （chat/responses/anthropic 各有估算器）。
 //
 // 白名单语义：子 Key 的 AllowedModels 只需包含路由名本身——解析出的目标由网关
 // 补进传给 balancer 的白名单副本，否则「只授权了路由名」的子 Key 会在 Select
@@ -213,8 +213,9 @@ func (g *Gateway) applyRouter(name string, tokens int64, allowModels []string) (
 
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
 // ip 为下游调用方地址（由各链路入口用 clientIP(r) 取一次后传入）。
+// firstTokenMs 为流式首字耗时（非流式/失败传 0）。
 func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
-	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, start time.Time) {
+	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time) {
 	ok := ferr == nil
 	// 客户端请求自身导致的失败（上下文超限等）：统计/日志照记，但不计入端点熔断。
 	clientErr := !ok && provider.IsRequestFault(ferr)
@@ -236,6 +237,7 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 		ImageCount:       images,
 		Status:           "ok",
 		LatencyMs:        time.Since(start).Milliseconds(),
+		FirstTokenMs:     firstTokenMs,
 		ClientIP:         ip,
 	}
 	if !ok {
@@ -407,7 +409,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -430,7 +432,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start)
 			// 透传上游真实状态码与 body。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -441,7 +443,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		// 直接以 400 收尾，不进入重试循环（recordAttempt 也不计端点熔断）。
 		var convErr *provider.ConversionError
 		if errors.As(ferr, &convErr) {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start)
 			writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", ferr.Error()))
 			return
 		}
@@ -449,7 +451,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -539,7 +541,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -551,7 +553,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -561,7 +563,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -635,7 +637,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, 0, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -649,7 +651,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 				images = usage.Count
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, 0, start)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -659,7 +661,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, start)
+		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, 0, start)
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -711,7 +713,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, derr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, derr, 0, start)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -731,17 +733,18 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			// 协议转换拒绝（请求内容问题）：不重试，直接 400（响应头尚未提交）。
 			var convErr *provider.ConversionError
 			if errors.As(oerr, &convErr) {
-				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, start)
+				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start)
 				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", oerr.Error()))
 				return
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start)
 			exclude[leaf.ID] = true
 			lastErr = oerr
 			continue
 		}
 
 		// 首字节到手：提交 SSE 响应头，此后不再跨叶子重试。
+		firstTokenMs := time.Since(start).Milliseconds()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -769,7 +772,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			// 流已开始，无法更改状态码；用 SSE error 帧收尾。
 			writeSSEError(w, perr)
 		}
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, start)
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, firstTokenMs, start)
 		return
 	}
 
@@ -792,7 +795,7 @@ func (g *Gateway) openStream(ctx context.Context, rt provider.Route, body []byte
 }
 
 // anthropicMaxTokens 解析 Anthropic 协议必填的 max_tokens：请求显式携带的值
-//（已经 clampOutput 按目标模型上限裁剪）优先；未携带时用目录里的模型输出上限；
+// （已经 clampOutput 按目标模型上限裁剪）优先；未携带时用目录里的模型输出上限；
 // 两者都没有时回落保守默认——Anthropic 没有默认值，缺了必然 400。
 func (g *Gateway) anthropicMaxTokens(body []byte, modelName string) int64 {
 	if v := openAIMaxTokensOf(body); v > 0 {
@@ -807,7 +810,7 @@ func (g *Gateway) anthropicMaxTokens(body []byte, modelName string) int64 {
 // openAIMaxTokensOf 读取 OpenAI 请求体里显式的输出上限（chat 的两个键）。
 func openAIMaxTokensOf(body []byte) int64 {
 	var v struct {
-		MaxTokens          *int64 `json:"max_tokens"`
+		MaxTokens           *int64 `json:"max_tokens"`
 		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
 	}
 	if json.Unmarshal(body, &v) != nil {

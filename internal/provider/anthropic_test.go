@@ -342,6 +342,22 @@ func TestOpenAnthropicChatStream(t *testing.T) {
 	}
 }
 
+// TestAnthropicStreamDeltaInputTokens 锁定转换桥对「input_tokens 放在
+// message_delta」的兼容：message_start 缺 input 时，message_delta 的 input 也能
+// 正确计入（赋值而非累加，不会双计）。
+func TestAnthropicStreamDeltaInputTokens(t *testing.T) {
+	st := &anthropicStreamState{model: "m"}
+	if _, err := st.convertEvent([]byte(`{"type":"message_start","message":{"id":"m","usage":{"input_tokens":0}}}`)); err != nil {
+		t.Fatalf("message_start: %v", err)
+	}
+	if _, err := st.convertEvent([]byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":7,"output_tokens":2}}`)); err != nil {
+		t.Fatalf("message_delta: %v", err)
+	}
+	if st.pt != 7 || st.ct != 2 {
+		t.Fatalf("usage: pt=%d ct=%d, want 7/2", st.pt, st.ct)
+	}
+}
+
 // TestAnthropicStreamWithoutBlankLines 兼容省略 SSE 空行的上游：每个完整 data JSON
 // 都应单独解析，不把相邻事件拼成 unexpected end/extra JSON 错误。
 func TestAnthropicStreamWithoutBlankLines(t *testing.T) {

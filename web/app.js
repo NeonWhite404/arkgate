@@ -1294,7 +1294,7 @@ const LogsPage = {
       <button class="btn btn-outline btn-sm" @click="resetFilters">重置</button>
     </div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>时间</th><th>来源 IP</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th><th>错误</th>
+      <th>时间</th><th>来源 IP</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>首字 / 总耗时</th><th>状态</th><th>错误</th>
     </tr></thead><tbody>
       <tr v-if="!logs.length"><td colspan="15" class="empty">暂无日志</td></tr>
       <tr v-for="l in logs" :key="l.id" class="row-in">
@@ -1308,7 +1308,7 @@ const LogsPage = {
         <td>{{ l.prompt_tokens }}</td><td>{{ l.completion_tokens }}</td><td>{{ l.total_tokens }}</td>
         <td>{{ l.modality === 'image' ? (l.image_count || 0) + ' 张' : '—' }}</td>
         <td class="cost">{{ fmtCost(l.cost) }}</td>
-        <td>{{ l.latency_ms }}ms</td>
+        <td class="mono">{{ l.first_token_ms ? l.first_token_ms + 'ms' : '—' }} / {{ l.latency_ms }}ms</td>
         <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
       </tr>

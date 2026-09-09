@@ -25,8 +25,8 @@ const (
 
 // 模型类型
 const (
-	ModelTypeText   = "text"
-	ModelTypeImage  = "image"
+	ModelTypeText  = "text"
+	ModelTypeImage = "image"
 	// ModelTypeRouter 虚拟路由模型：不承接上游流量（没有接入点映射），
 	// 网关按「估算输入长度」把发往该名字的请求分流到其它真实模型。
 	// 参考 OpenAI 的 auto / 各家 router 类模型：客户端只管请求这个名字，
@@ -70,12 +70,12 @@ const (
 type Account struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
-	Provider     string `json:"provider"`      // 供应商 id（ark | openai | custom…），默认 ark
-	BaseURL      string `json:"base_url"`      // 覆盖 provider 默认 base；custom 必填
-	ArkAPIKeyEnc string `json:"-"`             // 加密后的 API Key（不透明字符串），不外发
-	KeyHint      string `json:"key_hint"`      // 末 4 位，用于 UI 展示
-	Status       string `json:"status"`        // active | disabled
-	Weight       int    `json:"weight"`        // 账号级默认权重（其下叶节点 weight=0 时回落到此）
+	Provider     string `json:"provider"` // 供应商 id（ark | openai | custom…），默认 ark
+	BaseURL      string `json:"base_url"` // 覆盖 provider 默认 base；custom 必填
+	ArkAPIKeyEnc string `json:"-"`        // 加密后的 API Key（不透明字符串），不外发
+	KeyHint      string `json:"key_hint"` // 末 4 位，用于 UI 展示
+	Status       string `json:"status"`   // active | disabled
+	Weight       int    `json:"weight"`   // 账号级默认权重（其下叶节点 weight=0 时回落到此）
 	CreatedAt    int64  `json:"created_at"`
 	LastUsedAt   int64  `json:"last_used_at"`
 
@@ -118,8 +118,8 @@ type RouterConfig struct {
 // 价格字段用于成本核算：文本模型填 input/output（每百万 token 单价），
 // 图像模型填 image（每张单价）；0 表示未定价（成本计 0）。
 type Model struct {
-	Name     string   `json:"name"`
-	Type     string   `json:"type"` // text | image | router（默认 text）
+	Name string `json:"name"`
+	Type string `json:"type"` // text | image | router（默认 text）
 	// Provider 上游协议（供应商类型已从账号下沉到模型）："" = OpenAI 兼容
 	// （默认，覆盖 ark/openai/custom 账号）；"anthropic" = Anthropic /v1/messages，
 	// 由网关做 OpenAI↔Anthropic 双向转换。账号只提供主机（base_url）与密钥。
@@ -235,25 +235,26 @@ type SubKey struct {
 
 // UsageLog 单次请求日志（用于管理页日志列表）。
 type UsageLog struct {
-	ID               int64  `json:"id"`
-	TS               int64  `json:"ts"`
-	SubKeyID         string `json:"subkey_id"`
-	SubKeyName       string `json:"subkey_name"`
-	AccountID        string `json:"account_id"`
-	AccountName      string `json:"account_name"`
-	Provider         string `json:"provider"`        // 命中账号的供应商
-	EndpointID       string `json:"endpoint_id"`
-	EP               string `json:"ep"`              // 实际调用的上游模型标识
-	RequestedModel   string `json:"requested_model"` // 客户端请求的模型名
-	Model            string `json:"model"`           // 实际路由到的模型名（fallback 后）
-	Modality         string `json:"modality"`        // text | image
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
-	ImageCount       int64  `json:"image_count"`
-	Cost             float64 `json:"cost"` // 本次请求成本（按模型定价折算；未定价为 0）
-	Status           string `json:"status"` // ok | error
-	LatencyMs        int64  `json:"latency_ms"`
-	Error            string `json:"error"`
-	ClientIP         string `json:"client_ip"` // 下游调用方 IP（代理场景取 XFF 首跳）
+	ID               int64   `json:"id"`
+	TS               int64   `json:"ts"`
+	SubKeyID         string  `json:"subkey_id"`
+	SubKeyName       string  `json:"subkey_name"`
+	AccountID        string  `json:"account_id"`
+	AccountName      string  `json:"account_name"`
+	Provider         string  `json:"provider"` // 命中账号的供应商
+	EndpointID       string  `json:"endpoint_id"`
+	EP               string  `json:"ep"`              // 实际调用的上游模型标识
+	RequestedModel   string  `json:"requested_model"` // 客户端请求的模型名
+	Model            string  `json:"model"`           // 实际路由到的模型名（fallback 后）
+	Modality         string  `json:"modality"`        // text | image
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	ImageCount       int64   `json:"image_count"`
+	Cost             float64 `json:"cost"`   // 本次请求成本（按模型定价折算；未定价为 0）
+	Status           string  `json:"status"` // ok | error
+	LatencyMs        int64   `json:"latency_ms"`
+	FirstTokenMs     int64   `json:"first_token_ms"` // 首字耗时（流式首字节；非流式为 0）
+	Error            string  `json:"error"`
+	ClientIP         string  `json:"client_ip"` // 下游调用方 IP（代理场景取 XFF 首跳）
 }

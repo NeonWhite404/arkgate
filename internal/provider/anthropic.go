@@ -740,8 +740,15 @@ func (s *anthropicStreamState) convertEvent(data []byte) ([]byte, error) {
 		if evt.Delta != nil {
 			s.stopReason = evt.Delta.StopReason
 		}
-		if evt.Usage != nil && evt.Usage.OutputTokens > 0 {
-			s.ct = evt.Usage.OutputTokens
+		// 兼容把 input_tokens 放在 message_delta 的上游（与原生透传口径一致）。
+		// 这里是赋值而非累加：即使上游在 message_start 已给过非零 input 也不会双计。
+		if evt.Usage != nil {
+			if evt.Usage.OutputTokens > 0 {
+				s.ct = evt.Usage.OutputTokens
+			}
+			if evt.Usage.InputTokens > 0 {
+				s.pt = evt.Usage.InputTokens
+			}
 		}
 		fr := anthropicFinishReason(s.stopReason, s.nextToolIdx > 0)
 		return s.emit([]openAIChunkChoice{{Index: 0, Delta: openAIChunkDelta{}, FinishReason: &fr}})

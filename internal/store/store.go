@@ -57,7 +57,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // schemaVersion 当前迁移版本号，记入 settings，为未来分批迁移留锚点。
 // v7：虚拟路由模型（models.router JSON 列）+ subkeys.key_hash / usage_logs(subkey_id) 索引。
 // v8：模型上游协议列（models.provider；供应商类型从账号下沉到模型）。
-const schemaVersion = "8"
+// v9：日志首字耗时列（usage_logs.first_token_ms）。
+const schemaVersion = "9"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -136,6 +137,7 @@ func (s *Store) migrate() error {
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			status TEXT NOT NULL DEFAULT '',
 			latency_ms INTEGER NOT NULL DEFAULT 0,
+			first_token_ms INTEGER NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts)`,
@@ -217,6 +219,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE models ADD COLUMN router TEXT NOT NULL DEFAULT ''`,
 		// —— v8：模型上游协议（'' = OpenAI 兼容；anthropic = /v1/messages，网关转换） ——
 		`ALTER TABLE models ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		// —— v9：日志首字耗时（流式 TTFT；非流式为 0） ——
+		`ALTER TABLE usage_logs ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -743,25 +747,25 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
 		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
-		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,error,client_ip)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,first_token_ms,error,client_ip)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
 		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
 		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs,
-		l.Error, l.ClientIP)
+		l.FirstTokenMs, l.Error, l.ClientIP)
 	return err
 }
 
 const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
 	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
-	cost,status,latency_ms,error,client_ip`
+	cost,status,latency_ms,first_token_ms,error,client_ip`
 
 func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
 	if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
 		&l.Provider, &l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.Modality,
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
-		&l.Cost, &l.Status, &l.LatencyMs, &l.Error, &l.ClientIP); err != nil {
+		&l.Cost, &l.Status, &l.LatencyMs, &l.FirstTokenMs, &l.Error, &l.ClientIP); err != nil {
 		return nil, err
 	}
 	return l, nil
