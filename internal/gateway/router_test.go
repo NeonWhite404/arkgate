@@ -105,6 +105,29 @@ func TestEstimateResponsesTokens(t *testing.T) {
 	}
 }
 
+// TestEstimateResponsesTokensExtended 覆盖官方允许的 instructions 数组形态，
+// 以及 function_call / function_call_output 项的估算（旧实现会把这两种输入
+// 算成 0，导致虚拟路由按过短输入误分流）。
+func TestEstimateResponsesTokensExtended(t *testing.T) {
+	body := tt(t, map[string]any{
+		"instructions": []any{
+			map[string]any{"type": "message", "content": []any{
+				map[string]any{"type": "output_text", "text": "abcdefgh"},
+			}},
+		},
+		"input": []any{
+			map[string]any{"type": "function_call", "function_call": map[string]any{"arguments": "abcd"}},
+			map[string]any{"type": "function_call_output", "function_call_output": map[string]any{"output": "abcdefgh"}},
+		},
+	})
+	// 基数 3 + instructions(2) + function_call(结构 4 + 参数 1)
+	// + function_call_output(结构 4 + 输出 2)。
+	want := int64(3 + 2 + 4 + 1 + 4 + 2)
+	if got := estimateResponsesTokens(body); got != want {
+		t.Fatalf("extended responses want %d, got %d", want, got)
+	}
+}
+
 // TestEstimateInputTokensDispatch 各 API 形态分发正确；图像请求恒 0。
 func TestEstimateInputTokensDispatch(t *testing.T) {
 	chatBody := tt(t, map[string]any{"messages": []any{map[string]any{"content": "abcd"}}})

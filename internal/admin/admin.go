@@ -746,6 +746,18 @@ func (a *Admin) handleTestModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, result)
 		return
 	}
+	// account_id+ep 直测：若该元组恰有已登记映射（account×model×ep），带上它的
+	// 请求头，保证探测与真实转发环境一致（依赖 UA / beta 头的接入点也能被测准）。
+	if p.Model != "" {
+		if eps, lerr := a.store.ListEndpoints(); lerr == nil {
+			for _, ep := range eps {
+				if ep.AccountID == acc.ID && ep.Model == p.Model && ep.EP == p.EP {
+					rt.Headers = ep.RequestHeaders
+					break
+				}
+			}
+		}
+	}
 	a.finishModelProbe(r.Context(), &result, rt, p.EP, p.Protocol)
 	writeJSON(w, 200, result)
 }
@@ -821,6 +833,8 @@ func (a *Admin) testRegisteredModel(ctx context.Context, name string) testModelR
 		result.Error = err.Error()
 		return result
 	}
+	// 测试要与该映射的真实调用环境一致：带上叶节点的请求头（UA / beta 等）。
+	rt.Headers = chosen.RequestHeaders
 	a.finishModelProbe(ctx, &result, rt, chosen.EP, m.Provider)
 	return result
 }
@@ -1248,11 +1262,15 @@ func (a *Admin) handleEndpointsCollection(w http.ResponseWriter, r *http.Request
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		e.EP = strings.TrimSpace(e.EP)
 		if e.AccountID == "" || e.Model == "" || e.EP == "" {
 			writeJSON(w, 400, map[string]any{"detail": "account_id、model、ep 必填"})
 			return
 		}
-		e.EP = strings.TrimSpace(e.EP)
+		if err := provider.ValidateRequestHeaders(e.RequestHeaders); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
 		// 同一账号 + 同一模型可挂多个不同 ep（同模型的不同发布版本），
 		// 但完全相同的三元组是重复配置：明确拒绝，避免静默改到既有行。
 		if _, dup := a.store.EndpointIDByTuple(e.AccountID, e.Model, e.EP); dup {
@@ -1306,11 +1324,45 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 		if v, ok := probe["enabled"].(bool); ok {
 			existing.Enabled = v
 		}
-		existing.Weight = intField(probe["weight"])
-		existing.MaxConcurrency = intField(probe["max_concurrency"])
-		existing.RPMLimit = intField(probe["rpm_limit"])
-		existing.TPMLimit = int64(intField(probe["tpm_limit"]))
+		// 流控整数字段保持部分更新语义：只覆盖请求里显式携带的键。
+		// （此前无条件覆盖，只发 request_headers 会把四个限流值一起清零。）
+		type intFieldSpec struct {
+			key string
+			set func(int64)
+		}
+		for _, f := range []intFieldSpec{
+			{"weight", func(v int64) { existing.Weight = int(v) }},
+			{"max_concurrency", func(v int64) { existing.MaxConcurrency = int(v) }},
+			{"rpm_limit", func(v int64) { existing.RPMLimit = int(v) }},
+			{"tpm_limit", func(v int64) { existing.TPMLimit = v }},
+		} {
+			v, present := probe[f.key]
+			if !present || v == nil {
+				continue
+			}
+			num, isNum := v.(float64)
+			if !isNum {
+				writeJSON(w, 400, map[string]any{"detail": f.key + " 必须是数字"})
+				return
+			}
+			f.set(int64(num))
+		}
+		if raw, ok := probe["request_headers"]; ok {
+			if raw == nil {
+				existing.RequestHeaders = map[string]string{} // 显式 null 视作清空
+			} else {
+				b, err := json.Marshal(raw)
+				if err != nil || json.Unmarshal(b, &existing.RequestHeaders) != nil {
+					writeJSON(w, 400, map[string]any{"detail": "request_headers 必须是字符串到字符串的对象"})
+					return
+				}
+			}
+		}
 		existing.EP = strings.TrimSpace(existing.EP)
+		if err := provider.ValidateRequestHeaders(existing.RequestHeaders); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
 		// 改归属/标识后若与「另一条」映射三元组相同，明确拒绝（自身不算冲突）。
 		if other, dup := a.store.EndpointIDByTuple(existing.AccountID, existing.Model, existing.EP); dup && other != id {
 			writeJSON(w, 400, map[string]any{"detail": "该账号下该模型已存在相同的上游标识 " + existing.EP})

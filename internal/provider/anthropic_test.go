@@ -102,6 +102,22 @@ func TestAnthropicRequest(t *testing.T) {
 	if tc.ToolChoice == nil || string(tc.ToolChoice) != `{"type":"any"}` {
 		t.Fatalf("tool_choice: %s", tc.ToolChoice)
 	}
+	// tool_choice:"none" 表示禁止调用工具：应连工具声明一并忽略，而不是回落
+	// auto（auto 会让上游仍可调用已声明工具，违反 none 语义）。
+	noneBody := []byte(`{"messages":[{"role":"user","content":"x"}],
+		"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+		"tool_choice":"none"}`)
+	outNone, err := AnthropicRequest(noneBody, "m", 10, false)
+	if err != nil {
+		t.Fatalf("none convert: %v", err)
+	}
+	var noneReq anthropicMessagesRequest
+	if json.Unmarshal(outNone, &noneReq) != nil {
+		t.Fatalf("none unmarshal")
+	}
+	if len(noneReq.Tools) != 0 || len(noneReq.ToolChoice) != 0 {
+		t.Fatalf("tool_choice none 应忽略工具：tools=%v choice=%s", noneReq.Tools, noneReq.ToolChoice)
+	}
 	// 助手 tool_calls → tool_use 块；tool 角色 → user/tool_result。
 	withCalls := []byte(`{"messages":[
 		{"role":"user","content":"x"},

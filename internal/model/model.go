@@ -154,10 +154,11 @@ type Endpoint struct {
 	CreatedAt int64  `json:"created_at"`
 
 	// 叶节点级流量控制
-	Weight         int   `json:"weight"` // 0 = 继承账号权重
-	MaxConcurrency int   `json:"max_concurrency"`
-	RPMLimit       int   `json:"rpm_limit"`
-	TPMLimit       int64 `json:"tpm_limit"` // 文本=tokens/min；图像=张/min
+	Weight         int               `json:"weight"` // 0 = 继承账号权重
+	MaxConcurrency int               `json:"max_concurrency"`
+	RPMLimit       int               `json:"rpm_limit"`
+	TPMLimit       int64             `json:"tpm_limit"` // 文本=tokens/min；图像=张/min
+	RequestHeaders map[string]string `json:"request_headers,omitempty"`
 
 	// 叶节点级累计统计
 	LastUsedAt       int64 `json:"last_used_at"`

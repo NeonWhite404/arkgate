@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/textproto"
 	"strings"
 )
 
@@ -14,6 +16,76 @@ type Route struct {
 	Def     Def
 	BaseURL string
 	Key     string // 不透明字符串：不校验前缀/格式，原样进 Authorization
+	Headers map[string]string
+}
+
+// forbiddenRequestHeaders 是网关必须独占的头：认证、hop-by-hop、以及协议层
+// 强制字段。映射级自定义头不能覆盖它们——否则能冒充认证、破坏分帧或改变协议。
+var forbiddenRequestHeaders = map[string]bool{
+	"authorization": true, "proxy-authorization": true, "x-api-key": true,
+	"host": true, "content-length": true, "transfer-encoding": true,
+	"connection": true, "keep-alive": true, "te": true, "trailer": true,
+	"upgrade": true, "proxy-connection": true,
+	"content-type": true, "accept": true, "anthropic-version": true,
+}
+
+// validHeaderNameToken 校验 header 名是合法 RFC token（白名单字符 + 数字字母）。
+// 只拦换行不够：空格 / NUL / 其它控制字符会在出站 transport 层才炸，或悄悄被丢。
+func validHeaderNameToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '!', c == '#', c == '$', c == '%', c == '&', c == '\'',
+			c == '*', c == '+', c == '-', c == '.', c == '^', c == '_',
+			c == '`', c == '|', c == '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateRequestHeaders 在保存前校验映射级请求头，确保：
+//   - 名称是合法 token（拒绝空格 / 控制字符 / 冒号等）；
+//   - 值不含 CR/LF/NUL（防请求拆分）；
+//   - 不可覆盖认证 / 传输级 / 协议头；
+//   - 两个仅在大小写上不同的键不会规范化成同一个头（否则出站结果不确定）。
+func ValidateRequestHeaders(headers map[string]string) error {
+	seen := make(map[string]string, len(headers))
+	for name, value := range headers {
+		trimmed := strings.TrimSpace(name)
+		canonical := textproto.CanonicalMIMEHeaderKey(trimmed)
+		if !validHeaderNameToken(trimmed) {
+			return fmt.Errorf("请求头名称非法: %q", name)
+		}
+		if forbiddenRequestHeaders[strings.ToLower(canonical)] {
+			return fmt.Errorf("请求头 %s 属于认证、传输级或协议头，禁止覆盖", canonical)
+		}
+		if prior, dup := seen[canonical]; dup {
+			return fmt.Errorf("请求头 %s 与 %s 仅大小写不同，会规范化为同一头", name, prior)
+		}
+		seen[canonical] = name
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("请求头 %s 的值包含非法字符", canonical)
+		}
+	}
+	return nil
+}
+
+// applyRequestHeaders 把映射级自定义头写入待发送请求。跳过禁止覆盖/非法的头
+// 作为第二道防线（认证与协议头的正确性不依赖 admin 是否记得校验）。
+func applyRequestHeaders(dst http.Header, headers map[string]string) {
+	for name, value := range headers {
+		canonical := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
+		if !validHeaderNameToken(strings.TrimSpace(name)) || forbiddenRequestHeaders[strings.ToLower(canonical)] {
+			continue
+		}
+		dst.Set(canonical, value)
+	}
 }
 
 // TextUsage 文本调用计量（chat 与 responses 统一折算到 prompt/completion）。

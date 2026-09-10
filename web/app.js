@@ -812,11 +812,13 @@ const ModelsPage = {
         id: e.id,
         form: { account_id: e.account_id, model: e.model, ep: e.ep, enabled: e.enabled,
           weight: e.weight || 0, max_concurrency: e.max_concurrency || 0,
-          rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0 },
+          rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0,
+          request_headers_text: JSON.stringify(e.request_headers || {}, null, 2) },
       } : {
         id: null,
         form: { account_id: this.accounts.length ? this.accounts[0].id : "", model: this.models.length ? this.models[0].name : "",
-          ep: "", enabled: true, weight: 0, max_concurrency: 0, rpm_limit: 0, tpm_limit: 0 },
+          ep: "", enabled: true, weight: 0, max_concurrency: 0, rpm_limit: 0, tpm_limit: 0,
+          request_headers_text: "{}" },
       };
     },
     // siblingEps 当前弹窗所选「账号 × 模型」下已存在的其它接入点（同模型的不同版本）。
@@ -829,10 +831,28 @@ const ModelsPage = {
     epCount(name) {
       return this.eps.filter((e) => e.model === name).length;
     },
+    applyHeaderPreset(name) {
+      const presets = {
+        blank: {},
+        claude: {
+          "User-Agent": "claude-cli/1.0.119 (external, cli)",
+          "anthropic-beta": "claude-code-20250219",
+          "x-app": "cli",
+        },
+      };
+      this.eModal.form.request_headers_text = JSON.stringify(presets[name] || {}, null, 2);
+    },
     saveEp() {
       const f = this.eModal.form;
       if (!f.account_id || !f.model || !f.ep.trim()) { toast("请完整填写", false); return; }
+      let requestHeaders;
+      try { requestHeaders = JSON.parse(f.request_headers_text || "{}"); }
+      catch (_) { toast("请求头必须是合法 JSON 对象", false); return; }
+      if (!requestHeaders || Array.isArray(requestHeaders) || typeof requestHeaders !== "object" || Object.values(requestHeaders).some((v) => typeof v !== "string")) {
+        toast("请求头必须是字符串到字符串的 JSON 对象", false); return;
+      }
       const payload = { account_id: f.account_id, model: f.model, ep: f.ep.trim(), enabled: f.enabled,
+        request_headers: requestHeaders,
         weight: Number(f.weight) || 0, max_concurrency: Number(f.max_concurrency) || 0,
         rpm_limit: Number(f.rpm_limit) || 0, tpm_limit: Number(f.tpm_limit) || 0 };
       const p = this.eModal.id
@@ -1050,6 +1070,11 @@ const ModelsPage = {
           <div class="form-item"><label>RPM</label><input v-model="eModal.form.rpm_limit" type="number"/></div>
         </div>
         <div class="form-item"><label>TPM</label><input v-model="eModal.form.tpm_limit" type="number"/></div>
+        <div class="form-item"><label>上游请求头（JSON）</label>
+          <div class="row-actions" style="margin-bottom:8px"><button class="btn btn-outline btn-sm" type="button" @click="applyHeaderPreset('blank')">白板</button><button class="btn btn-outline btn-sm" type="button" @click="applyHeaderPreset('claude')">Claude Code</button></div>
+          <textarea v-model="eModal.form.request_headers_text" rows="6" spellcheck="false" placeholder='{"User-Agent":"Hermes/1.0"}'></textarea>
+          <div class="form-tip">Claude Code 预置使用 User-Agent=claude-cli/1.0.119、anthropic-beta=claude-code-20250219 与 x-app=cli。Hermes 等身份头可自行填写。认证、传输级与协议相关敏感头不可覆盖。</div>
+        </div>
         <div class="form-item"><label>状态</label>
           <select v-model="eModal.form.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></div>
       </div>

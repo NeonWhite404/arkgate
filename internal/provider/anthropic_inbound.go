@@ -513,6 +513,8 @@ func (m *Manager) OpenAnthropicNativeStream(ctx context.Context, rt Route, down 
 	req.Header.Set("X-Api-Key", rt.Key)
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("Accept", "text/event-stream")
+	// 映射级请求头（Claude Code 身份等）；anthropic-version 等协议头不可覆盖。
+	applyRequestHeaders(req.Header, rt.Headers)
 
 	resp, err := m.httpc.Do(req)
 	if err != nil {
@@ -789,6 +791,17 @@ func (s *openAIToAnthropicState) handleChunk(payload []byte, sink io.Writer) (bo
 						"name": tb.name, "input": map[string]any{}},
 				})); err != nil {
 					return false, err
+				}
+				// id/name 晚于 arguments 到达的场景：补发此前缓存的参数前缀，
+				// 否则这部分片段会静默丢失（JSON 拼接错乱）。
+				if tb.pendingArgs.Len() > 0 {
+					if err := writeSSE(sink, anthropicSSEEvent("content_block_delta", map[string]any{
+						"type": "content_block_delta", "index": tb.anthropicIndex,
+						"delta": map[string]any{"type": "input_json_delta", "partial_json": tb.pendingArgs.String()},
+					})); err != nil {
+						return false, err
+					}
+					tb.pendingArgs.Reset()
 				}
 			}
 		}

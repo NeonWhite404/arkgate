@@ -186,7 +186,7 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 		return routeInfo{}, errors.New("账号密钥解密失败")
 	}
 	return routeInfo{
-		rt:          provider.Route{Def: def, BaseURL: baseURL, Key: key},
+		rt:          provider.Route{Def: def, BaseURL: baseURL, Key: key, Headers: leaf.RequestHeaders},
 		accountID:   acc.ID,
 		accountName: acc.Name,
 	}, nil
@@ -750,27 +750,32 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no") // 防反代缓冲 SSE
 
+		// 逐写即刷：SSE 事件必须尽快推给客户端，不能缓冲到整条流结束。
+		fw := flushWriter{w: w, f: fl}
 		var pt, ct, images int64
 		perr := func() error {
 			switch api {
 			case balancer.APIImages:
-				a, b, e := st.Pump(w)
+				a, b, e := st.Pump(fw)
 				pt, ct = a, b
 				if e == nil {
 					images = provider.ExtractN(body) // 张数按请求 n 计量；失败不计费
 				}
 				return e
 			default:
-				a, b, e := st.Pump(w)
+				a, b, e := st.Pump(fw)
 				pt, ct = a, b
 				return e
 			}
 		}()
 		st.Close()
-		fl.Flush()
 		if perr != nil {
-			// 流已开始，无法更改状态码；用 SSE error 帧收尾。
-			writeSSEError(w, perr)
+			// 上游已通过 responses 协议事件（response.failed / error）传达失败，
+			// 事件已原样转发——只记账失败，不再追加第二层错误帧。
+			if !errors.Is(perr, provider.ErrStreamFailed) {
+				// 流已开始，无法更改状态码；用 SSE error 帧收尾。
+				writeSSEError(w, perr, api)
+			}
 		}
 		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, firstTokenMs, start)
 		return
@@ -898,7 +903,28 @@ func (g *Gateway) writeUpstreamError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusTooManyRequests, errBody("upstream_error", errText(err)))
 }
 
-func writeSSEError(w http.ResponseWriter, err error) {
+// flushWriter 每写即刷：SSE 事件必须及时推送，不能等上游整条流结束后才落客户端。
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+// writeSSEError 给已开始的流补错误帧。Chat/图像用 chunk 形状（error + [DONE]）；
+// Responses 必须用其 event: error 类型（不伪装 [DONE]），否则客户端无法解析。
+func writeSSEError(w http.ResponseWriter, err error, api balancer.API) {
+	if api == balancer.APIResponses {
+		payload, _ := json.Marshal(map[string]any{"type": "error", "code": "upstream_error", "message": errText(err)})
+		_, _ = w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
+		return
+	}
 	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": errText(err), "type": "upstream_error"}})
 	_, _ = w.Write([]byte("data: " + string(payload) + "\n\n"))
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))

@@ -60,6 +60,8 @@ func (m *Manager) post(ctx context.Context, rt Route, path string, body []byte, 
 	var raw []byte
 	err := client.Post(ctx, path, json.RawMessage(body), &raw,
 		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			// 映射级请求头在每次实际发送前注入（含 SDK 同叶子的瞬时重试）。
+			applyRequestHeaders(req.Header, rt.Headers)
 			resp, err := next(req)
 			if err != nil {
 				return resp, err
@@ -180,6 +182,7 @@ func (m *Manager) ListModels(ctx context.Context, rt Route, timeout time.Duratio
 	}
 	req.Header.Set("Authorization", "Bearer "+rt.Key)
 	req.Header.Set("Accept", "application/json")
+	applyRequestHeaders(req.Header, rt.Headers)
 
 	resp, err := m.httpc.Do(req)
 	if err != nil {
@@ -241,13 +244,19 @@ func filterModels(in []UpstreamModel) []UpstreamModel {
 // 未向客户端写过数据，调用方可安全重试。
 var ErrFirstToken = errors.New("上游首字节超时")
 
+// ErrStreamFailed 表示流已通过上游协议事件（responses 的 response.failed / error）
+// 正常终止，且该事件已原样转发给客户端。网关据此把本次记账为失败，但不应再追加
+// 一层错误帧——客户端已经通过协议事件知道了失败原因。
+var ErrStreamFailed = errors.New("上游流式以失败终止")
+
 // Stream 是一条已打开（已收到首字节）的上游流式响应。
 type Stream struct {
-	resp   *http.Response
-	rdr    *bufio.Reader
-	first  []byte // openStream 已读出的首个数据行
-	sniff  func(payload []byte) (pt, ct int64, ok bool)
-	cancel context.CancelFunc // 首 token 超时场景下创建的子 ctx（可能为 nil）
+	resp     *http.Response
+	rdr      *bufio.Reader
+	first    []byte // openStream 已读出的首个数据行
+	sniff    func(payload []byte) (pt, ct int64, ok bool)
+	terminal func(payload []byte) (stop, fail bool) // responses 终止事件检测（其它协议为 nil）
+	cancel   context.CancelFunc                     // 首 token 超时场景下创建的子 ctx（可能为 nil）
 }
 
 // Close 关闭流并释放底层资源。
@@ -264,6 +273,8 @@ func (s *Stream) Close() {
 }
 
 // Pump 把整条流写给 sink（含 openStream 已读出的首行），返回从流中提取的用量。
+// 配置了 terminal 检测时（responses），终止事件转发后即结束；失败终止返回
+// ErrStreamFailed（事件已原样转发，调用方只需记账失败，不再补错误帧）。
 func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 	line := s.first
 	for {
@@ -272,8 +283,15 @@ func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 				pt += p
 				ct += c
 			}
+			stop, fail := s.terminalLine(line)
 			if _, werr := sink.Write(line); werr != nil {
 				return pt, ct, werr
+			}
+			if stop {
+				if fail {
+					return pt, ct, ErrStreamFailed
+				}
+				return pt, ct, nil
 			}
 		}
 		line, err = s.rdr.ReadBytes('\n')
@@ -284,6 +302,19 @@ func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 			return pt, ct, err
 		}
 	}
+}
+
+// terminalLine 在配置了终止检测时，判断一行是否为终止事件（先取 data 载荷再交给
+// terminal 判定；event:/注释/空行都不是终止）。
+func (s *Stream) terminalLine(line []byte) (stop, fail bool) {
+	if s.terminal == nil {
+		return false, false
+	}
+	payload, ok := dataPayloadOf(line)
+	if !ok {
+		return false, false
+	}
+	return s.terminal(payload)
 }
 
 // openStream 发起流式请求并等待响应头 + 首个数据行（首 token）。
@@ -321,6 +352,7 @@ func (m *Manager) openStream(ctx context.Context, rt Route, path string, body []
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+rt.Key)
 	req.Header.Set("Accept", "text/event-stream")
+	applyRequestHeaders(req.Header, rt.Headers)
 
 	resp, err := m.httpc.Do(req)
 	if err != nil {
@@ -387,13 +419,18 @@ func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, ups
 	return st, err
 }
 
-// OpenResponsesStream 打开 responses 流（从 response.completed 提取用量）。
+// OpenResponsesStream 打开 responses 流（从终止事件提取用量；终止即收尾，不傻等 EOF）。
 func (m *Manager) OpenResponsesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
 	body, err := prepareBody(down, upstreamModel)
 	if err != nil {
 		return nil, err
 	}
-	return m.openStream(ctx, rt, "responses", body, firstTokenTimeout, responsesUsageFromEvent)
+	st, err := m.openStream(ctx, rt, "responses", body, firstTokenTimeout, responsesUsageFromEvent)
+	if err != nil {
+		return nil, err
+	}
+	st.terminal = responsesTerminal
+	return st, nil
 }
 
 // OpenImagesStream 打开 images/generations 流（partial images）。无 usage 事件。
@@ -444,20 +481,29 @@ func (m *Manager) ImagesStream(ctx context.Context, rt Route, down []byte, upstr
 	return ExtractN(down), nil
 }
 
+// dataPayloadOf 提取一行 SSE 里 data: 后的 JSON 载荷（空行与 [DONE] 都视为无载荷）。
+func dataPayloadOf(line []byte) ([]byte, bool) {
+	s := string(line)
+	if !strings.HasPrefix(s, "data:") {
+		return nil, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(s, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return nil, false
+	}
+	return []byte(payload), true
+}
+
 // sniffDataLine 判断一行 SSE 是否携带 data: 载荷，并交给 sniff 提取用量。
 func sniffDataLine(line []byte, sniff func(payload []byte) (int64, int64, bool)) (int64, int64, bool) {
 	if sniff == nil {
 		return 0, 0, false
 	}
-	s := string(line)
-	if !strings.HasPrefix(s, "data:") {
+	payload, ok := dataPayloadOf(line)
+	if !ok {
 		return 0, 0, false
 	}
-	payload := strings.TrimSpace(strings.TrimPrefix(s, "data:"))
-	if payload == "" || payload == "[DONE]" {
-		return 0, 0, false
-	}
-	return sniff([]byte(payload))
+	return sniff(payload)
 }
 
 // chatUsageFromChunk 从 chat 流式 chunk（include_usage 的 final chunk）提取用量。
@@ -474,7 +520,8 @@ func chatUsageFromChunk(payload []byte) (int64, int64, bool) {
 	return 0, 0, false
 }
 
-// responsesUsageFromEvent 从 response.completed 事件提取用量。
+// responsesUsageFromEvent 从 responses 终止事件（completed/incomplete/failed）提取用量：
+// 三种终止都携带顶层 response.usage（input→prompt，output→completion）。
 func responsesUsageFromEvent(payload []byte) (int64, int64, bool) {
 	var parsed struct {
 		Type     string `json:"type"`
@@ -485,9 +532,30 @@ func responsesUsageFromEvent(payload []byte) (int64, int64, bool) {
 			} `json:"usage"`
 		} `json:"response"`
 	}
-	if json.Unmarshal(payload, &parsed) == nil &&
-		parsed.Type == "response.completed" && parsed.Response != nil && parsed.Response.Usage != nil {
+	if json.Unmarshal(payload, &parsed) != nil || parsed.Response == nil || parsed.Response.Usage == nil {
+		return 0, 0, false
+	}
+	switch parsed.Type {
+	case "response.completed", "response.incomplete", "response.failed":
 		return parsed.Response.Usage.InputTokens, parsed.Response.Usage.OutputTokens, true
 	}
 	return 0, 0, false
+}
+
+// responsesTerminal 识别 responses 流的终止事件：stop=true 表示转发该事件后应收尾；
+// completed/incomplete 是正常终止，failed/error 是失败终止（→ ErrStreamFailed）。
+func responsesTerminal(payload []byte) (stop, fail bool) {
+	var parsed struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload, &parsed) != nil {
+		return false, false
+	}
+	switch parsed.Type {
+	case "response.completed", "response.incomplete":
+		return true, false
+	case "response.failed", "error":
+		return true, true
+	}
+	return false, false
 }

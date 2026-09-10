@@ -58,7 +58,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // v7：虚拟路由模型（models.router JSON 列）+ subkeys.key_hash / usage_logs(subkey_id) 索引。
 // v8：模型上游协议列（models.provider；供应商类型从账号下沉到模型）。
 // v9：日志首字耗时列（usage_logs.first_token_ms）。
-const schemaVersion = "9"
+// v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
+const schemaVersion = "10"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -199,6 +200,7 @@ func (s *Store) migrate() error {
 		`ALTER TABLE accounts ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE models ADD COLUMN type TEXT NOT NULL DEFAULT 'text'`,
 		`ALTER TABLE endpoints ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE endpoints ADD COLUMN request_headers TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE subkeys ADD COLUMN daily_limit_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE subkeys ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
@@ -293,6 +295,7 @@ func (s *Store) relaxEndpointUnique() error {
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			total_images INTEGER NOT NULL DEFAULT 0,
+			request_headers TEXT NOT NULL DEFAULT '{}',
 			UNIQUE(account_id, model, ep)
 		)`,
 		`INSERT INTO endpoints_v5 (` + endpointCols + `) SELECT ` + endpointCols + ` FROM endpoints`,
@@ -518,15 +521,21 @@ func (s *Store) DeleteModel(name string) error {
 
 const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
-	total_images`
+	total_images,request_headers`
 
 func scanEndpoint(sc scanner) (*model.Endpoint, error) {
 	e := &model.Endpoint{}
+	var requestHeaders string
 	if err := sc.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
-		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages); err != nil {
+		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages, &requestHeaders); err != nil {
 		return nil, err
+	}
+	if requestHeaders != "" {
+		if err := json.Unmarshal([]byte(requestHeaders), &e.RequestHeaders); err != nil {
+			return nil, fmt.Errorf("decode endpoint request_headers: %w", err)
+		}
 	}
 	return e, nil
 }
@@ -574,26 +583,35 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 		// id 不存在：落到下面的「插入或冲突」逻辑。
 		existingID = ""
 	}
-	_, err := s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
+	requestHeaders, err := json.Marshal(e.RequestHeaders)
+	if err != nil {
+		return fmt.Errorf("encode endpoint request_headers: %w", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
-			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images,request_headers)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id,model,ep) DO UPDATE SET enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
-			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit`,
+			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit,
+			request_headers=excluded.request_headers`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
 		e.Weight, e.MaxConcurrency, e.RPMLimit, e.TPMLimit, e.LastUsedAt,
 		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens,
-		e.TotalTokens, e.TotalImages)
+		e.TotalTokens, e.TotalImages, string(requestHeaders))
 	return err
 }
 
 // updateEndpointByID 按主键 id 覆盖一行（含 account_id/model 归属的变更）。
 func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
-	_, err := s.db.Exec(`UPDATE endpoints SET account_id=?, model=?, ep=?, enabled=?, weight=?,
-			max_concurrency=?, rpm_limit=?, tpm_limit=? WHERE id=?`,
+	requestHeaders, err := json.Marshal(e.RequestHeaders)
+	if err != nil {
+		return fmt.Errorf("encode endpoint request_headers: %w", err)
+	}
+	_, err = s.db.Exec(`UPDATE endpoints SET account_id=?, model=?, ep=?, enabled=?, weight=?,
+			max_concurrency=?, rpm_limit=?, tpm_limit=?, request_headers=? WHERE id=?`,
 		e.AccountID, e.Model, e.EP, boolInt(e.Enabled), e.Weight, e.MaxConcurrency,
-		e.RPMLimit, e.TPMLimit, id)
+		e.RPMLimit, e.TPMLimit, string(requestHeaders), id)
 	return err
 }
 

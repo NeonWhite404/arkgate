@@ -178,6 +178,20 @@ func AnthropicRequest(down []byte, upstreamModel string, maxTokens int64, stream
 		Stream:      stream,
 	}
 
+	// 先解析工具选择：none 表示「禁止调用工具」，给 Anthropic 翻译时最贴近的
+	// 等价是连工具声明一并忽略（过去回落 auto 会让模型仍可调用已声明工具，
+	// 违反 none 语义）。
+	var toolChoice any
+	if len(req.ToolChoice) > 0 && !isJSONNull(req.ToolChoice) {
+		if err := json.Unmarshal(req.ToolChoice, &toolChoice); err != nil {
+			return nil, convErr("tool_choice 参数无法解析")
+		}
+		if tc, isStr := toolChoice.(string); isStr && tc == "none" {
+			req.Tools = json.RawMessage("null")
+			toolChoice = nil
+		}
+	}
+
 	// 工具声明：function.parameters ↔ input_schema（schema 轻量清洗，参照
 	// cc-switch：根级补 object 类型，剔除 format:uri 等严格校验器会拒的修饰）。
 	if len(req.Tools) > 0 && !isJSONNull(req.Tools) {
@@ -207,21 +221,17 @@ func AnthropicRequest(down []byte, upstreamModel string, maxTokens int64, stream
 			})
 		}
 	}
-	// 工具选择：required ↔ any（Anthropic 无 required 字面值）；none 上游
-	// 无对应语义，回落 auto（工具在声明里存在但模型可自行决定不调用）。
-	if len(req.ToolChoice) > 0 && !isJSONNull(req.ToolChoice) {
-		var tc any
-		if json.Unmarshal(req.ToolChoice, &tc) != nil {
-			return nil, convErr("tool_choice 参数无法解析")
-		}
-		switch v := tc.(type) {
+	// 工具选择：required ↔ any（Anthropic 无 required 字面值）；auto 原样映射。
+	// none 已在前面处理（忽略 tools 与 tool_choice）；未知字符串回落 auto。
+	if toolChoice != nil {
+		switch v := toolChoice.(type) {
 		case string:
 			switch v {
 			case "required":
 				out.ToolChoice = json.RawMessage(`{"type":"any"}`)
-			case "none":
+			case "auto":
 				out.ToolChoice = json.RawMessage(`{"type":"auto"}`)
-			default: // auto
+			default:
 				out.ToolChoice = json.RawMessage(`{"type":"auto"}`)
 			}
 		case map[string]any:
@@ -940,6 +950,8 @@ func (m *Manager) AnthropicChat(ctx context.Context, rt Route, down []byte, upst
 	var raw []byte
 	err = client.Post(ctx, "v1/messages", json.RawMessage(body), &raw,
 		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			// 映射级请求头（如 Claude Code 的 anthropic-beta / x-app / User-Agent）。
+			applyRequestHeaders(req.Header, rt.Headers)
 			resp, err := next(req)
 			if err != nil {
 				return resp, err
@@ -1010,6 +1022,8 @@ func (m *Manager) OpenAnthropicChatStream(ctx context.Context, rt Route, down []
 	req.Header.Set("X-Api-Key", rt.Key)
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("Accept", "text/event-stream")
+	// 映射级请求头（Claude Code 身份等）；anthropic-version 等协议头不可覆盖。
+	applyRequestHeaders(req.Header, rt.Headers)
 
 	resp, err := m.httpc.Do(req)
 	if err != nil {

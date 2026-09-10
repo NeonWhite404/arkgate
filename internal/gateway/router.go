@@ -55,27 +55,69 @@ func estimateChatTokens(body []byte) int64 {
 }
 
 // estimateResponsesTokens 估算 responses 请求的输入 tokens：
-// instructions + input（字符串，或消息数组——每项 content 再按分段解析）。
+// instructions（字符串或消息项数组）+ input（字符串，或项数组——每项取
+// content 分段，并计入 function_call 参数与 function_call_output 输出）。
 func estimateResponsesTokens(body []byte) int64 {
 	var v struct {
-		Instructions string          `json:"instructions"`
+		Instructions json.RawMessage `json:"instructions"`
 		Input        json.RawMessage `json:"input"`
 	}
 	if json.Unmarshal(body, &v) != nil {
 		return 0
 	}
-	total := int64(estBaseTokens) + textTokens(v.Instructions)
-	var items []struct {
-		Content json.RawMessage `json:"content"`
+	total := int64(estBaseTokens) + responsesInstructionsTokens(v.Instructions)
+
+	type inputItem struct {
+		Content      json.RawMessage `json:"content"`
+		FunctionCall *struct {
+			Arguments string `json:"arguments"`
+		} `json:"function_call"`
+		FunctionCallOutput *struct {
+			Output string `json:"output"`
+		} `json:"function_call_output"`
 	}
+	var items []inputItem
 	if json.Unmarshal(v.Input, &items) == nil && len(items) > 0 {
 		for _, it := range items {
 			total += contentTokens(it.Content) + estMsgOverhead
+			if it.FunctionCall != nil {
+				total += textTokens(it.FunctionCall.Arguments)
+			}
+			if it.FunctionCallOutput != nil {
+				total += textTokens(it.FunctionCallOutput.Output)
+			}
 		}
 		return total
 	}
 	total += contentTokens(v.Input)
 	return total
+}
+
+// responsesInstructionsTokens 统计 instructions 的估算 tokens：官方允许
+// string 或 Array<ResponseInputItem>，数组形态逐项取文本 / content 分段。
+func responsesInstructionsTokens(raw json.RawMessage) int64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	if n := contentTokens(raw); n > 0 {
+		return n
+	}
+	var items []struct {
+		Text    string          `json:"text"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &items) == nil {
+		var n int64
+		for _, it := range items {
+			if it.Text != "" {
+				n += textTokens(it.Text)
+			} else {
+				n += contentTokens(it.Content)
+			}
+		}
+		return n
+	}
+	return 0
 }
 
 // estimateAnthropicInputTokens 估算 /v1/messages 请求的输入 tokens：
