@@ -280,7 +280,9 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
-		pt, ct, perr := stream.Pump(w)
+		// 逐写即刷（与 streamForward 同款 flushWriter）：SSE 事件必须及时推送，
+		// 不能缓冲到整条上游流结束后才落客户端。
+		pt, ct, perr := stream.Pump(flushWriter{w: w, f: fl})
 		stream.Close()
 		fl.Flush()
 		if perr != nil {

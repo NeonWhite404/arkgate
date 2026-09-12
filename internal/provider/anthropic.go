@@ -491,7 +491,7 @@ type openAIUsage struct {
 func AnthropicResponseToOpenAI(raw []byte, fallbackModel string) ([]byte, *TextUsage, error) {
 	var msg anthropicMessageResponse
 	if err := json.Unmarshal(raw, &msg); err != nil {
-		return nil, nil, errors.New("上游响应不是合法的 Anthropic message 格式")
+		return nil, nil, fmt.Errorf("上游响应不是合法的 Anthropic message 格式：%s", truncate(raw, 300))
 	}
 	var sb strings.Builder
 	var toolCalls []openAIToolCall

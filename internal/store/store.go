@@ -583,7 +583,7 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 		// id 不存在：落到下面的「插入或冲突」逻辑。
 		existingID = ""
 	}
-	requestHeaders, err := json.Marshal(e.RequestHeaders)
+	requestHeaders, err := marshalEndpointHeaders(e.RequestHeaders)
 	if err != nil {
 		return fmt.Errorf("encode endpoint request_headers: %w", err)
 	}
@@ -604,7 +604,7 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 
 // updateEndpointByID 按主键 id 覆盖一行（含 account_id/model 归属的变更）。
 func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
-	requestHeaders, err := json.Marshal(e.RequestHeaders)
+	requestHeaders, err := marshalEndpointHeaders(e.RequestHeaders)
 	if err != nil {
 		return fmt.Errorf("encode endpoint request_headers: %w", err)
 	}
@@ -613,6 +613,15 @@ func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
 		e.AccountID, e.Model, e.EP, boolInt(e.Enabled), e.Weight, e.MaxConcurrency,
 		e.RPMLimit, e.TPMLimit, string(requestHeaders), id)
 	return err
+}
+
+// marshalEndpointHeaders 把映射级请求头序列化为 JSON 文本。nil 与空 map 统一
+// 落库为 "{}"（json.Marshal(nil map) 会产出 "null"，造成两种空表示并存）。
+func marshalEndpointHeaders(headers map[string]string) ([]byte, error) {
+	if len(headers) == 0 {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(headers)
 }
 
 // EndpointIDByTuple 按 (账号, 模型名, 上游标识) 三元组定位映射 id。

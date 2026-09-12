@@ -339,7 +339,9 @@ func anthropicToolChoiceToOpenAI(raw json.RawMessage) any {
 func AnthropicResponseFromOpenAI(raw []byte, fallbackModel string) ([]byte, *TextUsage, error) {
 	var src openAIChatResponse
 	if err := json.Unmarshal(raw, &src); err != nil || len(src.Choices) == 0 {
-		return nil, nil, errors.New("上游响应不是合法的 OpenAI chat 格式")
+		// 带上上游原始响应摘要：上游以 200 返回了非 chat.completion 的 body
+		// （错误信封 / SSE 帧 / 非本协议的方言等），否则这个错误无法定位。
+		return nil, nil, fmt.Errorf("上游响应不是合法的 OpenAI chat 格式：%s", truncate(raw, 300))
 	}
 	choice := src.Choices[0]
 	var content []anthropicBlock
@@ -446,6 +448,8 @@ func (m *Manager) AnthropicNativeChat(ctx context.Context, rt Route, down []byte
 	var raw []byte
 	err = client.Post(ctx, "v1/messages", json.RawMessage(body), &raw,
 		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			// 映射级请求头（Claude Code 身份等）；与转换流/原生流保持一致。
+			applyRequestHeaders(req.Header, rt.Headers)
 			resp, err := next(req)
 			if err != nil {
 				return resp, err

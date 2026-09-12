@@ -11,3 +11,4 @@ secret.key
 # AI slop
 AGENTS.md
 docs/
+.zcode/

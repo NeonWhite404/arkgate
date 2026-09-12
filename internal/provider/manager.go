@@ -273,21 +273,29 @@ func (s *Stream) Close() {
 }
 
 // Pump 把整条流写给 sink（含 openStream 已读出的首行），返回从流中提取的用量。
-// 配置了 terminal 检测时（responses），终止事件转发后即结束；失败终止返回
-// ErrStreamFailed（事件已原样转发，调用方只需记账失败，不再补错误帧）。
+// 配置了 terminal 检测时（responses），终止事件所在帧写完（含帧尾空行）即结束；
+// 失败终止返回 ErrStreamFailed（事件已原样转发，调用方只需记账失败，不再补错误帧）。
+// 不能在 data 行后立即返回：SSE 事件以空行结尾，缺了帧尾客户端会丢弃整个终止
+// 事件（按规范 pending event 在流关闭时不派发），completed/failed 就送不到客户端。
 func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 	line := s.first
+	stopping, fail := false, false
 	for {
 		if len(line) > 0 {
 			if p, c, ok := sniffDataLine(line, s.sniff); ok {
 				pt += p
 				ct += c
 			}
-			stop, fail := s.terminalLine(line)
+			if !stopping {
+				if tstop, tfail := s.terminalLine(line); tstop {
+					stopping, fail = true, tfail
+				}
+			}
 			if _, werr := sink.Write(line); werr != nil {
 				return pt, ct, werr
 			}
-			if stop {
+			// 终止事件后继续写，直到当前帧的空行（或 EOF）才收尾。
+			if stopping && len(bytes.TrimSpace(line)) == 0 {
 				if fail {
 					return pt, ct, ErrStreamFailed
 				}
@@ -297,6 +305,9 @@ func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 		line, err = s.rdr.ReadBytes('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if stopping && fail {
+					return pt, ct, ErrStreamFailed
+				}
 				return pt, ct, nil
 			}
 			return pt, ct, err

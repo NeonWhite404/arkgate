@@ -1,8 +1,11 @@
-/* ArkGate 前端 —— Vue 3（vendor 全局构建，免 Node 构建；Arco 风格沿用 style.css）
+/* ArkGate 前端 —— Vue 3（vendor 全局构建，免 Node 构建）
  *
+ * 文件：ui.js（UiDrawer 抽屉 / UiSwitch 开关）→ models.js（模型映射工作台）→ app.js
  * 结构：LoginPage（管理端 / 子 Key 门户双模式登录）
- *      ├─ AdminShell（侧边栏 + 管理页：总览/用量分析/账号/模型映射/子Key/日志/设置 + 底部折叠使用说明）
+ *      ├─ AdminShell（侧边栏 + 管理页：总览/用量分析/账号/模型映射/分流配置/子Key/日志/设置）
  *      └─ PortalPage（子 Key 自助门户：限额进度、用量、成功率、脱敏调用记录）
+ * 交互模式参照 CLIProxyAPI Management Center：复杂实体用「工作台 + 侧滑抽屉」
+ * 分段编辑，替代窄弹窗；简单状态（启停）在表格行内直接切换。
  */
 "use strict";
 
@@ -663,460 +666,47 @@ const AccountsPage = {
       </tr>
     </tbody></table></div></div>
 
-    <div v-if="modal" class="modal-mask" @click.self="modal=null">
-      <div class="modal"><div class="modal-head"><h3>{{ modal.id ? '编辑账号' : '添加账号' }}</h3><button class="modal-close" @click="modal=null">×</button></div>
-      <div class="modal-body">
-        <div class="form-item"><label>名称 <span class="req">*</span></label><input v-model="modal.form.name" placeholder="例如：主账号-北京"/></div>
-        <div class="form-row">
-          <div class="form-item"><label>供应商</label>
-            <select v-model="modal.form.provider">
-              <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.display_name }}（{{ p.id }}）</option>
-            </select></div>
-          <div class="form-item"><label>权重</label><input v-model="modal.form.weight" type="number"/></div>
+    <ui-drawer :open="!!modal" :width="560" :title="modal && modal.id ? '编辑账号' : '添加账号'"
+      :subtitle="modal && modal.id ? modal.form.name : '接入点级限流在「模型映射」工作台按映射配置'" @close="modal=null">
+      <template v-if="modal">
+        <div class="sec">
+          <div class="sec-title">基础信息</div>
+          <div class="form-row">
+            <div class="form-item"><label>名称 <span class="req">*</span></label><input v-model="modal.form.name" placeholder="例如：主账号-北京"/></div>
+            <div class="form-item"><label>权重（其下映射 weight=0 时回落）</label><input v-model.number="modal.form.weight" type="number"/></div>
+          </div>
+          <div class="form-row">
+            <div class="form-item"><label>供应商</label>
+              <select v-model="modal.form.provider">
+                <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.display_name }}（{{ p.id }}）</option>
+              </select></div>
+            <div class="form-item"><label>状态</label>
+              <select v-model="modal.form.status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>
+          </div>
         </div>
-        <div class="form-row">
-          <div class="form-item"><label>状态</label>
-            <select v-model="modal.form.status"><option value="active">启用</option><option value="disabled">禁用</option></select></div>
+        <div class="sec">
+          <div class="sec-title">连接</div>
           <div class="form-item"><label>Base URL</label>
             <input v-model="modal.form.base_url" :placeholder="providerDef() && providerDef().default_base_url ? '留空使用默认：' + providerDef().default_base_url : '必填：该供应商无默认地址（http(s)://…）'"/></div>
+          <div class="form-item"><label>上游 API Key <span class="req">*</span>{{ modal.id ? '（留空表示不修改）' : '' }}</label>
+            <input v-model="modal.form.api_key" placeholder="任意字符串，网关不做格式假设"/></div>
         </div>
-        <div class="form-item"><label>上游 API Key <span class="req">*</span>{{ modal.id ? '（留空表示不修改）' : '' }}</label>
-          <input v-model="modal.form.api_key" placeholder="任意字符串，网关不做格式假设"/></div>
-        <div class="form-row">
-          <div class="form-item"><label>Responses 能力</label>
-            <select v-model="modal.form.cap_responses"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
-          <div class="form-item"><label>图像能力</label>
-            <select v-model="modal.form.cap_images"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
-        </div>
-        <div class="form-item" style="color:var(--color-text-3)">并发 / RPM / TPM 限额请到「模型映射」按接入点配置；能力覆盖用于纠正自定义供应商的能力声明。</div>
-      </div>
-      <div class="modal-foot"><button class="btn btn-outline" @click="modal=null">取消</button>
-        <button class="btn btn-primary" @click="save">保存</button></div>
-      </div></div>
-  </div>`,
-};
-
-// ── 模型映射 ──
-const ModelsPage = {
-  data() {
-    return {
-      models: [], accounts: [], eps: [],
-      mModal: null, // 模型弹窗 {name|null, form, catHint}
-      eModal: null, // 映射弹窗 {id|null, form}
-      iModal: null, // 从上游导入弹窗 {account_id, loading, list, picked}
-      epOptions: [], // 映射弹窗里「拉取上游模型」的候选 id
-      epLoading: false,
-      syncing: false, // 目录补全进行中
-    };
-  },
-  mounted() { this.load(); },
-  methods: {
-    load() {
-      Promise.all([req("GET", "/api/models"), req("GET", "/api/accounts"), req("GET", "/api/endpoints")])
-        .then((rs) => {
-          this.models = rs[0] || []; this.accounts = rs[1] || []; this.eps = rs[2] || [];
-        })
-        .catch((e) => toast(e.message, false));
-    },
-    accName(id) {
-      const a = this.accounts.find((x) => x.id === id);
-      return (a && a.name) || id;
-    },
-    // ── 模型 ──
-    openModel(m) {
-      this.mModal = m ? {
-        name: m.name,
-        originalType: m.type || "text",
-        form: { type: m.type || "text", provider: m.provider || "", display: m.display, description: m.description || "",
-          enabled: m.enabled, price_input: m.price_input || 0, price_output: m.price_output || 0,
-          price_image: m.price_image || 0, context_tokens: m.context_tokens || 0,
-          max_output_tokens: m.max_output_tokens || 0 },
-        catHint: "",
-      } : {
-        name: null,
-        originalType: "text",
-        form: { type: "text", provider: "", display: "", description: "", enabled: true,
-          price_input: 0, price_output: 0, price_image: 0,
-          context_tokens: 0, max_output_tokens: 0 },
-        catHint: "",
-      };
-      if (m && m.type !== "router") this.lookupCat(m.name); // 编辑态：即时显示目录命中情况（路由模型无价格/上下文语义，不查）
-    },
-    // lookupCat 按模型名查内置目录，提示将自动补全的价格/能力（人工填写优先）。
-    lookupCat(name) {
-      if (!name || !this.mModal) return;
-      req("GET", "/api/catalog/lookup?name=" + encodeURIComponent(name))
-        .then((d) => {
-          if (!this.mModal) return;
-          this.mModal.catHint = d.found ? this.catText(d.entry) : "";
-        })
-        .catch(() => {});
-    },
-    catText(e) {
-      if (!e) return "";
-      const parts = [];
-      if (e.max_input) parts.push("上下文 " + fmtTokens(e.max_input));
-      if (e.max_output) parts.push("最大输出 " + fmtTokens(e.max_output));
-      if (e.cost_in) parts.push("输入 $" + e.cost_in + "/1M");
-      if (e.cost_out) parts.push("输出 $" + e.cost_out + "/1M");
-      if (e.cost_image) parts.push("图像 $" + e.cost_image + "/张");
-      return parts.join(" · ");
-    },
-    saveModel() {
-      const f = this.mModal.form;
-      const name = this.mModal.name;
-      // fallback 与 router 配置只在「分流配置」页维护；普通编辑不携带这两个键，
-      // 从而完整保留既有编排。只有类型切换时才清理不兼容的旧配置。
-      const payload = {
-        type: f.type, provider: f.type === "text" ? (f.provider || "") : "",
-        display: f.display.trim() || name, description: f.description.trim(),
-        enabled: f.enabled, price_input: Number(f.price_input) || 0,
-        price_output: Number(f.price_output) || 0, price_image: Number(f.price_image) || 0,
-        context_tokens: Number(f.context_tokens) || 0, max_output_tokens: Number(f.max_output_tokens) || 0,
-      };
-      if (f.type === "router" || (name && this.mModal.originalType !== f.type)) payload.fallback = [];
-      if (this.mModal.originalType === "router" && f.type !== "router") payload.router = null;
-      if (!name) {
-        if (!f.name0 || !f.name0.trim()) { toast("请输入模型名", false); return; }
-      }
-      const p = name
-        ? req("PUT", "/api/models/" + name, payload)
-        : req("POST", "/api/models", { ...payload, name: (f.name0 || "").trim() });
-      p.then((d) => {
-        const filled = d && d.auto_filled;
-        toast(filled && filled.length ? "已保存，目录自动补全：" + filled.join("、") : "已保存");
-        this.mModal = null; this.load();
-      })
-        .catch((e) => toast(e.message, false));
-    },
-    // syncCatalog 在线刷新目录（失败回落内嵌快照）并为所有模型补全空缺字段。
-    syncCatalog() {
-      if (this.syncing) return;
-      this.syncing = true;
-      req("POST", "/api/models/metadata-sync")
-        .then((d) => {
-          const src = d.fetch_ok ? "在线目录" : "内嵌快照";
-          toast(d.updated > 0 ? "已从" + src + "补全 " + d.updated + " 个模型" : "目录已是最新（来源：" + src + "）");
-          this.load();
-        })
-        .catch((e) => toast(e.message, false))
-        .finally(() => { this.syncing = false; });
-    },
-    delModel(m) {
-      if (!confirm("确认删除该模型及其所有映射？")) return;
-      req("DELETE", "/api/models/" + m.name).then(() => { toast("已删除"); this.load(); });
-    },
-    // ── 映射 ──
-    openEp(e) {
-      this.eModal = e ? {
-        id: e.id,
-        form: { account_id: e.account_id, model: e.model, ep: e.ep, enabled: e.enabled,
-          weight: e.weight || 0, max_concurrency: e.max_concurrency || 0,
-          rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0,
-          request_headers_text: JSON.stringify(e.request_headers || {}, null, 2) },
-      } : {
-        id: null,
-        form: { account_id: this.accounts.length ? this.accounts[0].id : "", model: this.models.length ? this.models[0].name : "",
-          ep: "", enabled: true, weight: 0, max_concurrency: 0, rpm_limit: 0, tpm_limit: 0,
-          request_headers_text: "{}" },
-      };
-    },
-    // siblingEps 当前弹窗所选「账号 × 模型」下已存在的其它接入点（同模型的不同版本）。
-    siblingEps() {
-      if (!this.eModal) return [];
-      const f = this.eModal.form;
-      return this.eps.filter((e) => e.account_id === f.account_id && e.model === f.model && e.id !== this.eModal.id);
-    },
-    // epCount 某模型已配置的映射数（跨账号），用于目录表一眼看出多版本模型。
-    epCount(name) {
-      return this.eps.filter((e) => e.model === name).length;
-    },
-    applyHeaderPreset(name) {
-      const presets = {
-        blank: {},
-        claude: {
-          "User-Agent": "claude-cli/1.0.119 (external, cli)",
-          "anthropic-beta": "claude-code-20250219",
-          "x-app": "cli",
-        },
-      };
-      this.eModal.form.request_headers_text = JSON.stringify(presets[name] || {}, null, 2);
-    },
-    saveEp() {
-      const f = this.eModal.form;
-      if (!f.account_id || !f.model || !f.ep.trim()) { toast("请完整填写", false); return; }
-      let requestHeaders;
-      try { requestHeaders = JSON.parse(f.request_headers_text || "{}"); }
-      catch (_) { toast("请求头必须是合法 JSON 对象", false); return; }
-      if (!requestHeaders || Array.isArray(requestHeaders) || typeof requestHeaders !== "object" || Object.values(requestHeaders).some((v) => typeof v !== "string")) {
-        toast("请求头必须是字符串到字符串的 JSON 对象", false); return;
-      }
-      const payload = { account_id: f.account_id, model: f.model, ep: f.ep.trim(), enabled: f.enabled,
-        request_headers: requestHeaders,
-        weight: Number(f.weight) || 0, max_concurrency: Number(f.max_concurrency) || 0,
-        rpm_limit: Number(f.rpm_limit) || 0, tpm_limit: Number(f.tpm_limit) || 0 };
-      const p = this.eModal.id
-        ? req("PUT", "/api/endpoints/" + this.eModal.id, payload)
-        : req("POST", "/api/endpoints", payload);
-      p.then(() => { toast("已保存"); this.eModal = null; this.load(); })
-        .catch((e) => toast(e.message, false));
-    },
-    delEp(e) {
-      if (!confirm("确认删除该映射？")) return;
-      req("DELETE", "/api/endpoints/" + e.id).then(() => { toast("已删除"); this.load(); });
-    },
-    // ── 从上游拉取模型列表（OpenAI 兼容 GET /models） ──
-    // fetchEpOptions 供映射弹窗填 ep：拉一次候选，之后点选即填。
-    fetchEpOptions() {
-      const acc = this.eModal && this.eModal.form.account_id;
-      if (!acc || this.epLoading) return;
-      this.epLoading = true;
-      req("GET", "/api/upstream/models?account_id=" + encodeURIComponent(acc))
-        .then((d) => {
-          this.epOptions = (d.models || []).map((m) => m.id);
-          toast(this.epOptions.length ? "已拉取 " + this.epOptions.length + " 个上游模型" : "上游返回空列表");
-        })
-        .catch((e) => toast(e.message, false))
-        .finally(() => { this.epLoading = false; });
-    },
-    openImport() {
-      this.iModal = {
-        account_id: this.accounts.length ? this.accounts[0].id : "",
-        loading: false, saving: false, list: [], picked: {}, query: "",
-      };
-    },
-    fetchImport() {
-      const m = this.iModal;
-      if (!m || !m.account_id || m.loading) return;
-      m.loading = true;
-      req("GET", "/api/upstream/models?account_id=" + encodeURIComponent(m.account_id))
-        .then((d) => {
-          m.list = d.models || [];
-          m.picked = {};
-          // 已映射到该账号的 ep 默认不勾选，避免重复提交。
-          const mapped = {};
-          this.eps.filter((e) => e.account_id === m.account_id).forEach((e) => { mapped[e.ep] = true; });
-          m.list.forEach((it) => { m.picked[it.id] = !mapped[it.id]; });
-          toast("上游返回 " + m.list.length + " 个模型");
-        })
-        .catch((e) => toast(e.message, false))
-        .finally(() => { m.loading = false; });
-    },
-    importMapped(id) {
-      const m = this.iModal;
-      return this.eps.some((e) => e.account_id === m.account_id && e.ep === id);
-    },
-    filteredImportList() {
-      const m = this.iModal;
-      if (!m) return [];
-      const q = (m.query || "").trim().toLowerCase();
-      return q ? m.list.filter((it) => it.id.toLowerCase().includes(q)) : m.list;
-    },
-    togglePick(id) { this.iModal.picked[id] = !this.iModal.picked[id]; },
-    pickAll(v) { this.filteredImportList().forEach((it) => { this.iModal.picked[it.id] = v; }); },
-    // doImport 逐个「建模型（同名，走目录自动补全）+ 建映射（ep = 上游 id）」，
-    // 已存在的模型/映射按跳过处理，逐条汇总结果。
-    doImport() {
-      const m = this.iModal;
-      const ids = m.list.map((x) => x.id).filter((id) => m.picked[id]);
-      if (!ids.length) { toast("请先选择要导入的模型", false); return; }
-      m.saving = true;
-      const known = {};
-      this.models.forEach((x) => { known[x.name] = true; });
-      let added = 0, skipped = 0, failed = 0;
-      const step = (i) => {
-        if (i >= ids.length) {
-          m.saving = false;
-          this.iModal = null;
-          toast("导入完成：新增 " + added + " 个映射，跳过 " + skipped + "，失败 " + failed);
-          this.load();
-          return;
-        }
-        const id = ids[i];
-        const ensureModel = known[id]
-          ? Promise.resolve()
-          : req("POST", "/api/models", { name: id, type: "text", display: id }).catch(() => {});
-        ensureModel
-          .then(() => req("POST", "/api/endpoints", { account_id: m.account_id, model: id, ep: id, weight: 0 }))
-          .then(() => { added++; })
-          .catch((e) => { if (String(e.message).indexOf("已存在") >= 0) skipped++; else failed++; })
-          .finally(() => step(i + 1));
-      };
-      step(0);
-    },
-  },
-  template: `
-  <div class="page">
-    <div class="page-title">模型映射</div>
-    <div class="toolbar">
-      <button class="btn btn-primary" @click="openModel(null)">+ 新建模型</button>
-      <button class="btn btn-outline" @click="openEp(null)">+ 添加映射</button>
-      <button class="btn btn-outline" @click="openImport">⇩ 从上游导入</button>
-      <div class="spacer"></div>
-      <button class="btn btn-outline" :disabled="syncing" @click="syncCatalog">{{ syncing ? '补全中…' : '⟳ 从目录补全' }}</button>
-    </div>
-    <div class="card"><div class="card-head"><div class="card-title">模型目录</div></div>
-      <div class="table-wrap"><table><thead><tr>
-        <th>模型名</th><th>类型</th><th>显示名</th><th>映射</th><th>上下文 / 最大输出</th><th>价格</th><th>fallback / 分流</th><th>描述</th><th>状态</th><th>操作</th>
-      </tr></thead><tbody>
-        <tr v-if="!models.length"><td colspan="10" class="empty">暂无模型</td></tr>
-        <tr v-for="m in models" :key="m.name">
-          <td class="mono">{{ m.name }}</td>
-          <td><span :class="m.type==='image' ? 'tag tag-purple' : m.type==='router' ? 'tag tag-orange' : 'tag tag-blue'">{{ m.type==='image' ? '图像' : m.type==='router' ? '路由' : '文本' }}</span>
-            <span v-if="m.provider==='anthropic'" class="tag tag-gray" title="上游使用 Anthropic /v1/messages 协议，网关自动转换">Anthropic</span></td>
-          <td>{{ m.display }}</td>
-          <td><span v-if="m.type==='router'" class="tag tag-gray">虚拟</span><span v-else :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 个接入点</span></td>
-          <td class="mono">
-            <template v-if="m.context_tokens || m.max_output_tokens">{{ m.context_tokens ? fmtTokens(m.context_tokens) : '—' }} / {{ m.max_output_tokens ? fmtTokens(m.max_output_tokens) : '—' }}</template>
-            <span v-else>—</span>
-          </td>
-          <td class="cost">
-            <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
-            <template v-else-if="m.type==='router'">—</template>
-            <template v-else-if="m.price_input || m.price_output">{{ fmtCost(m.price_input) }} / {{ fmtCost(m.price_output) }} per 1M</template>
-            <span v-else class="tag tag-gray">未定价</span>
-          </td>
-          <td class="mono">
-            <template v-if="m.type==='router'">→ {{ (m.router && m.router.rules.length) || 0 }} 条规则<template v-if="m.router && m.router.default_target"> · 默认 {{ m.router.default_target }}</template></template>
-            <template v-else>{{ (m.fallback && m.fallback.length) ? m.fallback.join(' → ') : '—' }}</template>
-          </td>
-          <td>{{ m.description }}</td>
-          <td><span :class="m.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ m.enabled ? '启用' : '停用' }}</span></td>
-          <td><div class="row-actions">
-            <button class="btn btn-outline btn-sm" @click="openModel(m)">编辑</button>
-            <button class="btn btn-danger btn-sm" @click="delModel(m)">删除</button>
-          </div></td>
-        </tr>
-      </tbody></table></div></div>
-    <div class="card"><div class="card-head"><div class="card-title">映射表（元组级流控；同一账号 × 同一模型可挂多个接入点，如不同发布版本，按权重分摊）</div></div>
-      <div class="table-wrap"><table><thead><tr>
-        <th>账号</th><th>模型名</th><th>上游模型 / 接入点</th><th>权重</th><th>并发</th><th>RPM</th><th>TPM</th><th>状态</th><th>操作</th>
-      </tr></thead><tbody>
-        <tr v-if="!eps.length"><td colspan="9" class="empty">暂无映射</td></tr>
-        <tr v-for="e in eps" :key="e.id">
-          <td>{{ accName(e.account_id) }}</td><td class="mono">{{ e.model }}</td><td class="mono">{{ e.ep }}</td>
-          <td>{{ e.weight || '继承' }}</td><td>{{ e.max_concurrency || '不限' }}</td>
-          <td>{{ e.rpm_limit || '不限' }}</td><td>{{ e.tpm_limit || '不限' }}</td>
-          <td><span :class="e.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ e.enabled ? '启用' : '停用' }}</span></td>
-          <td><div class="row-actions">
-            <button class="btn btn-outline btn-sm" @click="openEp(e)">编辑</button>
-            <button class="btn btn-danger btn-sm" @click="delEp(e)">删除</button>
-          </div></td>
-        </tr>
-      </tbody></table></div></div>
-
-    <!-- 模型弹窗 -->
-    <div v-if="mModal" class="modal-mask" @click.self="mModal=null">
-      <div class="modal"><div class="modal-head"><h3>{{ mModal.name ? '编辑模型' : '新建模型' }}</h3><button class="modal-close" @click="mModal=null">×</button></div>
-      <div class="modal-body">
-        <div class="form-item"><label>模型名（下游调用用，唯一）<span class="req" v-if="!mModal.name">*</span></label>
-          <input v-if="!mModal.name" v-model="mModal.form.name0" placeholder="例如 doubao-seed-1-6" @blur="lookupCat(mModal.form.name0 && mModal.form.name0.trim())"/>
-          <input v-else :value="mModal.name" disabled/>
-          <div v-if="mModal.catHint" class="form-tip">目录命中：{{ mModal.catHint }}（保存时自动补全空缺字段，人工填写优先）</div></div>
-        <div class="form-item"><label>类型</label>
-          <select v-model="mModal.form.type">
-            <option value="text">文本（chat / responses）</option>
-            <option value="image">图像（images/generations）</option>
-            <option value="router">路由（虚拟分流，按输入长度）</option>
-          </select></div>
-        <div class="form-item" v-if="mModal.form.type==='text'"><label>上游协议</label>
-          <select v-model="mModal.form.provider">
-            <option value="">OpenAI 兼容（默认：chat/completions 透传）</option>
-            <option value="anthropic">Anthropic（/v1/messages，网关自动转换）</option>
-          </select>
-          <div class="form-tip">仅 /v1/responses 需 OpenAI 协议上游。</div></div>
-        <div class="form-item"><label>显示名</label><input v-model="mModal.form.display"/></div>
-        <div class="form-row three" v-if="mModal.form.type==='image'">
-          <div class="form-item"><label>图像单价（$ / 张）</label><input v-model="mModal.form.price_image" type="number" step="0.0001"/></div>
-        </div>
-        <div class="form-row" v-else-if="mModal.form.type!=='router'">
-          <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model="mModal.form.price_input" type="number" step="0.0001"/></div>
-          <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model="mModal.form.price_output" type="number" step="0.0001"/></div>
-        </div>
-        <div class="form-row" v-if="mModal.form.type==='text'">
-          <div class="form-item"><label>上下文窗口（tokens，0=不校验）</label><input v-model="mModal.form.context_tokens" type="number"/></div>
-          <div class="form-item"><label>最大输出（tokens，0=不裁剪）</label><input v-model="mModal.form.max_output_tokens" type="number"/></div>
-        </div>
-        <div class="form-item" v-if="mModal.form.type==='router'"><div class="form-tip">保存基本信息后，请到「分流配置」页设置输入长度分流规则。</div></div>
-        <div class="form-tip" v-else>fallback 链请到「分流配置」页编排。</div>
-        <div class="form-item"><label>描述</label><input v-model="mModal.form.description"/></div>
-        <div class="form-item"><label>状态</label>
-          <select v-model="mModal.form.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></div>
-      </div>
-      <div class="modal-foot"><button class="btn btn-outline" @click="mModal=null">取消</button>
-        <button class="btn btn-primary" @click="saveModel">保存</button></div>
-      </div></div>
-
-    <!-- 映射弹窗 -->
-    <div v-if="eModal" class="modal-mask" @click.self="eModal=null">
-      <div class="modal"><div class="modal-head"><h3>{{ eModal.id ? '编辑接入点映射' : '添加接入点映射' }}</h3><button class="modal-close" @click="eModal=null">×</button></div>
-      <div class="modal-body">
-        <div class="form-item"><label>账号 <span class="req">*</span></label>
-          <select v-model="eModal.form.account_id"><option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }}</option></select></div>
-        <div class="form-item"><label>模型名 <span class="req">*</span></label>
-          <select v-model="eModal.form.model"><option v-for="m in models" :key="m.name" :value="m.name">{{ m.name }}</option></select></div>
-        <div class="form-item"><label>上游模型 / 接入点 <span class="req">*</span></label>
-          <div style="display:flex;gap:8px">
-            <input v-model="eModal.form.ep" placeholder="如 ep-2025xxxxxxx（Ark）或 gpt-4o（OpenAI），按账号供应商填写"/>
-            <button class="btn btn-outline" style="white-space:nowrap" :disabled="epLoading" @click="fetchEpOptions">{{ epLoading ? '拉取中…' : '⇩ 拉取上游' }}</button>
+        <div class="sec">
+          <div class="sec-title">能力覆盖（三态）</div>
+          <div class="form-row">
+            <div class="form-item"><label>Responses 能力</label>
+              <select v-model="modal.form.cap_responses"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
+            <div class="form-item"><label>图像能力</label>
+              <select v-model="modal.form.cap_images"><option v-for="o in capOptions" :key="o.v" :value="o.v">{{ o.label }}</option></select></div>
           </div>
-          <div v-if="epOptions.length" class="ep-picker">
-            <span v-for="o in epOptions" :key="o" class="ep-chip" :class="{active: eModal.form.ep === o}" @click="eModal.form.ep = o">{{ o }}</span>
-          </div>
-          <div v-if="siblingEps().length" class="form-tip">该账号下「{{ eModal.form.model }}」已有 {{ siblingEps().length }} 个接入点：{{ siblingEps().map(x => x.ep).join('、') }}（可继续添加不同发布版本，流量按权重分摊）</div></div>
-        <div class="form-row three">
-          <div class="form-item"><label>权重</label><input v-model="eModal.form.weight" type="number"/></div>
-          <div class="form-item"><label>并发上限</label><input v-model="eModal.form.max_concurrency" type="number"/></div>
-          <div class="form-item"><label>RPM</label><input v-model="eModal.form.rpm_limit" type="number"/></div>
+          <div class="form-tip">用于纠正自定义供应商的能力声明；并发 / RPM / TPM 限额请到「模型映射」按接入点配置。</div>
         </div>
-        <div class="form-item"><label>TPM</label><input v-model="eModal.form.tpm_limit" type="number"/></div>
-        <div class="form-item"><label>上游请求头（JSON）</label>
-          <div class="row-actions" style="margin-bottom:8px"><button class="btn btn-outline btn-sm" type="button" @click="applyHeaderPreset('blank')">白板</button><button class="btn btn-outline btn-sm" type="button" @click="applyHeaderPreset('claude')">Claude Code</button></div>
-          <textarea v-model="eModal.form.request_headers_text" rows="6" spellcheck="false" placeholder='{"User-Agent":"Hermes/1.0"}'></textarea>
-          <div class="form-tip">Claude Code 预置使用 User-Agent=claude-cli/1.0.119、anthropic-beta=claude-code-20250219 与 x-app=cli。Hermes 等身份头可自行填写。认证、传输级与协议相关敏感头不可覆盖。</div>
-        </div>
-        <div class="form-item"><label>状态</label>
-          <select v-model="eModal.form.enabled"><option :value="true">启用</option><option :value="false">停用</option></select></div>
-      </div>
-      <div class="modal-foot"><button class="btn btn-outline" @click="eModal=null">取消</button>
-        <button class="btn btn-primary" @click="saveEp">保存</button></div>
-      </div></div>
-
-    <!-- 从上游导入弹窗（OpenAI 兼容 GET /models） -->
-    <div v-if="iModal" class="modal-mask" @click.self="iModal=null">
-      <div class="modal"><div class="modal-head"><h3>从上游导入模型</h3><button class="modal-close" @click="iModal=null">×</button></div>
-      <div class="modal-body">
-        <div class="form-item"><label>账号（用其凭据请求上游 GET /models）</label>
-          <div style="display:flex;gap:8px">
-            <select v-model="iModal.account_id">
-              <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }}</option>
-            </select>
-            <button class="btn btn-outline" style="white-space:nowrap" :disabled="iModal.loading" @click="fetchImport">{{ iModal.loading ? '拉取中…' : '⇩ 拉取列表' }}</button>
-          </div>
-          <div class="form-tip">导入会为每个选中项建立「同名模型 + 映射（上游标识 = 模型 id）」，价格与能力上限走目录自动补全；已存在的自动跳过。类型默认文本，图像模型请导入后到目录里改。</div></div>
-        <div v-if="iModal.list.length">
-          <div class="row-actions" style="margin-bottom:8px">
-            <input v-model="iModal.query" placeholder="搜索上游模型" style="width:210px"/>
-            <button class="btn btn-outline btn-sm" @click="pickAll(true)">全选</button>
-            <button class="btn btn-outline btn-sm" @click="pickAll(false)">全不选</button>
-            <span class="sh-note">显示 {{ filteredImportList().length }} / {{ iModal.list.length }} 项</span>
-          </div>
-          <div class="import-list">
-            <label v-for="it in filteredImportList()" :key="it.id" class="import-row">
-              <input type="checkbox" :checked="iModal.picked[it.id]" @change="togglePick(it.id)"/>
-              <span class="mono import-model">{{ it.id }}</span>
-              <span v-if="importMapped(it.id)" class="tag tag-gray">已映射</span>
-              <div class="spacer"></div>
-              <ProbeTest :payload="{account_id: iModal.account_id, ep: it.id}" @click.stop/>
-            </label>
-            <div v-if="!filteredImportList().length" class="empty">没有匹配的上游模型</div>
-          </div>
-        </div>
-        <div v-else class="empty">先选择账号并拉取列表</div>
-      </div>
-      <div class="modal-foot"><button class="btn btn-outline" @click="iModal=null">取消</button>
-        <button class="btn btn-primary" :disabled="iModal.saving || !iModal.list.length" @click="doImport">{{ iModal.saving ? '导入中…' : '导入选中' }}</button></div>
-      </div></div>
+      </template>
+      <template #foot>
+        <button class="btn btn-outline" @click="modal=null">取消</button>
+        <button class="btn btn-primary" @click="save">保存</button>
+      </template>
+    </ui-drawer>
   </div>`,
 };
 
@@ -1202,21 +792,33 @@ const SubKeysPage = {
       </tr>
     </tbody></table></div></div>
 
-    <div v-if="modal" class="modal-mask" @click.self="modal=null">
-      <div class="modal"><div class="modal-head"><h3>{{ modal.id ? '编辑子 Key' : '新建子 Key' }}</h3><button class="modal-close" @click="modal=null">×</button></div>
-      <div class="modal-body">
-        <div class="form-item"><label>名称</label><input v-model="modal.form.name" placeholder="例如：给团队的 Key"/></div>
-        <div class="form-item" v-if="!modal.id"><label>自定义 Key（留空自动生成 sk-xxx）</label><input v-model="modal.form.key" placeholder="sk-..."/></div>
-        <div class="form-item"><label>可访问模型（不勾选 = 全部）</label>
-          <CheckGroup :options="models.map(m => ({v: m.name, l: m.name}))" v-model="modal.form.allowed_models"/></div>
-        <div class="form-item"><label>可访问账号（不勾选 = 全部）</label>
-          <CheckGroup :options="accounts.map(a => ({v: a.id, l: a.name}))" v-model="modal.form.allowed_accounts"/></div>
-        <div class="form-item"><label>当日 Token 限额（0 = 不限）</label><input v-model="modal.form.daily_limit_tokens" type="number"/></div>
-        <div class="form-item"><label>当日图像张数限额（0 = 不限）</label><input v-model="modal.form.daily_limit_images" type="number"/></div>
-      </div>
-      <div class="modal-foot"><button class="btn btn-outline" @click="modal=null">取消</button>
-        <button class="btn btn-primary" @click="save">保存</button></div>
-      </div></div>
+    <ui-drawer :open="!!modal" :width="560" :title="modal && modal.id ? '编辑子 Key' : '新建子 Key'" @close="modal=null">
+      <template v-if="modal">
+        <div class="sec">
+          <div class="sec-title">基础信息</div>
+          <div class="form-item"><label>名称</label><input v-model="modal.form.name" placeholder="例如：给团队的 Key"/></div>
+          <div class="form-item" v-if="!modal.id"><label>自定义 Key（留空自动生成 sk-xxx）</label><input v-model="modal.form.key" placeholder="sk-..."/></div>
+        </div>
+        <div class="sec">
+          <div class="sec-title">访问白名单</div>
+          <div class="form-item"><label>可访问模型（不勾选 = 全部）</label>
+            <CheckGroup :options="models.map(m => ({v: m.name, l: m.name}))" v-model="modal.form.allowed_models"/></div>
+          <div class="form-item"><label>可访问账号（不勾选 = 全部）</label>
+            <CheckGroup :options="accounts.map(a => ({v: a.id, l: a.name}))" v-model="modal.form.allowed_accounts"/></div>
+        </div>
+        <div class="sec">
+          <div class="sec-title">当日限额（自然日，本地时区）</div>
+          <div class="form-row">
+            <div class="form-item"><label>Token 限额（0 = 不限）</label><input v-model.number="modal.form.daily_limit_tokens" type="number"/></div>
+            <div class="form-item"><label>图像张数限额（0 = 不限）</label><input v-model.number="modal.form.daily_limit_images" type="number"/></div>
+          </div>
+        </div>
+      </template>
+      <template #foot>
+        <button class="btn btn-outline" @click="modal=null">取消</button>
+        <button class="btn btn-primary" @click="save">保存</button>
+      </template>
+    </ui-drawer>
   </div>`,
 };
 
@@ -1716,7 +1318,7 @@ const RoutingPage = {
     saveChain() {
       if (!this.sel) return;
       this.savingC = true;
-      req("PUT", "/api/models/" + this.sel, { fallback: this.chain })
+      req("PUT", "/api/models/" + encodeURIComponent(this.sel), { fallback: this.chain })
         .then(() => { toast("已保存 fallback 链"); this.load(); })
         .catch((e) => toast(e.message, false))
         .finally(() => { this.savingC = false; });
@@ -1737,7 +1339,7 @@ const RoutingPage = {
       }
       this.savingR = true;
       // 模型 PUT 是部分更新：只带 router 键，不会动到该模型的其它字段。
-      req("PUT", "/api/models/" + this.sel, { router: { rules, default_target: this.rDraft.default_target || "" } })
+      req("PUT", "/api/models/" + encodeURIComponent(this.sel), { router: { rules, default_target: this.rDraft.default_target || "" } })
         .then(() => { toast("已保存分流规则"); this.load(); })
         .catch((e) => toast(e.message, false))
         .finally(() => { this.savingR = false; });
@@ -1994,14 +1596,14 @@ const SettingsPage = {
 
 // ── 管理端外壳 ──
 const MENU = [
-  { key: "overview", label: "总览", icon: "📊", comp: "OverviewPage" },
-  { key: "usage", label: "用量分析", icon: "📈", comp: "UsagePage" },
-  { key: "accounts", label: "上游账号", icon: "🏛", comp: "AccountsPage" },
-  { key: "models", label: "模型映射", icon: "🧩", comp: "ModelsPage" },
-  { key: "routing", label: "分流配置", icon: "🔀", comp: "RoutingPage" },
-  { key: "subkeys", label: "子 Key", icon: "🔑", comp: "SubKeysPage" },
-  { key: "logs", label: "请求日志", icon: "📄", comp: "LogsPage" },
-  { key: "settings", label: "设置", icon: "⚙️", comp: "SettingsPage" },
+  { key: "overview", label: "总览", icon: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>', comp: "OverviewPage" },
+  { key: "usage", label: "用量分析", icon: '<path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 5-6"/>', comp: "UsagePage" },
+  { key: "accounts", label: "上游账号", icon: '<rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01M6 16.5h.01"/>', comp: "AccountsPage" },
+  { key: "models", label: "模型映射", icon: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/>', comp: "ModelsPage" },
+  { key: "routing", label: "分流配置", icon: '<path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="m21 3-6.5 6.5"/><path d="m3 3 7 7"/><path d="M16 21h5v-5"/><path d="m21 21-5-5"/>', comp: "RoutingPage" },
+  { key: "subkeys", label: "子 Key", icon: '<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7"/><path d="m15 8 3 3"/><path d="m18 5 2 2"/>', comp: "SubKeysPage" },
+  { key: "logs", label: "请求日志", icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/>', comp: "LogsPage" },
+  { key: "settings", label: "设置", icon: '<path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/><path d="M20 21v-5"/><path d="M20 12V3"/><path d="M2 14h4"/><path d="M10 8h4"/><path d="M18 16h4"/>', comp: "SettingsPage" },
 ];
 
 const AdminShell = {
@@ -2025,7 +1627,7 @@ const AdminShell = {
       <div class="logo"><span class="dot"></span>ArkGate<span class="ver">v1.1</span></div>
       <div class="nav">
         <div v-for="m in menu" :key="m.key" class="nav-item" :class="{active: view===m.key}" @click="view=m.key">
-          <span class="ic">{{ m.icon }}</span>{{ m.label }}
+          <svg class="nav-ic" viewBox="0 0 24 24" v-html="m.icon"></svg>{{ m.label }}
         </div>
       </div>
       <div class="side-help">
@@ -2244,6 +1846,8 @@ app.config.globalProperties.fmtPct = fmtPct;
 app.config.globalProperties.toggleDark = toggleDark;
 app.config.globalProperties.capOptions = capOptions;
 app.component("ProbeTest", ProbeTest)
+  .component("UiDrawer", UiDrawer)   // ui.js：侧滑抽屉（工作台编辑容器）
+  .component("UiSwitch", UiSwitch)   // ui.js：开关
   .component("OverviewPage", OverviewPage)
   .component("UsagePage", UsagePage)
   .component("AccountsPage", AccountsPage)
