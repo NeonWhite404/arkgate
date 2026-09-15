@@ -53,6 +53,25 @@ func TestListModelsShapes(t *testing.T) {
 	}
 }
 
+// TestListModelsEmptyDataSuccess 标准形态的空列表 {"data":[]} 是合法的成功
+// 空结果（上游真的没有模型），与「接口不支持/响应损坏」必须区分——后者仍报错。
+func TestListModelsEmptyDataSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer srv.Close()
+	m := NewManager()
+	list, err := m.ListModels(context.Background(),
+		Route{BaseURL: srv.URL, Key: "k"}, time.Second)
+	if err != nil {
+		t.Fatalf("empty data must be success: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("empty data must yield empty list, got %+v", list)
+	}
+}
+
 // TestListModelsErrors 上游非 2xx 包成 HTTPError（错误体保留，供管理端提示
 // 真实原因）；无法解析的 200 响应必须报错而不是静默返回空列表。
 func TestListModelsErrors(t *testing.T) {

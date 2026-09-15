@@ -164,11 +164,13 @@ type UpstreamModel struct {
 }
 
 // ListModels 拉取上游的 OpenAI 兼容模型列表（GET {base}/models），供管理端
-// 「从上游导入」减少手工录入。非 2xx 原样包成 HTTPError（错误体保留），
-// 让管理端能显示上游的真实原因（未授权 / 不支持该接口等）。
+// 「从上游导入」减少手工录入，也供上游模型检查器核对映射是否仍然存在。
+// 非 2xx 原样包成 HTTPError（错误体保留），让调用方能区分真实失败原因。
 //
 // 解析容忍三种常见形态：标准 {"data":[{"id":...}]}、裸对象数组、裸字符串数组；
 // 都取不到就报错，而不是静默返回空列表（空列表会被误读成「上游没有模型」）。
+// 例外：标准 {"data":[]}（字段存在且确实是空数组）是合法的成功空结果——
+// 检查器需要区分「上游没有任何模型」与「接口不支持/响应损坏」。
 func (m *Manager) ListModels(ctx context.Context, rt Route, timeout time.Duration) ([]UpstreamModel, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -200,18 +202,30 @@ func (m *Manager) ListModels(ctx context.Context, rt Route, timeout time.Duratio
 }
 
 func parseModelList(raw []byte) ([]UpstreamModel, error) {
+	// 标准 {"data": [...]}：字段存在即按标准形态解析——空数组是合法的成功空结果，
+	// 与「没有 data 字段」（非标准形态）区分开。
 	var wrapped struct {
 		Data []UpstreamModel `json:"data"`
 	}
-	if json.Unmarshal(raw, &wrapped) == nil && len(wrapped.Data) > 0 {
+	if err := json.Unmarshal(raw, &wrapped); err == nil {
+		if wrapped.Data == nil {
+			// 显式 data:null 与缺失同视：回落裸形态解析。
+			return parseModelListBare(raw)
+		}
 		return filterModels(wrapped.Data), nil
 	}
+	return parseModelListBare(raw)
+}
+
+// parseModelListBare 解析裸对象数组 / 裸字符串数组；空数组同样是成功空结果，
+// 都取不到时才报错（防把「接口不支持/响应损坏」误读成「上游没有模型」）。
+func parseModelListBare(raw []byte) ([]UpstreamModel, error) {
 	var bare []UpstreamModel
-	if json.Unmarshal(raw, &bare) == nil && len(bare) > 0 {
+	if err := json.Unmarshal(raw, &bare); err == nil && bare != nil {
 		return filterModels(bare), nil
 	}
 	var names []string
-	if json.Unmarshal(raw, &names) == nil && len(names) > 0 {
+	if err := json.Unmarshal(raw, &names); err == nil && names != nil {
 		out := make([]UpstreamModel, 0, len(names))
 		for _, n := range names {
 			out = append(out, UpstreamModel{ID: n})

@@ -153,6 +153,13 @@ type Endpoint struct {
 	Enabled   bool   `json:"enabled"`
 	CreatedAt int64  `json:"created_at"`
 
+	// UpstreamDeleted 上游模型检查器的发现状态：最近一次成功探测中，该 EP 已
+	// 不在账号上游的模型列表里。它是「观察结果」而不是路由开关——不影响网关
+	// 选路、不自动停用、与熔断/限流互不干扰；仅用于管理界面提示，且随检查器
+	// 后续成功探测自动恢复（false）。与 Enabled（用户手动启停）语义独立，
+	// 普通编辑请求不应覆盖它（仅检查器的批量同步有权写入）。
+	UpstreamDeleted bool `json:"upstream_deleted"`
+
 	// 叶节点级流量控制
 	Weight         int               `json:"weight"` // 0 = 继承账号权重
 	MaxConcurrency int               `json:"max_concurrency"`

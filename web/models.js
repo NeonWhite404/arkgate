@@ -69,6 +69,10 @@ const ModelsPage = {
     epCount(name) {
       return this.eps.filter((e) => e.model === name).length;
     },
+    // deletedEpCount 该模型下「上游已删除」的接入点数（行内警告角标）。
+    deletedEpCount(name) {
+      return this.eps.filter((e) => e.model === name && e.upstream_deleted).length;
+    },
     filteredModels() {
       const q = (this.query || "").trim().toLowerCase();
       if (!q) return this.models;
@@ -123,6 +127,11 @@ const ModelsPage = {
       if (!this.mDrawer || !this.mDrawer.name) return [];
       return this.eps.filter((e) => e.account_id === row.form.account_id &&
         e.model === this.mDrawer.name && e.id !== row.id);
+    },
+    // epDeleted 该行对应的持久化映射是否带「上游已删除」标记。
+    epDeleted(id) {
+      const e = this.eps.find((x) => x.id === id);
+      return !!e && !!e.upstream_deleted;
     },
     applyHeaderPreset(name, row) {
       row.form.request_headers_text = JSON.stringify(HEADER_PRESETS[name] || {}, null, 2);
@@ -371,7 +380,8 @@ const ModelsPage = {
           <td><span :class="'tag ' + typeTag(m)[0]">{{ typeTag(m)[1] }}</span>
             <span v-if="m.type==='text' && m.provider==='anthropic'" class="tag tag-gray" title="上游使用 Anthropic /v1/messages 协议，网关自动转换">Anthropic</span></td>
           <td><span v-if="m.type==='router'" class="tag tag-out">虚拟</span>
-            <span v-else :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 接入点</span></td>
+            <span v-else :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 接入点</span>
+            <span v-if="deletedEpCount(m.name)" class="tag tag-warn" :title="'其中 ' + deletedEpCount(m.name) + ' 个接入点的上游模型已不在该账号的模型列表中（检查器标记，不影响路由，随上游恢复自动消除）'">⚠ 上游已删除 ×{{ deletedEpCount(m.name) }}</span></td>
           <td class="cost">
             <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
             <template v-else-if="m.type==='router'">—</template>
@@ -467,6 +477,7 @@ const ModelsPage = {
                 <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }}</option>
               </select>
               <input class="ep-input mono" v-model="row.form.ep" placeholder="上游模型标识，如 ep-2025xxx / gpt-4o"/>
+              <span v-if="row.id && epDeleted(row.id)" class="tag tag-warn" title="该上游标识已不在对应账号的模型列表中：映射保留、路由不受影响；上游恢复后此标记自动消失。若要更换上游标识请直接编辑并保存。">⚠ 上游已删除</span>
               <button class="btn btn-outline btn-sm" :disabled="row.optsLoading || !row.form.account_id" @click="fetchRowEp(row)">{{ row.optsLoading ? '拉取中…' : '⇩ 拉取' }}</button>
               <ui-switch v-model="row.form.enabled" size="sm"/>
             </div>

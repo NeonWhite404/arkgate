@@ -769,3 +769,206 @@ func TestModelProviderRoundTrip(t *testing.T) {
 		t.Fatalf("default provider must be empty, got %q", plain.Provider)
 	}
 }
+
+// TestEndpointUpstreamDeletedMigration v11 迁移：旧库（endpoints 无
+// upstream_deleted 列）打开后自动补列，存量记录默认「上游存在」（false，
+// 等价旧行为），且旧库数据原样保留。
+func TestEndpointUpstreamDeletedMigration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "arkgate.db"))
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	// v11 之前的库：endpoints 已含 v5 三元组约束与 v10 request_headers，
+	// 唯独没有 upstream_deleted。
+	legacy := []string{
+		`CREATE TABLE endpoints (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			model TEXT NOT NULL,
+			ep TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at INTEGER NOT NULL DEFAULT 0,
+			weight INTEGER NOT NULL DEFAULT 0,
+			max_concurrency INTEGER NOT NULL DEFAULT 0,
+			rpm_limit INTEGER NOT NULL DEFAULT 0,
+			tpm_limit INTEGER NOT NULL DEFAULT 0,
+			last_used_at INTEGER NOT NULL DEFAULT 0,
+			total_requests INTEGER NOT NULL DEFAULT 0,
+			success_requests INTEGER NOT NULL DEFAULT 0,
+			fail_requests INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			total_images INTEGER NOT NULL DEFAULT 0,
+			request_headers TEXT NOT NULL DEFAULT '{}',
+			UNIQUE(account_id, model, ep)
+		)`,
+		`INSERT INTO endpoints (id,account_id,model,ep,enabled,weight)
+			VALUES ('e-old','acc-old','m-old','ep-old',1,7)`,
+	}
+	for _, st := range legacy {
+		if _, err := db.Exec(st); err != nil {
+			t.Fatalf("legacy schema: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy: %v", err)
+	}
+
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("migrate open: %v", err)
+	}
+	defer s.Close()
+	eps, err := s.ListEndpoints()
+	if err != nil || len(eps) != 1 {
+		t.Fatalf("endpoints after migrate: %d (%v)", len(eps), err)
+	}
+	e := eps[0]
+	if e.ID != "e-old" || e.EP != "ep-old" || e.Weight != 7 || e.UpstreamDeleted {
+		t.Fatalf("legacy endpoint altered or wrong default: %+v", e)
+	}
+	if v, ok := s.GetSetting("schema_version"); !ok || v != schemaVersion {
+		t.Fatalf("schema_version = %q %v", v, ok)
+	}
+	// 补列后迁移幂等：重开不报错，数据仍在。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if got, err := s2.GetEndpoint("e-old"); err != nil || got.UpstreamDeleted || got.Weight != 7 {
+		t.Fatalf("after reopen: %+v (%v)", got, err)
+	}
+}
+
+// TestEndpointUpstreamDeletedRoundTrip 删除状态写入后重开数据库仍保留；
+// 管理端编辑（按 id 覆盖）不清掉检查器维护的状态。
+func TestEndpointUpstreamDeletedRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := s.UpsertEndpoint(&model.Endpoint{
+		ID: "e1", AccountID: "a1", Model: "m1", EP: "ep-gone", Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// 普通编辑路径：enabled/weight 等可编辑字段照常更新，upstream_deleted 不被清零。
+	if err := s.UpsertEndpoint(&model.Endpoint{
+		ID: "e1", AccountID: "a1", Model: "m1", EP: "ep-gone", Enabled: false, Weight: 5,
+	}); err != nil {
+		t.Fatalf("upsert edit: %v", err)
+	}
+	if _, err := s.SyncEndpointUpstreamPresence("a1", []string{"other-ep"}); err != nil {
+		t.Fatalf("sync mark deleted: %v", err)
+	}
+	got, err := s.GetEndpoint("e1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.UpstreamDeleted || got.Enabled || got.Weight != 5 {
+		t.Fatalf("after sync: %+v", got)
+	}
+	// 再走一次普通编辑（不改状态字段），upstream_deleted 必须保留。
+	if err := s.UpsertEndpoint(&model.Endpoint{
+		ID: "e1", AccountID: "a1", Model: "m1", EP: "ep-gone", Enabled: false, Weight: 9,
+	}); err != nil {
+		t.Fatalf("upsert edit 2: %v", err)
+	}
+	got, err = s.GetEndpoint("e1")
+	if err != nil || !got.UpstreamDeleted || got.Weight != 9 {
+		t.Fatalf("edit must not clear upstream_deleted: %+v (%v)", got, err)
+	}
+	// 重开数据库：状态仍在。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	got2, err := s2.GetEndpoint("e1")
+	if err != nil || !got2.UpstreamDeleted {
+		t.Fatalf("upstream_deleted lost after reopen: %+v (%v)", got2, err)
+	}
+}
+
+// TestSyncEndpointUpstreamPresence 批量同步：同时标记缺失项与恢复重新出现项、
+// 空集合标记账号下全部、不同账号同名 EP 互不影响。
+func TestSyncEndpointUpstreamPresence(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	mk := func(id, acc, ep string) {
+		if err := s.UpsertEndpoint(&model.Endpoint{
+			ID: id, AccountID: acc, Model: "m", EP: ep, Enabled: true,
+		}); err != nil {
+			t.Fatalf("upsert %s: %v", id, err)
+		}
+	}
+	mk("e1", "a1", "ep-keep")
+	mk("e2", "a1", "ep-drop")
+	mk("e3", "a2", "ep-drop") // 与 a1 同名 EP：账号隔离，不受 a1 影响
+
+	deletedOf := func(id string) bool {
+		e, err := s.GetEndpoint(id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		return e.UpstreamDeleted
+	}
+
+	// 集合内恢复 + 集合外标记：e2 消失被标删除，e1 保留。
+	restored, err := s.SyncEndpointUpstreamPresence("a1", []string{"ep-keep"})
+	if err != nil || restored != 0 {
+		t.Fatalf("sync a1: restored=%d err=%v", restored, err)
+	}
+	if deletedOf("e1") || !deletedOf("e2") {
+		t.Fatalf("a1 states wrong: e1=%v e2=%v", deletedOf("e1"), deletedOf("e2"))
+	}
+	// 账号隔离：a2 的同名 ep-drop 未被 a1 的同步波及。
+	if deletedOf("e3") {
+		t.Fatalf("a2 ep must be untouched by a1 sync")
+	}
+
+	// ep-drop 重新出现：恢复 + 计数正确。
+	restored, err = s.SyncEndpointUpstreamPresence("a1", []string{"ep-drop"})
+	if err != nil || restored != 1 {
+		t.Fatalf("sync restore: restored=%d err=%v", restored, err)
+	}
+	if deletedOf("e2") {
+		t.Fatalf("e2 must be restored")
+	}
+
+	// 成功空集合：账号下全部标记为已删除。
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync empty: %v", err)
+	}
+	if !deletedOf("e1") || !deletedOf("e2") {
+		t.Fatalf("empty set must mark all: e1=%v e2=%v", deletedOf("e1"), deletedOf("e2"))
+	}
+	// 空集合同样有账号边界：a2 不动。
+	if deletedOf("e3") {
+		t.Fatalf("a2 ep must be untouched by a1 empty sync")
+	}
+
+	// 重复同步幂等：恢复数只统计「状态翻转」的行。
+	if _, err := s.SyncEndpointUpstreamPresence("a1", []string{"ep-keep"}); err != nil {
+		t.Fatalf("sync restore again: %v", err)
+	}
+	restored, err = s.SyncEndpointUpstreamPresence("a1", []string{"ep-keep"})
+	if err != nil || restored != 0 {
+		t.Fatalf("idempotent restore count: restored=%d err=%v", restored, err)
+	}
+}

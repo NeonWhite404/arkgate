@@ -179,6 +179,11 @@ td.empty, .empty { text-align: center; color: var(--color-text-3); padding: 36px
 .tag-purple { background: rgba(var(--purple-6), .12); color: rgb(var(--purple-6)); }
 .tag-cyan { background: rgba(var(--cyan-6), .14); color: rgb(var(--cyan-6)); }
 .tag-out { background: transparent; border: 1px solid var(--color-border-2); color: var(--color-text-3); }
+/* 上游已删除警告（检查器标记）：深浅主题均醒目的黄色警示 */
+.tag-warn { background: rgba(var(--orange-6), .14); color: rgb(var(--orange-6));
+  border: 1px solid rgba(var(--orange-6), .4); }
+[data-theme="dark"] .tag-warn { background: rgba(255, 170, 40, .16); color: #ffb84d;
+  border-color: rgba(255, 170, 40, .45); }
 
 /* ── 表单 ───────────────────────────────────────────────────────────────── */
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -371,7 +376,7 @@ select { appearance: none; background-image: url("data:image/svg+xml;charset=utf
 .chart-grid .wide { grid-column: 1 / -1; }
 @media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
 
-/* 水平条形（分布图） */
+/* 水平条形（分布图）——已由总览页饼图取代，保留样式以防其它引用 */
 .hbars { display: flex; flex-direction: column; gap: 10px; }
 .hbar-row { display: grid; grid-template-columns: minmax(80px, 160px) 1fr 64px; align-items: center; gap: 10px; }
 .hbar-label { font-size: 12px; color: var(--color-text-2); overflow: hidden;
@@ -379,6 +384,27 @@ select { appearance: none; background-image: url("data:image/svg+xml;charset=utf
 .hbar-track { height: 14px; background: var(--color-fill-1); border-radius: 4px; overflow: hidden; }
 .hbar-fill { height: 100%; border-radius: 4px; background: rgb(var(--primary-6)); min-width: 2px; }
 .hbar-val { font-size: 12px; color: var(--color-text-3); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 总览分布饼图（模型 / 子 Key 24h Tokens） */
+.pie-wrap { display: flex; align-items: center; gap: 20px; }
+.pie-svg { flex-shrink: 0; display: block; }
+.pie-svg path { stroke: var(--color-bg-1); stroke-width: 1.5; }
+.pie-legend { list-style: none; flex: 1; min-width: 0; display: flex;
+  flex-direction: column; gap: 7px; }
+.pie-leg-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.pie-leg-row .leg-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.pie-leg-label { color: var(--color-text-2); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1; min-width: 0; }
+.pie-leg-val { color: var(--color-text-3); font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono); font-size: 11.5px; white-space: nowrap; }
+.pie-leg-pct { color: var(--color-text-3); font-variant-numeric: tabular-nums;
+  width: 46px; text-align: right; white-space: nowrap; }
+.pie-leg-row.leg-other .leg-swatch { background: #9ca3af !important; }
+.pie-leg-row.leg-other .pie-leg-label { color: var(--color-text-3); }
+/* 窄屏：饼图与图例纵向排列 */
+@media (max-width: 560px) {
+  .pie-wrap { flex-direction: column; align-items: flex-start; }
+}
 
 /* 分段切换控件 */
 .seg { display: inline-flex; background: var(--color-fill-1); border-radius: 7px; padding: 2px; gap: 2px; }
@@ -433,9 +459,13 @@ select { appearance: none; background-image: url("data:image/svg+xml;charset=utf
 .ep-card:hover { border-color: var(--color-border-3); }
 .ep-card.off { opacity: .62; }
 .ep-card-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
-  border-bottom: 1px solid var(--color-border-1); }
+  border-bottom: 1px solid var(--color-border-1); flex-wrap: wrap; }
 .ep-card-head select { width: 150px; flex-shrink: 0; }
-.ep-card-head .ep-input { flex: 1; min-width: 0; }
+.ep-card-head .ep-input { flex: 1; min-width: 140px; }
+/* 窄屏下警告标签不挤压输入框 */
+@media (max-width: 700px) {
+  .ep-card-head .tag-warn { order: 10; flex-basis: 100%; justify-content: center; }
+}
 .ep-card-body { padding: 10px 12px 12px; }
 .ep-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
 .ep-metrics label { font-size: 11px; color: var(--color-text-3); display: block; margin-bottom: 3px; }

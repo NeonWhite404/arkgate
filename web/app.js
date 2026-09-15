@@ -272,23 +272,14 @@ const OverviewPage = {
       }
       return Object.values(byTs).sort((a, b) => a.t - b.t);
     },
-    // 模型 / 子 Key 分布（tokens 降序，颜色与趋势图中的模型色一致）。
-    modelColors() {
-      const models = [...new Set(this.series.map((p) => p.model || "—"))].sort();
-      const colors = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#14b8a6"];
-      const map = {};
-      models.forEach((m, i) => { map[m] = colors[i % colors.length]; });
-      return map;
-    },
+    // 模型 / 子 Key 分布（tokens 聚合；着色在饼图渲染时按名称哈希固定）。
     modelDist() {
       const byModel = {};
       for (const p of this.series) {
         const m = p.model || "—";
         byModel[m] = (byModel[m] || 0) + (p.tokens || 0);
       }
-      return Object.entries(byModel)
-        .map(([label, value]) => ({ label, value, color: this.modelColors[label] }))
-        .sort((a, b) => b.value - a.value);
+      return Object.entries(byModel).map(([label, value]) => ({ label, value }));
     },
     subkeyDist() {
       const bySk = {};
@@ -296,10 +287,10 @@ const OverviewPage = {
         const k = p.subkey || p.subkey_id || "—";
         bySk[k] = (bySk[k] || 0) + (p.tokens || 0);
       }
-      return Object.entries(bySk)
-        .map(([label, value]) => ({ label, value, color: "rgb(var(--primary-6))" }))
-        .sort((a, b) => b.value - a.value);
+      return Object.entries(bySk).map(([label, value]) => ({ label, value }));
     },
+    modelPieHtml() { return renderPieChart(pieSlices(this.modelDist)); },
+    subkeyPieHtml() { return renderPieChart(pieSlices(this.subkeyDist)); },
     tokenChartHtml() { return renderStackedTokenChart(this.series); },
     costChartHtml() { return renderBarChart(this.hourly, (p) => p.cost, "#f59e0b", fmtCost); },
     reqChartHtml() { return renderBarChart(this.hourly, (p) => p.requests, "#3b82f6", fmtInt); },
@@ -338,24 +329,12 @@ const OverviewPage = {
       <div class="card"><div class="card-head"><div class="card-title">请求趋势（24h）</div></div>
         <div class="chart-wrap" v-html="reqChartHtml"></div></div>
       <div class="card"><div class="card-head"><div class="card-title">模型分布（24h Tokens）</div></div>
-        <div class="hbars"><div class="hbar-row" v-for="it in modelDist" :key="it.label">
-          <span class="hbar-label" :title="it.label">{{ it.label }}</span>
-          <div class="hbar-track"><div class="hbar-fill" :style="{width: hbarPct(it.value, modelDist) + '%', background: it.color}"></div></div>
-          <span class="hbar-val">{{ fmtTokens(it.value) }}</span>
-        </div><div v-if="!modelDist.length" class="empty">暂无数据</div></div></div>
+        <div v-html="modelPieHtml"></div></div>
       <div class="card"><div class="card-head"><div class="card-title">子 Key 分布（24h Tokens）</div></div>
-        <div class="hbars"><div class="hbar-row" v-for="it in subkeyDist" :key="it.label">
-          <span class="hbar-label" :title="it.label">{{ it.label }}</span>
-          <div class="hbar-track"><div class="hbar-fill" :style="{width: hbarPct(it.value, subkeyDist) + '%'}"></div></div>
-          <span class="hbar-val">{{ fmtTokens(it.value) }}</span>
-        </div><div v-if="!subkeyDist.length" class="empty">暂无数据</div></div></div>
+        <div v-html="subkeyPieHtml"></div></div>
     </div>
   </div>`,
   methods: {
-    hbarPct(v, list) {
-      const max = Math.max(...list.map((x) => x.value), 1);
-      return Math.max(2, (v / max) * 100);
-    },
     load() {
       req("GET", "/api/overview").then((d) => { this.o = d; }).catch((e) => toast(e.message, false));
       req("GET", "/api/usage/series?hours=24").then((s) => { this.series = s || []; }).catch(() => {});
@@ -480,6 +459,96 @@ function renderBarChart(points, pick, color, format, labelFn, big) {
   }
   svg += "</svg>";
   return svg;
+}
+
+// ── 总览分布饼图（SVG 原生 title + 图例；无第三方依赖） ──
+const PIE_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ef4444", "#14b8a6", "#ec4899", "#6366f1", "#f97316", "#06b6d4"];
+const PIE_OTHER_COLOR = "#9ca3af";
+const PIE_MAX_SLICES = 8;
+const PIE_SIZE = 168;
+
+// pieSlices 把分布整理成可渲染扇区：过滤非正值、按 Token 降序、超上限合并尾部为
+// 「其他」。颜色按分类名称哈希取固定调色板（与数组顺序无关，刷新不跳变），
+// 「其他」用固定中性色。空数据返回 []（渲染层画空态）。
+function pieSlices(dist) {
+  const items = (dist || [])
+    .map((d) => ({ label: String(d.label ?? "—"), value: Number(d.value) || 0 }))
+    .filter((d) => d.value > 0)
+    .sort((a, b) => b.value - a.value);
+  if (!items.length) return [];
+  const total = items.reduce((s, d) => s + d.value, 0);
+  const head = items.slice(0, PIE_MAX_SLICES);
+  const rest = items.slice(PIE_MAX_SLICES);
+  const slices = head.map((d) => ({ ...d, color: PIE_COLORS[hashIdx(d.label, PIE_COLORS.length)], pct: (d.value / total) * 100 }));
+  if (rest.length) {
+    slices.push({
+      label: "其他（" + rest.length + " 项）",
+      value: rest.reduce((s, d) => s + d.value, 0),
+      color: PIE_OTHER_COLOR, pct: 0, isOther: true,
+    });
+    const sum = slices.reduce((s, d) => s + d.value, 0);
+    slices.forEach((d) => { d.pct = (d.value / sum) * 100; });
+  }
+  return slices;
+}
+
+// hashIdx 名称哈希 → 稳定调色板下标（djb2，分布均匀、与顺序无关）。
+function hashIdx(name, n) {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) {
+    h = ((h << 5) + h + name.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h) % n;
+}
+
+// pieSlicePath 单扇区 SVG path：单扇区（360°）SVG arc 会退化成零弧，
+// 直接画整圆；其余从 12 点方向顺时针累计。
+function pieSlicePath(cx, cy, r, startDeg, endDeg) {
+  if (endDeg - startDeg >= 359.999) {
+    return "M " + cx + " " + (cy - r) + " A " + r + " " + r + " 0 1 1 " + (cx - 0.001) + " " + (cy - r) + " Z";
+  }
+  const p0 = polar(cx, cy, r, startDeg);
+  const p1 = polar(cx, cy, r, endDeg);
+  const large = endDeg - startDeg > 180 ? 1 : 0;
+  return "M " + p0.x + " " + p0.y + " A " + r + " " + r + " 0 " + large + " 1 " + p1.x + " " + p1.y + " L " + cx + " " + cy + " Z";
+}
+
+function polar(cx, cy, r, deg) {
+  const rad = ((deg - 90) * Math.PI) / 180;
+  return { x: (cx + r * Math.cos(rad)).toFixed(2), y: (cy + r * Math.sin(rad)).toFixed(2) };
+}
+
+// escHtml 属性/标签内文本转义（分类名与 tooltip 进入 innerHTML，防注入）。
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// renderPieChart 渲染饼图 + 图例：每个扇区带原生 <title>（分类名、格式化
+// Token 数与占比），图例行显示色块、截断名称、Token 数与占比，完整名称保留
+// 在 title 属性。空数据返回空态，单分类输出完整圆。
+function renderPieChart(slices) {
+  if (!slices || !slices.length) return '<div class="empty">暂无数据</div>';
+  const cx = PIE_SIZE / 2, cy = PIE_SIZE / 2, r = PIE_SIZE / 2 - 12;
+  let svg = '<svg class="pie-svg" width="' + PIE_SIZE + '" height="' + PIE_SIZE + '" viewBox="0 0 ' + PIE_SIZE + " " + PIE_SIZE + '" role="img">';
+  let acc = 0;
+  slices.forEach((s) => {
+    const end = acc + s.pct * 3.6;
+    svg += '<path d="' + pieSlicePath(cx, cy, r, acc, end) + '" fill="' + s.color + '">' +
+      "<title>" + escHtml(s.label) + "：" + fmtTokens(s.value) + "（" + s.pct.toFixed(1) + "%）</title></path>";
+    acc = end;
+  });
+  svg += "</svg>";
+  const total = slices.reduce((sum, s) => sum + s.value, 0);
+  const leg = '<ul class="pie-legend">' + slices.map((s) => {
+    const cls = s.isOther ? " leg-other" : "";
+    return '<li class="pie-leg-row' + cls + '">' +
+      '<span class="leg-swatch" style="background:' + s.color + '"></span>' +
+      '<span class="pie-leg-label" title="' + escHtml(s.label) + '">' + escHtml(s.label) + "</span>" +
+      '<span class="pie-leg-val">' + fmtTokens(s.value) + "</span>" +
+      '<span class="pie-leg-pct">' + (s.value > 0 ? ((s.value / total) * 100).toFixed(1) : "0.0") + "%</span>" +
+      "</li>";
+  }).join("") + "</ul>";
+  return '<div class="pie-wrap">' + svg + leg + "</div>";
 }
 
 // 成功率折线图（用量分析主图规格）：pick(p) 返回 {pct, ok, n} 或 null（该桶无请求，
@@ -1426,7 +1495,8 @@ const RoutingPage = {
               <th>账号 · 上游标识</th><th>权重</th><th>有效权重</th><th>占比</th><th>状态</th><th>累计请求</th><th>成功率</th><th>操作</th>
             </tr></thead><tbody>
               <tr v-for="l in leaves" :key="l.id">
-                <td><span class="dot-color" :style="{background: l.color}"></span>{{ accName(l.account_id) }} · <span class="mono">{{ l.ep }}</span></td>
+                <td><span class="dot-color" :style="{background: l.color}"></span>{{ accName(l.account_id) }} · <span class="mono">{{ l.ep }}</span>
+                  <span v-if="l.upstream_deleted" class="tag tag-warn" title="该上游标识已不在对应账号的模型列表中：映射保留、路由不受影响；上游恢复后此标记自动消失。">⚠ 上游已删除</span></td>
                 <td><div class="w-edit">
                   <button class="btn btn-outline btn-sm" @click="bump(l, -1)">−</button>
                   <input v-model.number="wDraft[l.id]" type="number" min="0"/>

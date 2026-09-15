@@ -59,7 +59,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // v8：模型上游协议列（models.provider；供应商类型从账号下沉到模型）。
 // v9：日志首字耗时列（usage_logs.first_token_ms）。
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
-const schemaVersion = "10"
+// v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
+const schemaVersion = "11"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -105,6 +106,7 @@ func (s *Store) migrate() error {
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
+			upstream_deleted INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account_id, model, ep)
 		)`,
 		`CREATE TABLE IF NOT EXISTS subkeys (
@@ -223,6 +225,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE models ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		// —— v9：日志首字耗时（流式 TTFT；非流式为 0） ——
 		`ALTER TABLE usage_logs ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0`,
+		// —— v11：接入点上游删除状态（检查器观察结果；0=上游仍存在，等价旧行为） ——
+		`ALTER TABLE endpoints ADD COLUMN upstream_deleted INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -296,9 +300,11 @@ func (s *Store) relaxEndpointUnique() error {
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			total_images INTEGER NOT NULL DEFAULT 0,
 			request_headers TEXT NOT NULL DEFAULT '{}',
+			upstream_deleted INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account_id, model, ep)
 		)`,
-		`INSERT INTO endpoints_v5 (` + endpointCols + `) SELECT ` + endpointCols + ` FROM endpoints`,
+		// v11 新增列不在旧表里：按旧列清单搬数据，新表该列取 DEFAULT 0。
+		`INSERT INTO endpoints_v5 (` + endpointColsV5Relax + `) SELECT ` + endpointColsV5Relax + ` FROM endpoints`,
 		`DROP TABLE endpoints`,
 		`ALTER TABLE endpoints_v5 RENAME TO endpoints`,
 		`CREATE INDEX IF NOT EXISTS idx_endpoints_account ON endpoints(account_id)`,
@@ -521,6 +527,12 @@ func (s *Store) DeleteModel(name string) error {
 
 const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
+	total_images,request_headers,upstream_deleted`
+
+// endpointColsV5Relax 是 v5 重建 endpoints 表搬数据用的旧列清单（v11 之前）。
+// 旧库没有 upstream_deleted 列，新表该列 DEFAULT 0，省略即取默认值。
+const endpointColsV5Relax = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
+	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
 	total_images,request_headers`
 
 func scanEndpoint(sc scanner) (*model.Endpoint, error) {
@@ -529,7 +541,8 @@ func scanEndpoint(sc scanner) (*model.Endpoint, error) {
 	if err := sc.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
-		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages, &requestHeaders); err != nil {
+		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages, &requestHeaders,
+		&e.UpstreamDeleted); err != nil {
 		return nil, err
 	}
 	if requestHeaders != "" {
@@ -589,20 +602,23 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 	}
 	_, err = s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
-			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images,request_headers)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images,request_headers,
+			upstream_deleted)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id,model,ep) DO UPDATE SET enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
 			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit,
-			request_headers=excluded.request_headers`,
+			request_headers=excluded.request_headers, upstream_deleted=excluded.upstream_deleted`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
 		e.Weight, e.MaxConcurrency, e.RPMLimit, e.TPMLimit, e.LastUsedAt,
 		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens,
-		e.TotalTokens, e.TotalImages, string(requestHeaders))
+		e.TotalTokens, e.TotalImages, string(requestHeaders), boolInt(e.UpstreamDeleted))
 	return err
 }
 
 // updateEndpointByID 按主键 id 覆盖一行（含 account_id/model 归属的变更）。
+// 只覆盖管理端可编辑的字段：upstream_deleted 是检查器的观察结果，
+// 普通编辑请求不得清掉它（改 ep 属于「换叶子」，检查器下一轮会按新 ep 重判）。
 func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
 	requestHeaders, err := marshalEndpointHeaders(e.RequestHeaders)
 	if err != nil {
@@ -659,6 +675,60 @@ func (s *Store) AccumulateEndpoint(id string, ok bool, pt, ct int64) error {
 		total_tokens=total_tokens+? WHERE id=?`,
 		nowUnix(), pt, ct, pt+ct, id)
 	return err
+}
+
+// SyncEndpointUpstreamPresence 按账号一次性同步「上游模型是否存在」的观察结果：
+// presentEPs 集合内的接入点恢复为存在（upstream_deleted=0），集合外的标记为
+// 已删除（=1）。单事务内完成且更新条件限定账号，不同账号即使 EP 相同也互不影响；
+// 空集合同样生效（把该账号下全部接入点标记为已删除）。返回集合内实际被恢复的
+// 行数（状态从 1 翻回 0 的），供检查器记录日志。
+func (s *Store) SyncEndpointUpstreamPresence(accountID string, presentEPs []string) (restored int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	// 事务内先数「即将被恢复的行」：更新前的已删除数就是本次恢复数。
+	if len(presentEPs) > 0 {
+		ph := placeholders(len(presentEPs))
+		args := append([]any{accountID}, toAnys(presentEPs)...)
+		if err = tx.QueryRow(
+			`SELECT COUNT(*) FROM endpoints WHERE account_id=? AND ep IN (`+ph+`) AND upstream_deleted=1`,
+			args...).Scan(&restored); err != nil {
+			return 0, err
+		}
+	}
+	if _, err = tx.Exec(
+		`UPDATE endpoints SET upstream_deleted=1 WHERE account_id=? AND upstream_deleted=0`,
+		accountID); err != nil {
+		return 0, err
+	}
+	if len(presentEPs) > 0 {
+		ph := placeholders(len(presentEPs))
+		args := append([]any{accountID}, toAnys(presentEPs)...)
+		if _, err = tx.Exec(
+			`UPDATE endpoints SET upstream_deleted=0 WHERE account_id=? AND ep IN (`+ph+`) AND upstream_deleted=1`,
+			args...); err != nil {
+			return 0, err
+		}
+	}
+	return restored, tx.Commit()
+}
+
+// placeholders 生成 n 个逗号分隔的 "?" 占位符（n > 0，调用方保证）。
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// toAnys 把 []string 转成 []any，供批量 SQL 参数展开。
+func toAnys(items []string) []any {
+	out := make([]any, len(items))
+	for i, s := range items {
+		out[i] = s
+	}
+	return out
 }
 
 // AccumulateImages 累计图像张数（账号/元组/子 Key 三视图）。

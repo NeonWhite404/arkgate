@@ -24,9 +24,12 @@ import (
 	"arkgate/internal/balancer"
 	"arkgate/internal/config"
 	"arkgate/internal/gateway"
+	"arkgate/internal/model"
 	"arkgate/internal/portal"
+	"arkgate/internal/provider"
 	"arkgate/internal/secure"
 	"arkgate/internal/store"
+	"arkgate/internal/upstreamcheck"
 )
 
 //go:embed all:web
@@ -48,6 +51,16 @@ func main() {
 
 	bal := balancer.New(st, cfg.SessionTTL)
 	defer bal.Close()
+
+	// 上游模型存在性检查器：周期探测各账号的上游模型列表，标记「上游已删除」
+	// 的映射（仅管理界面提示，不参与路由）。周期与单次探测超时是包级默认值，
+	// 生产配置见 upstreamcheck 包；复用管理端的账号→路由解析口径。
+	checker := upstreamcheck.New(st, routeForAccount(box), provider.NewManager().ListModels,
+		upstreamcheck.DefaultInterval, upstreamcheck.DefaultTimeout)
+	checker.Run()
+	// 先停检查器再走 bal.Close / st.Close：检查器在途的上游请求会因取消及时终止，
+	// 且不再写库，保证存储关闭前无残留访问。
+	defer checker.Stop()
 
 	gw := gateway.New(cfg, st, box, bal)
 	adm := admin.New(st, box, bal, cfg)
@@ -127,6 +140,27 @@ func isAddrInUse(err error) bool {
 		return sysErr.Err == syscall.EADDRINUSE
 	}
 	return strings.Contains(err.Error(), "address already in use")
+}
+
+// routeForAccount 构造上游检查器用的账号→路由解析函数。
+// 口径与 admin.routeForAccount 一致：未注册供应商回落 FallbackDef、
+// base URL 解析默认值、解密账号 Key 作为不透明字符串原样使用。
+func routeForAccount(box *secure.Box) func(*model.Account) (provider.Route, error) {
+	return func(acc *model.Account) (provider.Route, error) {
+		def, ok := provider.Get(acc.Provider)
+		if !ok {
+			def = provider.FallbackDef(acc.Provider)
+		}
+		baseURL, err := def.ResolveBaseURL(acc.BaseURL)
+		if err != nil {
+			return provider.Route{}, err
+		}
+		key, err := box.Decrypt(acc.ArkAPIKeyEnc)
+		if err != nil {
+			return provider.Route{}, fmt.Errorf("账号密钥解密失败: %w", err)
+		}
+		return provider.Route{Def: def, BaseURL: baseURL, Key: key}, nil
+	}
 }
 
 // spaHandler 提供内嵌 Web 管理界面（单页应用）。
