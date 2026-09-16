@@ -285,12 +285,20 @@ const ModelsPage = {
         .finally(() => { this.syncing = false; });
     },
     delModel(m) {
-      // 删除会连带清理其它模型指向它的 fallback 链与路由目标（后端同一事务内完成），
-      // 否则那些模型会因为引用了不存在的名字而无法保存。
-      if (!confirm("确认删除该模型及其所有映射？\n其它模型对它的 fallback / 路由引用会被一并移除。")) return;
+      // 删除会连带清理其它模型指向它的 fallback 链、路由目标，以及子 Key 白名单里的
+      // 该名字（后端同一事务内完成），否则那些模型会因为引用了不存在的名字而无法保存、
+      // 子 Key 白名单也会留下界面上摘不掉的幽灵条目。
+      if (!confirm("确认删除该模型及其所有映射？\n其它模型对它的 fallback / 路由引用、以及子 Key 白名单中的该模型都会被移除。")) return;
       req("DELETE", "/api/models/" + encodeURIComponent(m.name))
-        .then(() => {
-          toast("已删除");
+        .then((d) => {
+          const off = (d && d.disabled_subkeys) || [];
+          if (off.length) {
+            // 白名单被清空 = 会变成「不限」，后端 fail-closed 把 Key 停用了：
+            // 必须显式告知，否则管理员只会看到「Key 突然不工作」。
+            toast("已删除；白名单仅含该模型的 " + off.length + " 个子 Key 已自动停用：" + off.join("、"), false);
+          } else {
+            toast("已删除");
+          }
           if (this.mDrawer && this.mDrawer.name === m.name) this.mDrawer = null;
           return this.load();
         })

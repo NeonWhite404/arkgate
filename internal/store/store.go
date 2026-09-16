@@ -407,16 +407,30 @@ func (s *Store) UpsertAccount(a *model.Account) error {
 	return err
 }
 
-func (s *Store) DeleteAccount(id string) error {
+// DeleteAccount 删除账号及其全部接入点，并清理子 Key 的 allowed_accounts 白名单
+// 引用（与 DeleteModel 同理：悬空账号 id 在界面上没有对应勾选项，管理员无法通过
+// UI 摘除；剔除后白名单变空则停用该子 Key，避免空 = 不限的权限放大）。
+// 返回因白名单被清空而自动停用的子 Key 名，供调用方提示管理员。
+func (s *Store) DeleteAccount(id string) (disabledSubKeys []string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
-		return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
 	}
-	if _, err := s.db.Exec(`DELETE FROM endpoints WHERE account_id=?`, id); err != nil {
-		return err
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
+		return nil, err
 	}
-	return nil
+	if _, err := tx.Exec(`DELETE FROM endpoints WHERE account_id=?`, id); err != nil {
+		return nil, err
+	}
+	if _, disabled, cerr := cleanSubKeyWhitelist(tx, whitelistAccounts, id); cerr != nil {
+		return nil, cerr
+	} else {
+		disabledSubKeys = disabled
+	}
+	return disabledSubKeys, tx.Commit()
 }
 
 // AccumulateAccount 累计账号用量/请求计数。
@@ -517,27 +531,116 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	return err
 }
 
-// DeleteModel 删除模型、其全部接入点，并清理其它模型对它的引用
-// （fallback 链与路由分流目标）。
+// 子 Key 白名单列名（cleanSubKeyWhitelist 只接受这两个值，避免列名拼接出错）。
+const (
+	whitelistModels   = "allowed_models"
+	whitelistAccounts = "allowed_accounts"
+)
+
+// cleanSubKeyWhitelist 从子 Key 白名单里剔除已消失的条目（模型被删 / 账号被删），
+// 返回被改写的子 Key 名，以及其中因「剔除后白名单变空」而被停用的子 Key 名。
+//
+// 与 fallback 链不同，这里**不能**只做简单剔除：白名单的空列表语义是「不限」
+// （gateway/portal/balancer 三处都是 `len(list) == 0 → 允许全部`），把「仅允许 X」
+// 里的 X 剔除掉会得到空列表 = 允许全部——一次删除会静默变成权限放大。
+// 因此剔除后若白名单变空，同时把该子 Key 停用（fail closed）：它原本就只被授权
+// 访问那个已消失的对象，停用是把「实际已不可用」变成显式可见，管理员重新授权
+// 后手动启用即可。调用方应把停用结果呈现给管理员（否则会变成「Key 突然不工作」
+// 的无头案）。
+//
+// entry 按 JSON 引号精确匹配，保证 "gpt-4" 不会误命中 "gpt-4o"。
+func cleanSubKeyWhitelist(tx *sql.Tx, column, entry string) (changed, disabled []string, err error) {
+	switch column {
+	case whitelistModels, whitelistAccounts:
+	default:
+		return nil, nil, fmt.Errorf("cleanSubKeyWhitelist: 未知白名单列 %q", column)
+	}
+	pattern := "%" + likeEscape(`"`+entry+`"`) + "%"
+	rows, err := tx.Query(`SELECT id,name,enabled,`+column+` FROM subkeys WHERE `+column+` LIKE ? ESCAPE '\'`, pattern)
+	if err != nil {
+		return nil, nil, err
+	}
+	type subkeyUpdate struct {
+		id, name string
+		kept     []string
+		disable  bool // 白名单被清空：停用而不是留成「不限」
+	}
+	var updates []subkeyUpdate
+	for rows.Next() {
+		var (
+			id, name, raw string
+			enabled       int
+		)
+		if err := rows.Scan(&id, &name, &enabled, &raw); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		var list []string
+		_ = json.Unmarshal([]byte(raw), &list)
+		kept := make([]string, 0, len(list))
+		for _, v := range list {
+			if v != entry {
+				kept = append(kept, v)
+			}
+		}
+		if len(kept) == len(list) {
+			continue // 未命中（例如前缀同名），保持原样
+		}
+		// 只在「原本启用」时计入 disabled：已停用的 Key 保持停用，
+		// 不该被算作本次操作的副作用（否则管理端会报出无关的停用）。
+		updates = append(updates, subkeyUpdate{
+			id: id, name: name, kept: kept, disable: len(kept) == 0 && enabled != 0,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	rows.Close()
+	for _, up := range updates {
+		raw, merr := json.Marshal(up.kept)
+		if merr != nil {
+			return changed, disabled, merr
+		}
+		if up.disable {
+			if _, err := tx.Exec(`UPDATE subkeys SET `+column+`=?, enabled=0 WHERE id=?`,
+				string(raw), up.id); err != nil {
+				return changed, disabled, err
+			}
+			disabled = append(disabled, up.name)
+		} else if _, err := tx.Exec(`UPDATE subkeys SET `+column+`=? WHERE id=?`,
+			string(raw), up.id); err != nil {
+			return changed, disabled, err
+		}
+		changed = append(changed, up.name)
+	}
+	return changed, disabled, nil
+}
+
+// DeleteModel 删除模型、其全部接入点，并清理其它模型与子 Key 对它的引用
+// （fallback 链、路由分流目标、子 Key 的 allowed_models 白名单）。
 //
 // 引用必须一并清理：留下悬空名字会让「被引用方已不存在」的配置留在库里——
 // 运行时该 fallback/路由目标必然失败，更麻烦的是管理端保存那些模型时
 // validateFallbackChain / validateRouterTarget 会因「目标不存在」直接 400，
-// 使管理员无法再编辑保存任何引用过该名字的模型（只能手工去库里删串）。
+// 使管理员无法再编辑保存任何引用过该名字的模型（只能手工去库里删串）；
+// 子 Key 白名单里的悬空名字则在界面上没有对应勾选项，管理员无法通过 UI 摘除。
 // 全程单事务，避免「删了模型却漏清引用」的中间态。
-func (s *Store) DeleteModel(name string) error {
+//
+// 返回因白名单被清空而自动停用的子 Key 名，供调用方提示管理员。
+func (s *Store) DeleteModel(name string) (disabledSubKeys []string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`DELETE FROM models WHERE name=?`, name); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.Exec(`DELETE FROM endpoints WHERE model=?`, name); err != nil {
-		return err
+		return nil, err
 	}
 	// 清理其它模型的 fallback 引用与路由目标。两者都以 JSON 文本存储，
 	// SQL 层无法精准改写，改为在 Go 侧解析后回写（先收集再更新，避免
@@ -547,7 +650,7 @@ func (s *Store) DeleteModel(name string) error {
 	rows, err := tx.Query(`SELECT name,fallback,router FROM models
 		WHERE fallback LIKE ? ESCAPE '\' OR router LIKE ? ESCAPE '\'`, pattern, pattern)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	type modelRefs struct {
 		name     string
@@ -561,7 +664,7 @@ func (s *Store) DeleteModel(name string) error {
 		)
 		if err := rows.Scan(&mName, &fb, &routerRaw); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		var chain []string
 		_ = json.Unmarshal([]byte(fb), &chain)
@@ -595,20 +698,24 @@ func (s *Store) DeleteModel(name string) error {
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return nil, err
 	}
 	rows.Close()
 	for _, up := range updates {
 		fb, err := json.Marshal(up.fallback)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := tx.Exec(`UPDATE models SET fallback=?, router=? WHERE name=?`,
 			string(fb), up.router, up.name); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return tx.Commit()
+	// 子 Key 白名单：剔除该模型名；若因此变空则停用该子 Key（见函数注释）。
+	if _, disabledSubKeys, err = cleanSubKeyWhitelist(tx, whitelistModels, name); err != nil {
+		return nil, err
+	}
+	return disabledSubKeys, tx.Commit()
 }
 
 // ─────────────────────────── Endpoint（元组） ───────────────────────────

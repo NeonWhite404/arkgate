@@ -722,7 +722,7 @@ func TestDeleteModelCleansReferences(t *testing.T) {
 	// 名字前缀相同的模型不能被误伤（"doom" vs "doomed"）。
 	mk("doom", []string{"doomed"})
 
-	if err := s.DeleteModel("doomed"); err != nil {
+	if _, err := s.DeleteModel("doomed"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := s.GetModel("doomed"); err == nil {
@@ -802,7 +802,7 @@ func TestDeleteModelLeavesUnrelatedAlone(t *testing.T) {
 			t.Fatalf("upsert %s: %v", m.Name, err)
 		}
 	}
-	if err := s.DeleteModel("lonely"); err != nil {
+	if _, err := s.DeleteModel("lonely"); err != nil {
 		t.Fatalf("delete unreferenced: %v", err)
 	}
 	other, err := s.GetModel("other")
@@ -811,6 +811,160 @@ func TestDeleteModelLeavesUnrelatedAlone(t *testing.T) {
 	}
 	if len(other.Fallback) != 1 || other.Fallback[0] != "third" {
 		t.Fatalf("unrelated fallback must be untouched: %+v", other.Fallback)
+	}
+}
+
+// TestDeleteModelCleansSubKeyWhitelist 删除模型要同步清理子 Key 的 allowed_models：
+// 多授权项时剔除该名（其余保留、Key 继续可用）；若剔除后白名单变空则停用该 Key
+// ——白名单空 = 不限，直接留下空列表会把「仅允许该模型」放大成「允许全部」。
+func TestDeleteModelCleansSubKeyWhitelist(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, m := range []*model.Model{
+		{Name: "doomed", Type: model.ModelTypeText, Enabled: true, Fallback: []string{}},
+		{Name: "keeper", Type: model.ModelTypeText, Enabled: true, Fallback: []string{}},
+	} {
+		if err := s.UpsertModel(m); err != nil {
+			t.Fatalf("upsert %s: %v", m.Name, err)
+		}
+	}
+	// multi：白名单两项（剔除后非空 → 继续可用）
+	// only：白名单只有 doomed（剔除后为空 → 停用）
+	// wildcard：白名单为空（= 全部，不该被动）
+	// prefixed：白名单含前缀同名 "doom"（不该被误伤）
+	for _, sk := range []*model.SubKey{
+		{ID: "sk-multi", Name: "multi", Key: "sk-m", KeyHash: "h-m", Enabled: true,
+			AllowedModels: []string{"doomed", "keeper"}},
+		{ID: "sk-only", Name: "only", Key: "sk-o", KeyHash: "h-o", Enabled: true,
+			AllowedModels: []string{"doomed"}},
+		{ID: "sk-wild", Name: "wildcard", Key: "sk-w", KeyHash: "h-w", Enabled: true,
+			AllowedModels: []string{}},
+		{ID: "sk-pre", Name: "prefixed", Key: "sk-p", KeyHash: "h-p", Enabled: true,
+			AllowedModels: []string{"doom", "keeper"}},
+	} {
+		if err := s.UpsertSubKey(sk); err != nil {
+			t.Fatalf("upsert subkey %s: %v", sk.Name, err)
+		}
+	}
+
+	disabled, err := s.DeleteModel("doomed")
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(disabled) != 1 || disabled[0] != "only" {
+		t.Fatalf("only the key left with empty whitelist must be disabled, got %v", disabled)
+	}
+
+	byName := func(name string) *model.SubKey {
+		all, err := s.ListSubKeys()
+		if err != nil {
+			t.Fatalf("list subkeys: %v", err)
+		}
+		for _, sk := range all {
+			if sk.Name == name {
+				return sk
+			}
+		}
+		t.Fatalf("subkey %s not found", name)
+		return nil
+	}
+	// 多项白名单：剔除 doomed，保留 keeper，仍启用。
+	multi := byName("multi")
+	if len(multi.AllowedModels) != 1 || multi.AllowedModels[0] != "keeper" {
+		t.Fatalf("multi whitelist must drop doomed: %+v", multi.AllowedModels)
+	}
+	if !multi.Enabled {
+		t.Fatalf("multi must stay enabled (whitelist not empty)")
+	}
+	// 单项白名单：被清空 → 停用（关键安全语义）。
+	only := byName("only")
+	if len(only.AllowedModels) != 0 {
+		t.Fatalf("only whitelist must be emptied: %+v", only.AllowedModels)
+	}
+	if only.Enabled {
+		t.Fatalf("key with emptied whitelist must be disabled (empty = allow all)")
+	}
+	// 空白名单（= 全部）与前缀同名不被误伤。
+	if !byName("wildcard").Enabled {
+		t.Fatalf("wildcard key must be untouched")
+	}
+	pre := byName("prefixed")
+	if len(pre.AllowedModels) != 2 || !pre.Enabled {
+		t.Fatalf("prefix-similar name must not be removed: %+v enabled=%v", pre.AllowedModels, pre.Enabled)
+	}
+
+	// 清理结果落库：重开后仍是剔除 + 停用状态。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	reopened, err := s2.GetSubKeyByHash("h-o")
+	if err != nil {
+		t.Fatalf("get reopened: %v", err)
+	}
+	if reopened.Enabled || len(reopened.AllowedModels) != 0 {
+		t.Fatalf("whitelist cleanup must persist: %+v", reopened)
+	}
+}
+
+// TestDeleteAccountCleansSubKeyWhitelist 删账号同样清理 allowed_accounts，
+// 且空白名单的 Key 会被 fail-closed 停用。
+func TestDeleteAccountCleansSubKeyWhitelist(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, acc := range []*model.Account{
+		{ID: "acc-1", Name: "甲", ArkAPIKeyEnc: "e1", Status: model.AccountActive, Provider: "ark"},
+		{ID: "acc-2", Name: "乙", ArkAPIKeyEnc: "e2", Status: model.AccountActive, Provider: "ark"},
+	} {
+		if err := s.UpsertAccount(acc); err != nil {
+			t.Fatalf("upsert account: %v", err)
+		}
+	}
+	for _, sk := range []*model.SubKey{
+		{ID: "sk-a", Name: "both", Key: "sk-a", KeyHash: "h-a", Enabled: true,
+			AllowedAccounts: []string{"acc-1", "acc-2"}},
+		{ID: "sk-b", Name: "onlyacc1", Key: "sk-b", KeyHash: "h-b", Enabled: true,
+			AllowedAccounts: []string{"acc-1"}},
+	} {
+		if err := s.UpsertSubKey(sk); err != nil {
+			t.Fatalf("upsert subkey: %v", err)
+		}
+	}
+
+	disabled, err := s.DeleteAccount("acc-1")
+	if err != nil {
+		t.Fatalf("delete account: %v", err)
+	}
+	if len(disabled) != 1 || disabled[0] != "onlyacc1" {
+		t.Fatalf("expected onlyacc1 disabled, got %v", disabled)
+	}
+	both, err := s.GetSubKeyByHash("h-a")
+	if err != nil {
+		t.Fatalf("get both: %v", err)
+	}
+	if len(both.AllowedAccounts) != 1 || both.AllowedAccounts[0] != "acc-2" || !both.Enabled {
+		t.Fatalf("both must keep acc-2 and stay enabled: %+v enabled=%v", both.AllowedAccounts, both.Enabled)
+	}
+	only, err := s.GetSubKeyByHash("h-b")
+	if err != nil {
+		t.Fatalf("get only: %v", err)
+	}
+	if only.Enabled || len(only.AllowedAccounts) != 0 {
+		t.Fatalf("emptied account whitelist must disable the key: %+v", only)
 	}
 }
 

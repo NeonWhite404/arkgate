@@ -709,8 +709,18 @@ const AccountsPage = {
         .catch((e) => toast(e.message, false));
     },
     del(a) {
-      if (!confirm("确认删除该账号？将同时删除其模型映射。")) return;
-      req("DELETE", "/api/accounts/" + a.id).then(() => { toast("已删除"); this.load(); });
+      // 删除账号会连带清理子 Key 白名单里的该账号（后端同一事务内完成）。
+      if (!confirm("确认删除该账号？将同时删除其模型映射。\n子 Key 白名单中的该账号会被移除。")) return;
+      req("DELETE", "/api/accounts/" + a.id).then((d) => {
+        const off = (d && d.disabled_subkeys) || [];
+        if (off.length) {
+          // 白名单被清空 = 会变成「不限」，后端 fail-closed 把 Key 停用了。
+          toast("已删除；白名单仅含该账号的 " + off.length + " 个子 Key 已自动停用：" + off.join("、"), false);
+        } else {
+          toast("已删除");
+        }
+        this.load();
+      }).catch((e) => toast(e.message, false));
     },
   },
   template: `

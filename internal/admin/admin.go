@@ -432,12 +432,18 @@ func (a *Admin) handleAccountItem(w http.ResponseWriter, r *http.Request) {
 		a.bal.Refresh()
 		writeJSON(w, 200, map[string]any{"success": true})
 	case http.MethodDelete:
-		if err := a.store.DeleteAccount(id); err != nil {
+		disabled, err := a.store.DeleteAccount(id)
+		if err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
 		a.bal.Refresh()
-		writeJSON(w, 200, map[string]any{"success": true})
+		// 白名单被清空的子 Key 会被自动停用（空白名单 = 不限，必须 fail closed）。
+		body := map[string]any{"success": true}
+		if len(disabled) > 0 {
+			body["disabled_subkeys"] = disabled
+		}
+		writeJSON(w, 200, body)
 	default:
 		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
 	}
@@ -1220,12 +1226,19 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		a.bal.Refresh()
 		writeJSON(w, 200, map[string]any{"success": true})
 	case http.MethodDelete:
-		if err := a.store.DeleteModel(name); err != nil {
+		disabled, err := a.store.DeleteModel(name)
+		if err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
 		a.bal.Refresh()
-		writeJSON(w, 200, map[string]any{"success": true})
+		// 白名单被清空的子 Key 会被自动停用（空白名单 = 不限，必须 fail closed）；
+		// 把名字回给前端提示，避免管理员以为 Key 无故失效。
+		body := map[string]any{"success": true}
+		if len(disabled) > 0 {
+			body["disabled_subkeys"] = disabled
+		}
+		writeJSON(w, 200, body)
 	default:
 		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
 	}
