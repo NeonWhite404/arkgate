@@ -1324,6 +1324,18 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 		if v, ok := probe["enabled"].(bool); ok {
 			existing.Enabled = v
 		}
+		// 接入点级上游检查豁免：开启时即时清除本条的「上游已删除」标记——
+		// 该标记来自检查器且携带「本条参与检查」的前提，豁免后必须一并失效，
+		// 否则会出现「已豁免却仍标红」的矛盾状态（检查器下一轮也会清，这里不等它）。
+		if v, ok := probe["skip_upstream_check"].(bool); ok {
+			existing.SkipUpstreamCheck = v
+			if v {
+				if err := a.store.ClearUpstreamDeleted(id); err != nil {
+					writeJSON(w, 500, map[string]any{"detail": err.Error()})
+					return
+				}
+			}
+		}
 		// 流控整数字段保持部分更新语义：只覆盖请求里显式携带的键。
 		// （此前无条件覆盖，只发 request_headers 会把四个限流值一起清零。）
 		type intFieldSpec struct {

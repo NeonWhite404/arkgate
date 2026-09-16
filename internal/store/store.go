@@ -60,7 +60,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // v9：日志首字耗时列（usage_logs.first_token_ms）。
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
 // v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
-const schemaVersion = "11"
+// v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
+const schemaVersion = "12"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -107,6 +108,7 @@ func (s *Store) migrate() error {
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			upstream_deleted INTEGER NOT NULL DEFAULT 0,
+			skip_upstream_check INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account_id, model, ep)
 		)`,
 		`CREATE TABLE IF NOT EXISTS subkeys (
@@ -227,6 +229,8 @@ func (s *Store) migrate() error {
 		`ALTER TABLE usage_logs ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0`,
 		// —— v11：接入点上游删除状态（检查器观察结果；0=上游仍存在，等价旧行为） ——
 		`ALTER TABLE endpoints ADD COLUMN upstream_deleted INTEGER NOT NULL DEFAULT 0`,
+		// —— v12：接入点级跳过上游检查（0=参与检查，等价旧行为） ——
+		`ALTER TABLE endpoints ADD COLUMN skip_upstream_check INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -301,6 +305,7 @@ func (s *Store) relaxEndpointUnique() error {
 			total_images INTEGER NOT NULL DEFAULT 0,
 			request_headers TEXT NOT NULL DEFAULT '{}',
 			upstream_deleted INTEGER NOT NULL DEFAULT 0,
+			skip_upstream_check INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account_id, model, ep)
 		)`,
 		// v11 新增列不在旧表里：按旧列清单搬数据，新表该列取 DEFAULT 0。
@@ -507,7 +512,8 @@ func (s *Store) UpsertModel(m *model.Model) error {
 		price_image=excluded.price_image, context_tokens=excluded.context_tokens,
 		max_output_tokens=excluded.max_output_tokens, router=excluded.router`,
 		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type, m.Provider,
-		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens, routerJSON(m.Router))
+		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens,
+		routerJSON(m.Router))
 	return err
 }
 
@@ -527,10 +533,11 @@ func (s *Store) DeleteModel(name string) error {
 
 const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
-	total_images,request_headers,upstream_deleted`
+	total_images,request_headers,upstream_deleted,skip_upstream_check`
 
 // endpointColsV5Relax 是 v5 重建 endpoints 表搬数据用的旧列清单（v11 之前）。
-// 旧库没有 upstream_deleted 列，新表该列 DEFAULT 0，省略即取默认值。
+// 旧库没有 upstream_deleted / skip_upstream_check 列，新表这两列 DEFAULT 0，
+// 省略即取默认值。
 const endpointColsV5Relax = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
 	total_images,request_headers`
@@ -542,7 +549,7 @@ func scanEndpoint(sc scanner) (*model.Endpoint, error) {
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
 		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages, &requestHeaders,
-		&e.UpstreamDeleted); err != nil {
+		&e.UpstreamDeleted, &e.SkipUpstreamCheck); err != nil {
 		return nil, err
 	}
 	if requestHeaders != "" {
@@ -603,31 +610,34 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 	_, err = s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
 			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images,request_headers,
-			upstream_deleted)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			upstream_deleted,skip_upstream_check)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id,model,ep) DO UPDATE SET enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
 			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit,
-			request_headers=excluded.request_headers, upstream_deleted=excluded.upstream_deleted`,
+			request_headers=excluded.request_headers, upstream_deleted=excluded.upstream_deleted,
+			skip_upstream_check=excluded.skip_upstream_check`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
 		e.Weight, e.MaxConcurrency, e.RPMLimit, e.TPMLimit, e.LastUsedAt,
 		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens,
-		e.TotalTokens, e.TotalImages, string(requestHeaders), boolInt(e.UpstreamDeleted))
+		e.TotalTokens, e.TotalImages, string(requestHeaders), boolInt(e.UpstreamDeleted),
+		boolInt(e.SkipUpstreamCheck))
 	return err
 }
 
 // updateEndpointByID 按主键 id 覆盖一行（含 account_id/model 归属的变更）。
-// 只覆盖管理端可编辑的字段：upstream_deleted 是检查器的观察结果，
-// 普通编辑请求不得清掉它（改 ep 属于「换叶子」，检查器下一轮会按新 ep 重判）。
+// 覆盖管理端可编辑的字段 + 接入点级豁免 skip_upstream_check；upstream_deleted
+// 是检查器的观察结果，普通编辑请求不得清掉它（改 ep 属于「换叶子」，检查器
+// 下一轮会按新 ep 重判）。豁免本身是用户配置而非观察结果，因此随编辑写入。
 func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
 	requestHeaders, err := marshalEndpointHeaders(e.RequestHeaders)
 	if err != nil {
 		return fmt.Errorf("encode endpoint request_headers: %w", err)
 	}
 	_, err = s.db.Exec(`UPDATE endpoints SET account_id=?, model=?, ep=?, enabled=?, weight=?,
-			max_concurrency=?, rpm_limit=?, tpm_limit=?, request_headers=? WHERE id=?`,
+			max_concurrency=?, rpm_limit=?, tpm_limit=?, request_headers=?, skip_upstream_check=? WHERE id=?`,
 		e.AccountID, e.Model, e.EP, boolInt(e.Enabled), e.Weight, e.MaxConcurrency,
-		e.RPMLimit, e.TPMLimit, string(requestHeaders), id)
+		e.RPMLimit, e.TPMLimit, string(requestHeaders), boolInt(e.SkipUpstreamCheck), id)
 	return err
 }
 
@@ -682,6 +692,10 @@ func (s *Store) AccumulateEndpoint(id string, ok bool, pt, ct int64) error {
 // 已删除（=1）。单事务内完成且更新条件限定账号，不同账号即使 EP 相同也互不影响；
 // 空集合同样生效（把该账号下全部接入点标记为已删除）。返回集合内实际被恢复的
 // 行数（状态从 1 翻回 0 的），供检查器记录日志。
+//
+// 豁免（endpoints.skip_upstream_check=1）的接入点全程不参与：既不会被标记，
+// 其既有标记也会在本事务里清掉——豁免语义是「不观察也不展示」，避免出现
+// 「已豁免却还挂着上游已删除标签」的矛盾状态。
 func (s *Store) SyncEndpointUpstreamPresence(accountID string, presentEPs []string) (restored int64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -690,6 +704,13 @@ func (s *Store) SyncEndpointUpstreamPresence(accountID string, presentEPs []stri
 		return 0, err
 	}
 	defer tx.Rollback()
+	// 先清豁免接入点的既有标记（幂等；与恢复计数无交集，因为下面按 upstream_deleted=1 数）。
+	if _, err = tx.Exec(
+		`UPDATE endpoints SET upstream_deleted=0 WHERE account_id=? AND upstream_deleted=1
+			AND skip_upstream_check=1`,
+		accountID); err != nil {
+		return 0, err
+	}
 	// 事务内先数「即将被恢复的行」：更新前的已删除数就是本次恢复数。
 	if len(presentEPs) > 0 {
 		ph := placeholders(len(presentEPs))
@@ -700,8 +721,10 @@ func (s *Store) SyncEndpointUpstreamPresence(accountID string, presentEPs []stri
 			return 0, err
 		}
 	}
+	// 标记缺失：豁免接入点跳过（上一步已把它们的标记清零，这里不再碰）。
 	if _, err = tx.Exec(
-		`UPDATE endpoints SET upstream_deleted=1 WHERE account_id=? AND upstream_deleted=0`,
+		`UPDATE endpoints SET upstream_deleted=1 WHERE account_id=? AND upstream_deleted=0
+			AND skip_upstream_check=0`,
 		accountID); err != nil {
 		return 0, err
 	}
@@ -715,6 +738,17 @@ func (s *Store) SyncEndpointUpstreamPresence(accountID string, presentEPs []stri
 		}
 	}
 	return restored, tx.Commit()
+}
+
+// ClearUpstreamDeleted 清除某条接入点的「上游已删除」标记。
+// 供管理端开启接入点级豁免（skip_upstream_check）时即时生效——否则要等下一轮
+// 检查器跑完标签才消失，界面会短暂停在「已豁免但仍标红」的矛盾状态。
+func (s *Store) ClearUpstreamDeleted(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE endpoints SET upstream_deleted=0 WHERE id=? AND upstream_deleted=1`, id)
+	return err
 }
 
 // placeholders 生成 n 个逗号分隔的 "?" 占位符（n > 0，调用方保证）。

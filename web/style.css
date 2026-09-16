@@ -472,6 +472,10 @@ select { appearance: none; background-image: url("data:image/svg+xml;charset=utf
 .ep-metrics input { min-height: 30px; padding: 4px 8px; font-size: 12.5px; }
 .ep-card-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ep-card-foot .spacer { flex: 1; }
+/* 接入点级豁免开关（标签 + 小开关） */
+.ep-skip { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  user-select: none; padding: 0 2px; }
+.ep-skip .sh-note { color: var(--color-text-3); }
 .ep-dirty-dot { width: 7px; height: 7px; border-radius: 50%; background: rgb(var(--orange-6));
   display: inline-block; }
 .ep-headers { margin-top: 8px; border-top: 1px dashed var(--color-border-2); padding-top: 8px; }

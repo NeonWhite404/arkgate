@@ -738,6 +738,168 @@ func TestModelRouterRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSyncRespectsSkipUpstreamCheck 接入点级豁免：skip_upstream_check=1 的接入点
+// 全程不参与同步（不被标记），且其既有标记会在同一事务里被清除；同一模型下
+// 未豁免的兄弟接入点照常标记——这是豁免粒度落在接入点的关键证据。
+func TestSyncRespectsSkipUpstreamCheck(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	// 同一模型下两条接入点：一条参与检查，一条豁免（证明粒度不是模型级）。
+	for _, e := range []*model.Endpoint{
+		{ID: "e-ck", AccountID: "a1", Model: "m1", EP: "ep-ck", Enabled: true},
+		{ID: "e-ex", AccountID: "a1", Model: "m1", EP: "ep-ex", Enabled: true},
+	} {
+		if err := s.UpsertEndpoint(e); err != nil {
+			t.Fatalf("upsert endpoint %s: %v", e.ID, err)
+		}
+	}
+	deletedOf := func(id string) bool {
+		e, err := s.GetEndpoint(id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		return e.UpstreamDeleted
+	}
+
+	// 首轮同步（上游空列表）：两条都还没豁免 → 都被标记。
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync 1: %v", err)
+	}
+	if !deletedOf("e-ck") || !deletedOf("e-ex") {
+		t.Fatalf("both must be marked before exemption: ck=%v ex=%v", deletedOf("e-ck"), deletedOf("e-ex"))
+	}
+
+	// 给 e-ex 开启豁免后同步：它的标记被清掉，同一模型的 e-ck 保持已删除。
+	ep, err := s.GetEndpoint("e-ex")
+	if err != nil {
+		t.Fatalf("get endpoint: %v", err)
+	}
+	ep.SkipUpstreamCheck = true
+	if err := s.UpsertEndpoint(ep); err != nil {
+		t.Fatalf("save exemption: %v", err)
+	}
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	if deletedOf("e-ex") {
+		t.Fatalf("exempt endpoint must be cleared, not marked")
+	}
+	if !deletedOf("e-ck") {
+		t.Fatalf("sibling endpoint in same model must stay marked")
+	}
+	// 幂等：再来一轮结果不变。
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync 3: %v", err)
+	}
+	if deletedOf("e-ex") || !deletedOf("e-ck") {
+		t.Fatalf("sync must be idempotent: ck=%v ex=%v", deletedOf("e-ck"), deletedOf("e-ex"))
+	}
+
+	// 关闭豁免后重新参与检查：再标记回来。
+	ep.SkipUpstreamCheck = false
+	if err := s.UpsertEndpoint(ep); err != nil {
+		t.Fatalf("revoke exemption: %v", err)
+	}
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync 4: %v", err)
+	}
+	if !deletedOf("e-ex") {
+		t.Fatalf("endpoint must rejoin check after revoking exemption")
+	}
+}
+
+// TestClearUpstreamDeleted 管理端开启豁免时的即时清除：只清指定接入点，
+// 同模型的兄弟接入点不受影响。
+func TestClearUpstreamDeleted(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, e := range []*model.Endpoint{
+		{ID: "e1", AccountID: "a1", Model: "m1", EP: "ep-1", Enabled: true},
+		{ID: "e2", AccountID: "a1", Model: "m1", EP: "ep-2", Enabled: true},
+	} {
+		if err := s.UpsertEndpoint(e); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	if _, err := s.SyncEndpointUpstreamPresence("a1", nil); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := s.ClearUpstreamDeleted("e1"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	got1, _ := s.GetEndpoint("e1")
+	got2, _ := s.GetEndpoint("e2")
+	if got1.UpstreamDeleted {
+		t.Fatalf("e1 must be cleared")
+	}
+	if !got2.UpstreamDeleted {
+		t.Fatalf("sibling e2 in same model must be untouched")
+	}
+}
+
+// TestEndpointSkipUpstreamCheckRoundTrip v12 接入点级豁免列：读写回环、重开保留、
+// 普通编辑（按 id 覆盖）可写入且不清掉检查器观察状态。
+func TestEndpointSkipUpstreamCheckRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertEndpoint(&model.Endpoint{ID: "e1", AccountID: "a1", Model: "m1",
+		EP: "ep-1", Enabled: true, SkipUpstreamCheck: true}); err != nil {
+		t.Fatalf("upsert exempt: %v", err)
+	}
+	if err := s.UpsertEndpoint(&model.Endpoint{ID: "e2", AccountID: "a1", Model: "m1",
+		EP: "ep-2", Enabled: true}); err != nil {
+		t.Fatalf("upsert plain: %v", err)
+	}
+	got, err := s.GetEndpoint("e1")
+	if err != nil || !got.SkipUpstreamCheck {
+		t.Fatalf("skip roundtrip: %+v (%v)", got, err)
+	}
+	plain, err := s.GetEndpoint("e2")
+	if err != nil || plain.SkipUpstreamCheck {
+		t.Fatalf("default must be false: %+v (%v)", plain, err)
+	}
+
+	// 普通编辑写入豁免（管理端点开关的场景）：按 id 覆盖路径。
+	got.EP = "ep-1"
+	got.Weight = 4
+	if err := s.UpsertEndpoint(got); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	after, err := s.GetEndpoint("e1")
+	if err != nil || !after.SkipUpstreamCheck || after.Weight != 4 {
+		t.Fatalf("edit must persist skip: %+v (%v)", after, err)
+	}
+
+	// 重开后保留。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	ex2, err := s2.GetEndpoint("e1")
+	if err != nil || !ex2.SkipUpstreamCheck {
+		t.Fatalf("skip lost after reopen: %+v (%v)", ex2, err)
+	}
+}
+
 // TestModelProviderRoundTrip v8 上游协议列：空值（OpenAI 兼容）与 anthropic 的读写回环。
 func TestModelProviderRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -826,7 +988,7 @@ func TestEndpointUpstreamDeletedMigration(t *testing.T) {
 		t.Fatalf("endpoints after migrate: %d (%v)", len(eps), err)
 	}
 	e := eps[0]
-	if e.ID != "e-old" || e.EP != "ep-old" || e.Weight != 7 || e.UpstreamDeleted {
+	if e.ID != "e-old" || e.EP != "ep-old" || e.Weight != 7 || e.UpstreamDeleted || e.SkipUpstreamCheck {
 		t.Fatalf("legacy endpoint altered or wrong default: %+v", e)
 	}
 	if v, ok := s.GetSetting("schema_version"); !ok || v != schemaVersion {
@@ -841,7 +1003,7 @@ func TestEndpointUpstreamDeletedMigration(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s2.Close()
-	if got, err := s2.GetEndpoint("e-old"); err != nil || got.UpstreamDeleted || got.Weight != 7 {
+	if got, err := s2.GetEndpoint("e-old"); err != nil || got.UpstreamDeleted || got.SkipUpstreamCheck || got.Weight != 7 {
 		t.Fatalf("after reopen: %+v (%v)", got, err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
+	"arkgate/internal/store"
 )
 
 // fakeStore 记录每次批量同步的调用（账号 → 当前有效 EP 集合），
@@ -110,7 +111,8 @@ func (f *fakeLister) callCount() int {
 }
 
 // testCfg 组装一个用假依赖驱动的检查器（不启动 Run，手动触发 runOnce）。
-func testCfg(st *fakeStore, lister *fakeLister) *Checker {
+// st 接受任意 AccountStore 实现：fakeStore（行为断言）或真实 store（豁免等 SQL 语义）。
+func testCfg(st AccountStore, lister *fakeLister) *Checker {
 	resolve := func(acc *model.Account) (provider.Route, error) {
 		return provider.Route{BaseURL: "http://fake", Key: acc.ID}, nil
 	}
@@ -319,5 +321,64 @@ func TestCheckerRunTickerStops(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if after := st.syncCount(); after != first {
 		t.Fatalf("syncs grew after Stop: %d -> %d", first, after)
+	}
+}
+
+// TestCheckerHonorsEndpointExemption 端到端豁免（接入点粒度）：接真实 store
+// （豁免语义在 SQL 里，fake 记录器表达不了）+ 假上游，锁定「同模型下豁免的接入点
+// 不被标记、未豁免的兄弟接入点照常标记」，以及撤销豁免后重新参与检查。
+func TestCheckerHonorsEndpointExemption(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer st.Close()
+
+	// 同一模型 m1 下两条接入点：只有 e-ex 豁免——粒度证据就在同模型互为兄弟。
+	for _, e := range []*model.Endpoint{
+		{ID: "e-ck", AccountID: "a1", Model: "m1", EP: "ep-ck", Enabled: true},
+		{ID: "e-ex", AccountID: "a1", Model: "m1", EP: "ep-ex", Enabled: true, SkipUpstreamCheck: true},
+	} {
+		if err := st.UpsertEndpoint(e); err != nil {
+			t.Fatalf("upsert endpoint %s: %v", e.ID, err)
+		}
+	}
+	if err := st.UpsertAccount(&model.Account{
+		ID: "a1", Name: "甲", Provider: "custom", BaseURL: "http://fake", Status: model.AccountActive,
+	}); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	// 上游模型列表为空：未豁免的 e-ck 应被标记，豁免的 e-ex 不动。
+	up := &fakeLister{byAcc: map[string][]string{"a1": {}}}
+	c := testCfg(st, up)
+	c.runOnce()
+
+	deleted := func(id string) bool {
+		e, err := st.GetEndpoint(id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		return e.UpstreamDeleted
+	}
+	if !deleted("e-ck") {
+		t.Fatalf("non-exempt endpoint must be marked when missing upstream")
+	}
+	if deleted("e-ex") {
+		t.Fatalf("exempt endpoint must never be marked")
+	}
+
+	// 撤销豁免后重新参与检查（同一模型下，兄弟不受影响）。
+	ep, err := st.GetEndpoint("e-ex")
+	if err != nil {
+		t.Fatalf("get endpoint: %v", err)
+	}
+	ep.SkipUpstreamCheck = false
+	if err := st.UpsertEndpoint(ep); err != nil {
+		t.Fatalf("revoke exemption: %v", err)
+	}
+	c.runOnce()
+	if !deleted("e-ex") {
+		t.Fatalf("endpoint must rejoin check after revoking exemption")
 	}
 }

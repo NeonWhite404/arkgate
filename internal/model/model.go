@@ -160,6 +160,14 @@ type Endpoint struct {
 	// 普通编辑请求不应覆盖它（仅检查器的批量同步有权写入）。
 	UpstreamDeleted bool `json:"upstream_deleted"`
 
+	// SkipUpstreamCheck 本条接入点的豁免：开启后检查器不再对它做任何状态写入
+	// （既不标记「上游已删除」也不恢复）。适用于上游 GET /models 列表不完整
+	// （例如只返回模型名、不含 ep-* 接入点）而该接入点实际可用的场景。
+	// 粒度是接入点而非模型：同一模型下不同账号/不同 ep 可各自决定（某账号的
+	// /models 不完整、另一账号完整时互不牵连）。豁免只影响检查器——不改变路由、
+	// 限流与统计；开启时既有的「上游已删除」标记会被清除（豁免 = 不观察也不展示）。
+	SkipUpstreamCheck bool `json:"skip_upstream_check"`
+
 	// 叶节点级流量控制
 	Weight         int               `json:"weight"` // 0 = 继承账号权重
 	MaxConcurrency int               `json:"max_concurrency"`

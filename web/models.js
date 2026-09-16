@@ -13,6 +13,7 @@
 function epFormOf(e) {
   return {
     account_id: e.account_id, ep: e.ep, enabled: !!e.enabled,
+    skip_upstream_check: !!e.skip_upstream_check,
     weight: e.weight || 0, max_concurrency: e.max_concurrency || 0,
     rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0,
     request_headers_text: JSON.stringify(e.request_headers || {}, null, 2),
@@ -72,6 +73,10 @@ const ModelsPage = {
     // deletedEpCount 该模型下「上游已删除」的接入点数（行内警告角标）。
     deletedEpCount(name) {
       return this.eps.filter((e) => e.model === name && e.upstream_deleted).length;
+    },
+    // skippedEpCount 该模型下手动豁免上游检查的接入点数（行内提示角标）。
+    skippedEpCount(name) {
+      return this.eps.filter((e) => e.model === name && e.skip_upstream_check).length;
     },
     filteredModels() {
       const q = (this.query || "").trim().toLowerCase();
@@ -179,6 +184,7 @@ const ModelsPage = {
       }
       const payload = { account_id: f.account_id, model: this.mDrawer.name, ep: f.ep.trim(),
         enabled: f.enabled, request_headers: requestHeaders,
+        skip_upstream_check: !!f.skip_upstream_check,
         weight: Number(f.weight) || 0, max_concurrency: Number(f.max_concurrency) || 0,
         rpm_limit: Number(f.rpm_limit) || 0, tpm_limit: Number(f.tpm_limit) || 0 };
       row.saving = true;
@@ -236,7 +242,8 @@ const ModelsPage = {
       const payload = {
         type: f.type, provider: f.type === "text" ? (f.provider || "") : "",
         display: f.display.trim() || name, description: f.description.trim(),
-        enabled: f.enabled, price_input: Number(f.price_input) || 0,
+        enabled: f.enabled,
+        price_input: Number(f.price_input) || 0,
         price_output: Number(f.price_output) || 0, price_image: Number(f.price_image) || 0,
         context_tokens: Number(f.context_tokens) || 0, max_output_tokens: Number(f.max_output_tokens) || 0,
       };
@@ -254,6 +261,7 @@ const ModelsPage = {
           d.name = (f.name0 || "").trim();
           d.originalType = f.type;
         }
+        // load() 会刷新 this.eps；豁免开启后后端已即时清除标记，卡片与表格标签同步消失。
         return this.load();
       })
         .catch((e) => toast(e.message, false))
@@ -381,7 +389,8 @@ const ModelsPage = {
             <span v-if="m.type==='text' && m.provider==='anthropic'" class="tag tag-gray" title="上游使用 Anthropic /v1/messages 协议，网关自动转换">Anthropic</span></td>
           <td><span v-if="m.type==='router'" class="tag tag-out">虚拟</span>
             <span v-else :class="epCount(m.name) ? 'tag tag-blue' : 'tag tag-gray'">{{ epCount(m.name) }} 接入点</span>
-            <span v-if="deletedEpCount(m.name)" class="tag tag-warn" :title="'其中 ' + deletedEpCount(m.name) + ' 个接入点的上游模型已不在该账号的模型列表中（检查器标记，不影响路由，随上游恢复自动消除）'">⚠ 上游已删除 ×{{ deletedEpCount(m.name) }}</span></td>
+            <span v-if="deletedEpCount(m.name)" class="tag tag-warn" :title="'其中 ' + deletedEpCount(m.name) + ' 个接入点的上游模型已不在该账号的模型列表中（检查器标记，不影响路由，随上游恢复自动消除）'">⚠ 上游已删除 ×{{ deletedEpCount(m.name) }}</span>
+            <span v-if="skippedEpCount(m.name)" class="tag tag-out" :title="'其中 ' + skippedEpCount(m.name) + ' 个接入点已豁免上游检查（在工作台对应接入点卡片里可关闭）'">豁免检查 ×{{ skippedEpCount(m.name) }}</span></td>
           <td class="cost">
             <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
             <template v-else-if="m.type==='router'">—</template>
@@ -510,6 +519,12 @@ const ModelsPage = {
               </div>
               <div class="ep-card-foot">
                 <span v-if="sibEps(row).length" class="sh-note" :title="sibEps(row).map(x => x.ep).join('、')">同账号同模型另有 {{ sibEps(row).length }} 个接入点</span>
+                <!-- 用 span 而非 label：label 包裹 switch 会让点击被转发一次，
+                     与按钮自身的 click 叠加成两次切换（净效果为零）。 -->
+                <span class="ep-skip" :title="'开启后该接入点不参与「上游已删除」检查：上游 GET /models 列表不完整（只返回模型名、不含 ep-* 等）时用。只影响检查器，不改变路由/限流/统计。'">
+                  <ui-switch v-model="row.form.skip_upstream_check" size="sm"/>
+                  <span class="sh-note">豁免上游检查</span>
+                </span>
                 <div class="spacer"></div>
                 <probe-test v-if="row.id && row.form.account_id && row.form.ep" :payload="{model: mDrawer.name, account_id: row.form.account_id, ep: row.form.ep}" label="测试"/>
                 <span v-if="dirtyRow(row)" class="ep-dirty-dot" title="有未保存的修改"></span>
