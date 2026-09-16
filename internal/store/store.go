@@ -517,16 +517,98 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	return err
 }
 
+// DeleteModel 删除模型、其全部接入点，并清理其它模型对它的引用
+// （fallback 链与路由分流目标）。
+//
+// 引用必须一并清理：留下悬空名字会让「被引用方已不存在」的配置留在库里——
+// 运行时该 fallback/路由目标必然失败，更麻烦的是管理端保存那些模型时
+// validateFallbackChain / validateRouterTarget 会因「目标不存在」直接 400，
+// 使管理员无法再编辑保存任何引用过该名字的模型（只能手工去库里删串）。
+// 全程单事务，避免「删了模型却漏清引用」的中间态。
 func (s *Store) DeleteModel(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM models WHERE name=?`, name); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM endpoints WHERE model=?`, name); err != nil {
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM models WHERE name=?`, name); err != nil {
 		return err
 	}
-	return nil
+	if _, err := tx.Exec(`DELETE FROM endpoints WHERE model=?`, name); err != nil {
+		return err
+	}
+	// 清理其它模型的 fallback 引用与路由目标。两者都以 JSON 文本存储，
+	// SQL 层无法精准改写，改为在 Go 侧解析后回写（先收集再更新，避免
+	// 在遍历结果集的同时写同一张表）。模型数量级很小，全表扫可接受。
+	// 匹配模式带上引号，保证 "gpt-4" 不会误命中 "gpt-4o"。
+	pattern := "%" + likeEscape(`"`+name+`"`) + "%"
+	rows, err := tx.Query(`SELECT name,fallback,router FROM models
+		WHERE fallback LIKE ? ESCAPE '\' OR router LIKE ? ESCAPE '\'`, pattern, pattern)
+	if err != nil {
+		return err
+	}
+	type modelRefs struct {
+		name     string
+		fallback []string
+		router   string
+	}
+	var updates []modelRefs
+	for rows.Next() {
+		var (
+			mName, fb, routerRaw string
+		)
+		if err := rows.Scan(&mName, &fb, &routerRaw); err != nil {
+			rows.Close()
+			return err
+		}
+		var chain []string
+		_ = json.Unmarshal([]byte(fb), &chain)
+		kept := make([]string, 0, len(chain))
+		for _, f := range chain {
+			if f != name {
+				kept = append(kept, f)
+			}
+		}
+		up := modelRefs{name: mName, fallback: kept, router: routerRaw}
+		// 路由配置：剔除指向被删模型的分流规则；默认目标命中则清空
+		// （保持与「软禁用」一致——宁可该路由模型解析失败提示重配，
+		// 也不留一个永远打不通的目标）。
+		if routerRaw != "" {
+			rc := &model.RouterConfig{}
+			if json.Unmarshal([]byte(routerRaw), rc) == nil {
+				rules := make([]model.RouterRule, 0, len(rc.Rules))
+				for _, r := range rc.Rules {
+					if r.Target != name {
+						rules = append(rules, r)
+					}
+				}
+				rc.Rules = rules
+				if rc.DefaultTarget == name {
+					rc.DefaultTarget = ""
+				}
+				up.router = routerJSON(rc)
+			}
+		}
+		updates = append(updates, up)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, up := range updates {
+		fb, err := json.Marshal(up.fallback)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE models SET fallback=?, router=? WHERE name=?`,
+			string(fb), up.router, up.name); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ─────────────────────────── Endpoint（元组） ───────────────────────────

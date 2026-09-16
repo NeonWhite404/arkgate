@@ -685,6 +685,135 @@ func TestSubKeyScopedQueries(t *testing.T) {
 	}
 }
 
+// TestDeleteModelCleansReferences 删除模型必须清理其它模型对它的引用：
+// fallback 链去项（保持其余顺序）、路由规则与默认目标去掉该名字。
+// 不清理会让引用方在管理端保存时被 validateFallbackChain 400 卡死。
+func TestDeleteModelCleansReferences(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	// a：fallback 链 [doomed, keeper]；b：链 [keeper, doomed]；c：链只有 keeper（不该被动）。
+	// auto：路由规则一项指向 doomed、默认目标也是 doomed。
+	mk := func(name string, fb []string) {
+		if err := s.UpsertModel(&model.Model{Name: name, Type: model.ModelTypeText,
+			Enabled: true, Fallback: fb}); err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+	}
+	mk("doomed", []string{})
+	mk("keeper", []string{})
+	mk("a", []string{"doomed", "keeper"})
+	mk("b", []string{"keeper", "doomed"})
+	mk("c", []string{"keeper"})
+	if err := s.UpsertModel(&model.Model{Name: "auto", Type: model.ModelTypeRouter, Enabled: true,
+		Router: &model.RouterConfig{
+			Rules: []model.RouterRule{
+				{MaxInputTokens: 4096, Target: "doomed"},
+				{MaxInputTokens: 32768, Target: "keeper"},
+			},
+			DefaultTarget: "doomed",
+		}}); err != nil {
+		t.Fatalf("upsert router: %v", err)
+	}
+	// 名字前缀相同的模型不能被误伤（"doom" vs "doomed"）。
+	mk("doom", []string{"doomed"})
+
+	if err := s.DeleteModel("doomed"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := s.GetModel("doomed"); err == nil {
+		t.Fatalf("doomed must be gone")
+	}
+
+	fbOf := func(name string) []string {
+		m, err := s.GetModel(name)
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		return m.Fallback
+	}
+	a := fbOf("a")
+	if len(a) != 1 || a[0] != "keeper" {
+		t.Fatalf("a fallback must drop doomed and keep order: %+v", a)
+	}
+	b := fbOf("b")
+	if len(b) != 1 || b[0] != "keeper" {
+		t.Fatalf("b fallback must drop doomed and keep order: %+v", b)
+	}
+	c := fbOf("c")
+	if len(c) != 1 || c[0] != "keeper" {
+		t.Fatalf("c fallback must be untouched: %+v", c)
+	}
+	// 前缀同名（doom 引用 doomed）也要被清掉——按引号精确匹配。
+	dm := fbOf("doom")
+	if len(dm) != 0 {
+		t.Fatalf("doom fallback must be cleared: %+v", dm)
+	}
+
+	auto, err := s.GetModel("auto")
+	if err != nil {
+		t.Fatalf("get auto: %v", err)
+	}
+	if auto.Router == nil {
+		t.Fatalf("auto router config must survive")
+	}
+	if auto.Router.DefaultTarget != "" {
+		t.Fatalf("default target pointing at deleted model must be cleared: %q", auto.Router.DefaultTarget)
+	}
+	if len(auto.Router.Rules) != 1 || auto.Router.Rules[0].Target != "keeper" {
+		t.Fatalf("router rules must drop the deleted target: %+v", auto.Router.Rules)
+	}
+
+	// 重开后引用清理结果仍在（确认是落库而非仅在内存）。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	got, err := s2.GetModel("a")
+	if err != nil || len(got.Fallback) != 1 || got.Fallback[0] != "keeper" {
+		t.Fatalf("cleanup must be persisted: %+v (%v)", got, err)
+	}
+}
+
+// TestDeleteModelLeavesUnrelatedAlone 删除与引用清理不误伤无关模型；
+// 删除没被任何模型引用的模型也不报错。
+func TestDeleteModelLeavesUnrelatedAlone(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, m := range []*model.Model{
+		{Name: "lonely", Type: model.ModelTypeText, Enabled: true, Fallback: []string{}},
+		{Name: "other", Type: model.ModelTypeText, Enabled: true, Fallback: []string{"third"}},
+		{Name: "third", Type: model.ModelTypeText, Enabled: true, Fallback: []string{}},
+	} {
+		if err := s.UpsertModel(m); err != nil {
+			t.Fatalf("upsert %s: %v", m.Name, err)
+		}
+	}
+	if err := s.DeleteModel("lonely"); err != nil {
+		t.Fatalf("delete unreferenced: %v", err)
+	}
+	other, err := s.GetModel("other")
+	if err != nil {
+		t.Fatalf("get other: %v", err)
+	}
+	if len(other.Fallback) != 1 || other.Fallback[0] != "third" {
+		t.Fatalf("unrelated fallback must be untouched: %+v", other.Fallback)
+	}
+}
+
 // TestModelRouterRoundTrip v7 路由配置列的读写回环：nil ↔ 空串、对象整体替换。
 func TestModelRouterRoundTrip(t *testing.T) {
 	dir := t.TempDir()

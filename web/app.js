@@ -1694,7 +1694,7 @@ const AdminShell = {
   template: `
   <div class="layout">
     <aside class="sidebar">
-      <div class="logo"><span class="dot"></span>ArkGate<span class="ver">v1.1</span></div>
+      <div class="logo"><span class="dot"></span>ArkGate<span class="ver">v1.2</span></div>
       <div class="nav">
         <div v-for="m in menu" :key="m.key" class="nav-item" :class="{active: view===m.key}" @click="view=m.key">
           <svg class="nav-ic" viewBox="0 0 24 24" v-html="m.icon"></svg>{{ m.label }}
