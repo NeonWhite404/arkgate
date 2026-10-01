@@ -35,6 +35,9 @@ type Admin struct {
 	catalog *catalog.Catalog  // 内置模型元数据目录（价格/能力自动补全来源）
 	mgr     *provider.Manager // 仅用于「拉取上游模型列表」这类管理侧探测
 	handler http.Handler
+	// usageCache 用量分析查询结果缓存（含单飞）。前端点 facet 下钻是最高频操作，
+	// 同一组参数短时间内会被反复请求，缓存收益最明显。
+	usageCache *store.UsageCache
 }
 
 const tokenHashKey = "admin_token_hash"
@@ -48,7 +51,8 @@ const (
 // New 构造管理后端，并把已持久化的运行时设置应用到 cfg
 // （优先级：DB 持久化值 > 环境变量 > 内置默认）。
 func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.Config) *Admin {
-	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New(), mgr: provider.NewManager()}
+	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New(),
+		mgr: provider.NewManager(), usageCache: store.NewUsageCache(store.UsageCacheTTL)}
 	a.loadPersistedTimeouts()
 	a.handler = a.routes()
 	return a
@@ -225,10 +229,31 @@ func (a *Admin) handleUsageStats(w http.ResponseWriter, r *http.Request) {
 		Dim:         qv.Get("dim"),
 		Entity:      qv.Get("entity"),
 	}
-	res, err := a.store.QueryUsage(q)
-	if err != nil {
-		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+	// nocache=1 绕过缓存（排查「数对不对」时必须能拿到实时值，
+	// 否则缓存会让人怀疑是数据问题而不是缓存问题）。
+	if qv.Get("nocache") == "1" {
+		res, err := a.store.QueryUsage(q)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"detail": err.Error()})
+			return
+		}
+		w.Header().Set("X-Usage-Cache", "bypass")
+		writeJSON(w, 200, res)
 		return
+	}
+	// 缓存键 = 全部查询参数的规范化拼接。带 entity 与 dim，否则下钻会串味。
+	key := fmt.Sprintf("%d|%d|%s|%s|%s", q.From, q.To, q.Granularity, q.Dim, q.Entity)
+	res, loaded, err := a.usageCache.GetOrLoad(key, func() (*store.UsageQueryResult, error) {
+		return a.store.QueryUsage(q)
+	})
+	if err != nil || res == nil {
+		writeJSON(w, 500, map[string]any{"detail": "用量查询失败"})
+		return
+	}
+	if loaded {
+		w.Header().Set("X-Usage-Cache", "miss")
+	} else {
+		w.Header().Set("X-Usage-Cache", "hit")
 	}
 	writeJSON(w, 200, res)
 }
