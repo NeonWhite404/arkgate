@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -61,7 +62,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
 // v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
 // v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
-const schemaVersion = "12"
+const schemaVersion = "13"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -143,7 +144,15 @@ func (s *Store) migrate() error {
 			status TEXT NOT NULL DEFAULT '',
 			latency_ms INTEGER NOT NULL DEFAULT 0,
 			first_token_ms INTEGER NOT NULL DEFAULT 0,
-			error TEXT NOT NULL DEFAULT ''
+			error TEXT NOT NULL DEFAULT '',
+			error_kind TEXT NOT NULL DEFAULT '',
+			is_stream INTEGER NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			input_cost REAL NOT NULL DEFAULT 0,
+			output_cost REAL NOT NULL DEFAULT 0,
+			cache_cost REAL NOT NULL DEFAULT 0,
+			user_agent TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_endpoints_account ON endpoints(account_id)`,
@@ -151,6 +160,13 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_subkeys_hash ON subkeys(key_hash)`,
 		// 门户按子 Key 拉日志（WHERE subkey_id ORDER BY id DESC）。
 		`CREATE INDEX IF NOT EXISTS idx_usage_subkey ON usage_logs(subkey_id, id)`,
+		// 分析查询索引（v13）：
+		//   - 维度趋势按 (ts, 维度键) 走覆盖索引，避免全表扫；
+		//   - (status, ts) 服务成功率/错误分析（按状态过滤后按时间分桶）。
+		`CREATE INDEX IF NOT EXISTS idx_usage_ts_model ON usage_logs(ts, model)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_ts_subkey ON usage_logs(ts, subkey_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_ts_account ON usage_logs(ts, account_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_status_ts ON usage_logs(status, ts)`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -231,6 +247,16 @@ func (s *Store) migrate() error {
 		`ALTER TABLE endpoints ADD COLUMN upstream_deleted INTEGER NOT NULL DEFAULT 0`,
 		// —— v12：接入点级跳过上游检查（0=参与检查，等价旧行为） ——
 		`ALTER TABLE endpoints ADD COLUMN skip_upstream_check INTEGER NOT NULL DEFAULT 0`,
+		// —— v13：用量分析口径补齐（缓存 token / 成本拆分 / 错误分类 / 流式标记 / UA） ——
+		// 全部 NOT NULL DEFAULT，历史行自动等价旧行为（成本只记总额、错误无分类）。
+		`ALTER TABLE usage_logs ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN input_cost REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN output_cost REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN cache_cost REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_logs ADD COLUMN is_stream INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_logs ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -1067,27 +1093,55 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO usage_logs
 		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
-		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,first_token_ms,error,client_ip)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,first_token_ms,error,client_ip,
+		 error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
 		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
 		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs,
-		l.FirstTokenMs, l.Error, l.ClientIP)
+		l.FirstTokenMs, l.Error, l.ClientIP,
+		l.ErrorKind, boolToInt(l.IsStream), l.CacheCreationTokens, l.CacheReadTokens,
+		l.InputCost, l.OutputCost, l.CacheCost, truncateStr(l.UserAgent, 200))
 	return err
+}
+
+// boolToInt 把布尔写成 SQLite 的 0/1（无原生布尔类型）。
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// truncateStr 按字节截断字符串（用于 UA 这类只供展示、无需全量的字段），
+// 截断时保证不切碎 UTF-8。
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
 	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
-	cost,status,latency_ms,first_token_ms,error,client_ip`
+	cost,status,latency_ms,first_token_ms,error,client_ip,
+	error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent`
 
 func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
+	var isStream int
 	if err := rows.Scan(&l.ID, &l.TS, &l.SubKeyID, &l.SubKeyName, &l.AccountID, &l.AccountName,
 		&l.Provider, &l.EndpointID, &l.RequestedModel, &l.Model, &l.EP, &l.Modality,
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
-		&l.Cost, &l.Status, &l.LatencyMs, &l.FirstTokenMs, &l.Error, &l.ClientIP); err != nil {
+		&l.Cost, &l.Status, &l.LatencyMs, &l.FirstTokenMs, &l.Error, &l.ClientIP,
+		&l.ErrorKind, &isStream, &l.CacheCreationTokens, &l.CacheReadTokens,
+		&l.InputCost, &l.OutputCost, &l.CacheCost, &l.UserAgent); err != nil {
 		return nil, err
 	}
+	l.IsStream = isStream != 0
 	return l, nil
 }
 
@@ -1388,7 +1442,7 @@ func (s *Store) ListUsageLogsBySubKey(subkeyID string, limit int) ([]*model.Usag
 
 // UsageQuery 用量分析查询参数。Dim 为空表示只看总量；Entity 为该维度下的键过滤。
 type UsageQuery struct {
-	From, To    int64  // unix 秒闭区间 [From, To]
+	From, To    int64  // unix 秒右开区间 [From, To)
 	Granularity string // day | hour（其它值回落 day）
 	Dim         string // "" | model | subkey | account | endpoint | provider
 	Entity      string // Dim 的过滤键（facet.Key）
@@ -1403,6 +1457,21 @@ type UsageTotals struct {
 	TotalTokens      int64   `json:"total_tokens"`
 	Images           int64   `json:"images"`
 	Cost             float64 `json:"cost"`
+	// 成本拆分（三者和 == Cost）。
+	InputCost  float64 `json:"input_cost"`
+	OutputCost float64 `json:"output_cost"`
+	CacheCost  float64 `json:"cache_cost"`
+	// 缓存 token（v13）：用于算命中率 cache_read/(prompt+cache_read)。
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	// 上游失败计数（error_kind 属 upstream_error/upstream_timeout）。
+	// 与 Requests-Success 的差值是「客户端侧失败」，两者分开才能看清上游健康度。
+	UpstreamErrors int64 `json:"upstream_errors"`
+	ClientErrors   int64 `json:"client_errors"`
+	// 流式请求数与首字耗时之和（仅流式成功计入，非流式首字为 0 不参与均值）。
+	StreamRequests   int64 `json:"stream_requests"`
+	FirstTokenMsSum  int64 `json:"first_token_ms_sum"`
+	LatencyMsSum     int64 `json:"latency_ms_sum"`
 }
 
 // UsageBucket 单个时间桶的聚合。
@@ -1414,6 +1483,8 @@ type UsageBucket struct {
 	Success          int64   `json:"success"`
 	Images           int64   `json:"images"`
 	Cost             float64 `json:"cost"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	UpstreamErrors   int64   `json:"upstream_errors"`
 }
 
 // UsageFacet 维度下实体的小计行（供下拉/表格选择实体）。
@@ -1427,6 +1498,8 @@ type UsageFacet struct {
 	TotalTokens      int64   `json:"total_tokens"`
 	Images           int64   `json:"images"`
 	Cost             float64 `json:"cost"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	UpstreamErrors   int64   `json:"upstream_errors"`
 }
 
 // UsageQueryResult 一次查询的完整结果：总量 + 时序 + 维度实体列表。
@@ -1434,6 +1507,16 @@ type UsageQueryResult struct {
 	Summary UsageTotals    `json:"summary"`
 	Series  []*UsageBucket `json:"series"`
 	Facets  []*UsageFacet  `json:"facets"`
+	// Errors 按 error_kind 的错误分布（客户端侧与上游侧分开，便于定位根因）。
+	Errors []*UsageErrorKind `json:"errors"`
+	// Source 标记本结果来自预聚合还是原始表（raw），便于排查口径问题。
+	Source string `json:"source"`
+}
+
+// UsageErrorKind 一种错误分类的小计。
+type UsageErrorKind struct {
+	Kind     string `json:"kind"`
+	Requests int64  `json:"requests"`
 }
 
 // usageDims 分析维度 → (过滤键列, 展示名列)。
@@ -1449,14 +1532,43 @@ var usageDims = map[string][2]string{
 const usageQueryMaxSpan = 92 * 86400
 
 // usageBucketExpr 时间桶表达式：小时桶按 UTC 整点；天桶按本地时区自然日。
-// 时区偏移以整型常量直接内进 SQL（SELECT 与 GROUP BY 会重复出现该表达式，
-// 不能用占位符），值来自 time.Zone，无注入面。
-func usageBucketExpr(gran string) string {
+//
+// 为什么不能用「固定偏移算术平移」："((ts+off)/86400)*86400-off" 隐含「所有天
+// 都是同一偏移」。跨 DST 切换时同一区间内的天属于不同偏移，会被归错桶（差 1 小时
+// 的日界线）。这里改为在 Go 侧算好「本地日 → 该日 00:00 对应的 UTC 秒」列表，
+// 用 CASE 表达式精确分桶，每个日边界都各自按当时的偏移计算（DST-safe）。
+//
+// 桶值统一返回为「本地日 00:00 的 UTC 秒」，前端按该值本地化展示。
+// 天桶的 CASE 分支数 = 区间天数（最大 usageQueryMaxSpan/86400 ≈ 92），可接受。
+func usageBucketExpr(gran string, from, to int64, loc *time.Location) string {
 	if gran == "hour" {
 		return "(ts/3600)*3600"
 	}
-	_, off := time.Now().Zone()
-	return "((ts+" + strconv.Itoa(int(off)) + ")/86400)*86400-" + strconv.Itoa(int(off))
+	// 区间内每个自然日的起点（取 from 前一天开端，以免 from 落在日中时漏掉当天的前缀）。
+	start := time.Unix(from, 0).In(loc).Truncate(24 * time.Hour)
+	// Truncate 对带偏移的时间不可靠，改用显式构造当地 00:00。
+	y, m, d := time.Unix(from, 0).In(loc).Date()
+	start = time.Date(y, m, d, 0, 0, 0, 0, loc)
+
+	var sb strings.Builder
+	sb.WriteString("CASE")
+	for t := start; t.Unix() <= to; t = t.AddDate(0, 0, 1) {
+		// 下一天 00:00 同样按当地时间构造，DST 切换日的边界自动正确。
+		next := time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, loc)
+		sb.WriteString(" WHEN ts < ")
+		sb.WriteString(strconv.FormatInt(next.Unix(), 10))
+		sb.WriteString(" THEN ")
+		sb.WriteString(strconv.FormatInt(t.Unix(), 10))
+		// 极端情况：区间跨越超过一年时限制分支数（上限 400 天，远超 usageQueryMaxSpan）。
+		if t.AddDate(0, 0, 400).Before(time.Unix(to, 0)) {
+			break
+		}
+	}
+	// 兜底分桶：不应命中（区间已按 to 覆盖），保证 SQL 在任何输入下都返回非 NULL。
+	sb.WriteString(" ELSE ")
+	sb.WriteString(strconv.FormatInt(start.Unix(), 10))
+	sb.WriteString(" END")
+	return sb.String()
 }
 
 // QueryUsage 聚合 usage_logs 返回总量、按时间粒度的时序，以及维度实体小计。
@@ -1480,35 +1592,54 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 		q.Dim, q.Entity = "", ""
 	}
 
-	where := "ts >= ? AND ts <= ?"
+	// 右开区间 [from, to)：闭区间会让相邻两次查询把边界那一秒重复计入，
+	// 前端翻页/切换区间时会看到总量对不上。
+	where := "ts >= ? AND ts < ?"
 	whereArgs := []any{q.From, q.To}
 	if q.Entity != "" {
 		where += " AND " + dim[0] + " = ?"
 		whereArgs = append(whereArgs, q.Entity)
 	}
 
-	res := &UsageQueryResult{Series: []*UsageBucket{}, Facets: []*UsageFacet{}}
+	res := &UsageQueryResult{Series: []*UsageBucket{}, Facets: []*UsageFacet{}, Errors: []*UsageErrorKind{}}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	// 1) 总量。
+	// 上游错误单列：error_kind 属上游问题的才算「上游失败」，否则客户端参数错误与
+	// 断连会把成功率拖低，看不出上游真实健康度。历史行 error_kind 为空（v13 之前），
+	// 按「非 ok 且非本地/客户端」上溯——它们当时只有自由文本，无法再细分，
+	// 归入上游错误是与旧口径（status='error' 全部算失败）最接近的保守选择。
 	row := s.db.QueryRow(`SELECT COUNT(*),
 			COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-			COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
+			COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0),
+			COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0),
+			COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN status<>'ok' AND error_kind IN ('client_invalid','client_cancel','local_error') THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(is_stream),0),
+			COALESCE(SUM(CASE WHEN status='ok' AND is_stream=1 THEN first_token_ms ELSE 0 END),0),
+			COALESCE(SUM(latency_ms),0)
 		FROM usage_logs WHERE `+where, whereArgs...)
 	if err := row.Scan(&res.Summary.Requests, &res.Summary.Success,
 		&res.Summary.PromptTokens, &res.Summary.CompletionTokens,
-		&res.Summary.TotalTokens, &res.Summary.Images, &res.Summary.Cost); err != nil {
+		&res.Summary.TotalTokens, &res.Summary.Images, &res.Summary.Cost,
+		&res.Summary.InputCost, &res.Summary.OutputCost, &res.Summary.CacheCost,
+		&res.Summary.CacheCreationTokens, &res.Summary.CacheReadTokens,
+		&res.Summary.UpstreamErrors, &res.Summary.ClientErrors,
+		&res.Summary.StreamRequests, &res.Summary.FirstTokenMsSum, &res.Summary.LatencyMsSum); err != nil {
 		return nil, err
 	}
 
 	// 2) 时序。
-	bucketExpr := usageBucketExpr(q.Granularity)
+	bucketExpr := usageBucketExpr(q.Granularity, q.From, q.To, time.Local)
 	rows, err := s.db.Query(`SELECT `+bucketExpr+`,
 			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 			COUNT(*), COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
-			COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
+			COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0),
+			COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0)
 		FROM usage_logs WHERE `+where+` GROUP BY `+bucketExpr+` ORDER BY 1 ASC`, whereArgs...)
 	if err != nil {
 		return nil, err
@@ -1517,7 +1648,8 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 	for rows.Next() {
 		b := &UsageBucket{}
 		if err := rows.Scan(&b.Bucket, &b.PromptTokens, &b.CompletionTokens,
-			&b.Requests, &b.Success, &b.Images, &b.Cost); err != nil {
+			&b.Requests, &b.Success, &b.Images, &b.Cost,
+			&b.CacheReadTokens, &b.UpstreamErrors); err != nil {
 			return nil, err
 		}
 		res.Series = append(res.Series, b)
@@ -1531,8 +1663,10 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 		frows, err := s.db.Query(`SELECT `+dim[0]+`, `+dim[1]+`,
 				COUNT(*), COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
 				COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-				COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0)
-			FROM usage_logs WHERE ts >= ? AND ts <= ?
+				COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0),
+			COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0)
+			FROM usage_logs WHERE ts >= ? AND ts < ?
 			GROUP BY `+dim[0]+`, `+dim[1]+`
 			ORDER BY SUM(total_tokens) DESC, SUM(image_count) DESC
 			LIMIT 200`, q.From, q.To)
@@ -1543,7 +1677,8 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 		for frows.Next() {
 			f := &UsageFacet{}
 			if err := frows.Scan(&f.Key, &f.Label, &f.Requests, &f.Success,
-				&f.PromptTokens, &f.CompletionTokens, &f.TotalTokens, &f.Images, &f.Cost); err != nil {
+				&f.PromptTokens, &f.CompletionTokens, &f.TotalTokens, &f.Images, &f.Cost,
+				&f.CacheReadTokens, &f.UpstreamErrors); err != nil {
 				return nil, err
 			}
 			res.Facets = append(res.Facets, f)
@@ -1552,6 +1687,30 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 			return nil, err
 		}
 	}
+
+	// 4) 错误分类分布（与总量/时序同一 WHERE，仅统计失败行）。
+	erows, err := s.db.Query(`SELECT error_kind, COUNT(*) FROM usage_logs
+		WHERE `+where+` AND status<>'ok'
+		GROUP BY error_kind ORDER BY COUNT(*) DESC`, whereArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer erows.Close()
+	for erows.Next() {
+		ek := &UsageErrorKind{}
+		if err := erows.Scan(&ek.Kind, &ek.Requests); err != nil {
+			return nil, err
+		}
+		if ek.Kind == "" {
+			// v13 之前的历史行没有分类：标注成 unclassified 而不是伪装成某个已知类别。
+			ek.Kind = "unclassified"
+		}
+		res.Errors = append(res.Errors, ek)
+	}
+	if err := erows.Err(); err != nil {
+		return nil, err
+	}
+	res.Source = "raw"
 	return res, nil
 }
 

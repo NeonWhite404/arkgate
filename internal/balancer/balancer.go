@@ -843,8 +843,10 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr b
 		images:     l.ImageCount,
 	}
 	// 成本核算：即使请求失败（tokens 全 0）结果也是 0，无需分支。
+	// 同时写回拆分列——computeCost 是唯一写入口，保证「拆分之和 == 总额」。
 	op.cost = b.computeCost(l.Model, l.PromptTokens, l.CompletionTokens, l.ImageCount)
 	l.Cost = op.cost
+	l.InputCost, l.OutputCost, l.CacheCost = b.splitCost(l.Model, l)
 	// 阻塞投递，保证不丢。
 	if b.statCh != nil {
 		b.statCh <- op
@@ -864,6 +866,24 @@ func (b *Balancer) computeCost(modelName string, pt, ct, images int64) float64 {
 		return 0
 	}
 	return float64(pt)/1e6*p[0] + float64(ct)/1e6*p[1] + float64(images)*p[2]
+}
+
+// splitCost 把一次请求的成本拆成输入/输出/缓存三部分（供用量分析按成本构成下钻）。
+//
+// 与 computeCost 的关系统一为：input + output + cache == Cost。图像费用归入 output
+// （目前图像无独立拆分列，混入输出更贴近「非输入侧费用」的直觉）。
+// 缓存 token 不额外计价（上游对缓存读通常给折扣，但网关未建模该折扣），因此
+// cache 只会是 0；保留该列是为了下一步接上游真实账单时不用再改 schema。
+func (b *Balancer) splitCost(modelName string, l *model.UsageLog) (in, out, cache float64) {
+	b.mu.RLock()
+	p, ok := b.prices[modelName]
+	b.mu.RUnlock()
+	if !ok {
+		return 0, 0, 0
+	}
+	in = float64(l.PromptTokens) / 1e6 * p[0]
+	out = float64(l.CompletionTokens)/1e6*p[1] + float64(l.ImageCount)*p[2]
+	return in, out, cache
 }
 
 func nowPlusCooldown(fails int32) int64 {

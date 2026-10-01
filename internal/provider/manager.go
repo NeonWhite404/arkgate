@@ -271,6 +271,25 @@ type Stream struct {
 	sniff    func(payload []byte) (pt, ct int64, ok bool)
 	terminal func(payload []byte) (stop, fail bool) // responses 终止事件检测（其它协议为 nil）
 	cancel   context.CancelFunc                     // 首 token 超时场景下创建的子 ctx（可能为 nil）
+
+	// 缓存 token（v13）：Pump 过程中从 usage 事件額外抽取。
+	// 不并入 Pump 返回值是为了不改动已有 10 处 (pt, ct, err) 调用点；
+	// 流跑完后用 Usage() 取即可（未跑到 usage 事件时为 0）。
+	cacheCreation int64
+	cacheRead     int64
+}
+
+// Usage 返回流式过程中累计的用量（含缓存 token）。应在 Pump 返回后读取。
+func (s *Stream) Usage(pt, ct int64) *TextUsage {
+	if s == nil {
+		return &TextUsage{PromptTokens: pt, CompletionTokens: ct}
+	}
+	return &TextUsage{
+		PromptTokens:        pt,
+		CompletionTokens:    ct,
+		CacheCreationTokens: s.cacheCreation,
+		CacheReadTokens:     s.cacheRead,
+	}
 }
 
 // Close 关闭流并释放底层资源。
@@ -299,6 +318,16 @@ func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 			if p, c, ok := sniffDataLine(line, s.sniff); ok {
 				pt += p
 				ct += c
+			}
+			// 缓存 token 单独扫一遍：不同上游字段名不同，统一在这里归一，
+			// 不必给 sniff 加第三个返回值（那会改到所有协议分支）。
+			if cc, cr, ok := sniffCacheTokens(line); ok {
+				if cc > 0 {
+					s.cacheCreation = cc
+				}
+				if cr > 0 {
+					s.cacheRead = cr
+				}
 			}
 			if !stopping {
 				if tstop, tfail := s.terminalLine(line); tstop {
@@ -477,7 +506,7 @@ func (m *Manager) ChatStream(ctx context.Context, rt Route, down []byte, upstrea
 	}
 	defer st.Close()
 	pt, ct, err := st.Pump(sink)
-	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
+	return st.Usage(pt, ct), err
 }
 
 // ResponsesStream 转发流式 responses；从 response.completed 事件提取用量。
@@ -489,7 +518,7 @@ func (m *Manager) ResponsesStream(ctx context.Context, rt Route, down []byte, up
 	}
 	defer st.Close()
 	pt, ct, err := st.Pump(sink)
-	return &TextUsage{PromptTokens: pt, CompletionTokens: ct}, err
+	return st.Usage(pt, ct), err
 }
 
 // ImagesStream 转发流式 images/generations（partial images）。无 usage 事件，
@@ -543,6 +572,50 @@ func chatUsageFromChunk(payload []byte) (int64, int64, bool) {
 		return parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens, true
 	}
 	return 0, 0, false
+}
+
+// sniffCacheTokens 从一行 SSE 载荷里扫缓存 token（OpenAI / Anthropic 两种口径）。
+// 不依赖具体协议，因此在 Pump 里对每一行无差别调用；解析不出就返回 false。
+func sniffCacheTokens(line []byte) (creation, read int64, ok bool) {
+	payload, ok := dataPayloadOf(line)
+	if !ok {
+		return 0, 0, false
+	}
+	var parsed struct {
+		Usage *struct {
+			CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+			CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+		// Anthropic 原生事件把 usage 放在 message_start.message.usage，
+		// 转换桥会重写成 OpenAI chunk，故此处只需兼顾顶层与 message 两种位置。
+		Message *struct {
+			Usage *struct {
+				CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+				CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(payload, &parsed) != nil {
+		return 0, 0, false
+	}
+	if u := parsed.Usage; u != nil {
+		creation, read = u.CacheCreationTokens, u.CacheReadTokens
+		if d := u.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			read = d.CachedTokens
+		}
+	}
+	if m := parsed.Message; m != nil && m.Usage != nil {
+		if m.Usage.CacheCreationTokens > 0 {
+			creation = m.Usage.CacheCreationTokens
+		}
+		if m.Usage.CacheReadTokens > 0 {
+			read = m.Usage.CacheReadTokens
+		}
+	}
+	return creation, read, creation > 0 || read > 0
 }
 
 // responsesUsageFromEvent 从 responses 终止事件（completed/incomplete/failed）提取用量：

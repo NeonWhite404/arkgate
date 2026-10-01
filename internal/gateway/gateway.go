@@ -202,6 +202,29 @@ type routeInfo struct {
 	accountName string
 }
 
+// reqMeta 携带「记录日志需要、但不在既有参数里」的请求级元数据。
+//
+// 为什么单独搞一个结构而不是继续加参数：recordAttempt 有 24 个调用点，
+// 参数已经 12 个；再加两个会在每个调用点重复一遍 r 的取值逻辑。这里由各入口
+// 用 newReqMeta(r, stream) 取一次，传值（非指针）避免逃逸到堆。
+//
+// 注意：UserAgent 只写入 usage_logs，**不得**加入门户列白名单
+//（store.subKeyLogCols）——UA 可指纹化下游客户端，属管理端可见信息。
+type reqMeta struct {
+	userAgent string // 截断 200 字节；仅管理端可见
+	isStream  bool   // 本请求走流式路径（用于区分 TTFT 口径与流式占比）
+	// 缓存 token（v13）：在上游响应到手后才能得知，因此在结算前回填到 meta。
+	// 非流式在拿到 TextUsage 后填，流式在 Pump 结束后填。
+	cacheCreation int64
+	cacheRead     int64
+}
+
+// newReqMeta 从请求取一次元数据。stream 由各入口根据自己的分流结果传入
+//（不能用 wantsStream 现算：归一后 body 已改写，且 anthropic 入口的判定不同源）。
+func newReqMeta(r *http.Request, stream bool) reqMeta {
+	return reqMeta{userAgent: r.Header.Get("User-Agent"), isStream: stream}
+}
+
 // resolveRoute 把选中的叶节点解析成可发送路由：
 // 账号 → 供应商定义 → 最终 base URL → 解密真实 Key（不透明字符串，原样进鉴权头）。
 func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
@@ -264,11 +287,43 @@ func upstreamCtx(r *http.Request) context.Context {
 	return r.Context()
 }
 
+// classifyError 把一次失败归类到 model.ErrorKind* 枚举。
+//
+// 分类的意义在于把「不是上游故障」的失败从上游失败率里剔出去——否则成功率会被
+// 下游客户端的参数错误与断连行为污染，看不出上游真实健康度。
+// 顺序即优先级：本地错误（选路阶段就失败，没打到上游）优先于上游错误；
+// 客户端取消优先于请求非法（两者可能同时成立时，取消更具体）。
+func classifyError(ferr error) string {
+	if ferr == nil {
+		return model.ErrorKindNone
+	}
+	// 下游断连：ctx 被取消或被取消时写响应失败。
+	if provider.IsClientCancel(ferr) {
+		return model.ErrorKindClientCancel
+	}
+	// 超时：上游整体超时或流式首 token 超时。注意与取消区分——超时是上游真的慢。
+	if errors.Is(ferr, context.DeadlineExceeded) || errors.Is(ferr, provider.ErrFirstToken) {
+		return model.ErrorKindUpstreamTimeout
+	}
+	// 请求方问题：上下文超限、参数类型非法、协议转换不支持的内容等。
+	if provider.IsRequestFault(ferr) {
+		return model.ErrorKindClientInvalid
+	}
+	// 真实上游错误：非 2xx 且不属上面任何一类。
+	var he *provider.HTTPError
+	if errors.As(ferr, &he) {
+		return model.ErrorKindUpstreamError
+	}
+	// 其余归本地错误：无账号/全熔断/限流/无能力/转换拒绝等选路与预备阶段失败。
+	return model.ErrorKindLocal
+}
+
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
 // ip 为下游调用方地址（由各链路入口用 clientIP(r) 取一次后传入）。
 // firstTokenMs 为流式首字耗时（非流式/失败传 0）。
 func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
-	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time) {
+	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time,
+	meta reqMeta) {
 	ok := ferr == nil
 	// 两类「不是端点故障」的失败都不计入熔断：
 	//   - clientErr：客户端请求自身问题（上下文超限、参数类型非法等）；
@@ -296,9 +351,14 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 		LatencyMs:        time.Since(start).Milliseconds(),
 		FirstTokenMs:     firstTokenMs,
 		ClientIP:         ip,
+		IsStream:            meta.isStream,
+		UserAgent:           meta.userAgent,
+		CacheCreationTokens: meta.cacheCreation,
+		CacheReadTokens:     meta.cacheRead,
 	}
 	if !ok {
 		l.Status = "error"
+		l.ErrorKind = classifyError(ferr)
 		l.Error = errText(ferr)
 		switch {
 		case cancelErr:
@@ -326,8 +386,9 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 // 再次取消，因此不再进入下一轮 attempt，也不再把错误回写响应（客户端已走）。
 // 熔断计数已由 recordAttempt 内部按 clientCancel 排除。
 func (g *Gateway) failAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
-	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time) bool {
-	g.recordAttempt(sk, ip, leaf, ri, requestedModel, actualModel, modality, pt, ct, images, ferr, firstTokenMs, start)
+	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time,
+	meta reqMeta) bool {
+	g.recordAttempt(sk, ip, leaf, ri, requestedModel, actualModel, modality, pt, ct, images, ferr, firstTokenMs, start, meta)
 	return provider.IsClientCancel(ferr)
 }
 
@@ -466,6 +527,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 	origName, selName string, allowModels []string) {
 	start := time.Now()
 	ip := clientIP(r)
+	meta := newReqMeta(r, false) // 走非流式路径
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -486,7 +548,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -509,7 +571,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start, meta)
 			// 透传上游真实状态码与 body。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -520,7 +582,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		// 直接以 400 收尾，不进入重试循环（recordAttempt 也不计端点熔断）。
 		var convErr *provider.ConversionError
 		if errors.As(ferr, &convErr) {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start, meta)
 			writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", ferr.Error()))
 			return
 		}
@@ -528,7 +590,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开：换叶子重试无意义（父 ctx 已死）
 		}
 		exclude[leaf.ID] = true
@@ -607,6 +669,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 	origName, selName string, allowModels []string) {
 	start := time.Now()
 	ip := clientIP(r)
+	meta := newReqMeta(r, false)
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -624,7 +687,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -636,7 +699,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start, meta)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -646,7 +709,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开（见 chatNonStream 同款说明）
 		}
 		exclude[leaf.ID] = true
@@ -709,6 +772,7 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte, modelName string) {
 	start := time.Now()
 	ip := clientIP(r)
+	meta := newReqMeta(r, false)
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -726,7 +790,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -740,7 +804,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 				images = usage.Count
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, images, nil, 0, start, meta)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -750,7 +814,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		if g.failAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, 0, start) {
+		if g.failAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开
 		}
 		exclude[leaf.ID] = true
@@ -779,6 +843,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 	start := time.Now()
 	modality := modalityOf(api)
 	ip := clientIP(r)
+	meta := newReqMeta(r, true) // 本函数只服务流式请求
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -804,7 +869,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -824,13 +889,13 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			// 协议转换拒绝（请求内容问题）：不重试，直接 400（响应头尚未提交）。
 			var convErr *provider.ConversionError
 			if errors.As(oerr, &convErr) {
-				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start)
+				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start, meta)
 				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", oerr.Error()))
 				return
 			}
 			// 首 token 前打开失败：换叶子重试（此时尚未向客户端写过任何字节）。
 			// 若失败源于下游断开，重试必然立即再次取消，直接收尾。
-			if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start) {
+			if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start, meta) {
 				return
 			}
 			exclude[leaf.ID] = true
@@ -863,6 +928,8 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 				return e
 			}
 		}()
+		// 缓存 token 需在 Close 前取（Close 后 Stream 不再保证可读）。
+		usage := st.Usage(pt, ct)
 		st.Close()
 		if perr != nil {
 			// 上游已通过 responses 协议事件（response.failed / error）传达失败，
@@ -874,7 +941,8 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 		}
 		// 流已开始，无法更改状态码；用 SSE error 帧收尾。流中失败若源于下游断开，
 		// 写错误帧同样会失败（客户端已走），但记账口径一致：不计熔断、单独归类。
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, firstTokenMs, start)
+		meta.cacheCreation, meta.cacheRead = usage.CacheCreationTokens, usage.CacheReadTokens
+		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, firstTokenMs, start, meta)
 		return
 	}
 

@@ -94,6 +94,14 @@ func applyRequestHeaders(dst http.Header, headers map[string]string) {
 type TextUsage struct {
 	PromptTokens     int64
 	CompletionTokens int64
+	// 缓存 token（v13）：上游 prompt cache 的写入/读取量。两家口径不同，统一到这里：
+	//   - OpenAI：prompt_tokens_details.cached_tokens → CacheReadTokens（OpenAI 不报写入量）
+	//   - Anthropic：cache_creation_input_tokens → CacheCreationTokens
+	//                       cache_read_input_tokens     → CacheReadTokens
+	// 注意：Anthropic 的 input_tokens **不含**缓存部分，这里不做加法改写（保持上游原值，
+	// 否则成本与 TPM 口径会被改变）；展示层需要总量时自行相加。
+	CacheCreationTokens int64
+	CacheReadTokens     int64
 }
 
 // ImageUsage 图像调用计量：张数为主；个别供应商（gpt-image-1）附带 token 用量。
@@ -442,17 +450,30 @@ func prepareStreamBody(down []byte, upstreamModel string) ([]byte, error) {
 // ─────────────────────────── 用量提取（原始字节轻量抽取，不依赖 SDK 版本） ───────────────────────────
 
 // ExtractChatUsage 从 chat/completions 响应提取 usage。
+// 缓存 token 兼容两种口径（见 TextUsage 注释）：OpenAI 的
+// prompt_tokens_details.cached_tokens 与 Anthropic 风格的 cache_* 字段
+// （Anthropic 原生响应不经过本函数，但转换桥的下游可能透传这些字段）。
 func ExtractChatUsage(raw []byte) *TextUsage {
 	u := &TextUsage{}
 	var parsed struct {
 		Usage *struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
+			PromptTokens        int64 `json:"prompt_tokens"`
+			CompletionTokens    int64 `json:"completion_tokens"`
+			CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+			CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(raw, &parsed) == nil && parsed.Usage != nil {
 		u.PromptTokens = parsed.Usage.PromptTokens
 		u.CompletionTokens = parsed.Usage.CompletionTokens
+		u.CacheCreationTokens = parsed.Usage.CacheCreationTokens
+		u.CacheReadTokens = parsed.Usage.CacheReadTokens
+		if d := parsed.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			u.CacheReadTokens = d.CachedTokens
+		}
 	}
 	return u
 }

@@ -608,6 +608,9 @@ func anthropicSSEEvent(name string, payload any) []byte {
 type openAIToAnthropicState struct {
 	id, model string
 	pt, ct    int64
+	// 缓存 token（v13）：OpenAI 口径的 cached_tokens 与 Anthropic 风格字段。
+	cacheCreation int64
+	cacheRead     int64
 	finish    string
 	// message_start 是否已发送 / 收尾序列是否已发送。
 	started bool
@@ -688,6 +691,19 @@ func (s *anthropicFromOpenAIStream) pumpLines(sink io.Writer) (int64, int64, err
 
 func (s *anthropicFromOpenAIStream) Close() { s.st.Close() }
 
+// Usage 返回转换过程中累计的用量（含缓存 token）。
+func (s *anthropicFromOpenAIStream) Usage(pt, ct int64) *TextUsage {
+	if s == nil || s.s == nil {
+		return &TextUsage{PromptTokens: pt, CompletionTokens: ct}
+	}
+	return &TextUsage{
+		PromptTokens:        pt,
+		CompletionTokens:    ct,
+		CacheCreationTokens: s.s.cacheCreation,
+		CacheReadTokens:     s.s.cacheRead,
+	}
+}
+
 // handleChunk 处理一个 OpenAI chunk，写出对应的 Anthropic 事件。
 // 返回 done=true 表示流已收尾（message_stop 已发）。
 func (s *openAIToAnthropicState) handleChunk(payload []byte, sink io.Writer) (bool, error) {
@@ -712,8 +728,13 @@ func (s *openAIToAnthropicState) handleChunk(payload []byte, sink io.Writer) (bo
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
+			PromptTokens        int64 `json:"prompt_tokens"`
+			CompletionTokens    int64 `json:"completion_tokens"`
+			CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+			CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
@@ -728,6 +749,15 @@ func (s *openAIToAnthropicState) handleChunk(payload []byte, sink io.Writer) (bo
 	if chunk.Usage != nil {
 		s.pt = chunk.Usage.PromptTokens
 		s.ct = chunk.Usage.CompletionTokens
+		if d := chunk.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			s.cacheRead = d.CachedTokens
+		}
+		if chunk.Usage.CacheCreationTokens > 0 {
+			s.cacheCreation = chunk.Usage.CacheCreationTokens
+		}
+		if chunk.Usage.CacheReadTokens > 0 {
+			s.cacheRead = chunk.Usage.CacheReadTokens
+		}
 	}
 	if len(chunk.Choices) == 0 {
 		return false, nil // include_usage 的末尾 chunk 只带 usage

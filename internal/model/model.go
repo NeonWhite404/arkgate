@@ -267,10 +267,34 @@ type UsageLog struct {
 	CompletionTokens int64   `json:"completion_tokens"`
 	TotalTokens      int64   `json:"total_tokens"`
 	ImageCount       int64   `json:"image_count"`
-	Cost             float64 `json:"cost"`   // 本次请求成本（按模型定价折算；未定价为 0）
-	Status           string  `json:"status"` // ok | error
-	LatencyMs        int64   `json:"latency_ms"`
-	FirstTokenMs     int64   `json:"first_token_ms"` // 首字耗时（流式首字节；非流式为 0）
-	Error            string  `json:"error"`
-	ClientIP         string  `json:"client_ip"` // 下游调用方 IP（代理场景取 XFF 首跳）
+	Cost             float64 `json:"cost"` // 本次请求成本（按模型定价折算；未定价为 0）
+	// 成本拆分（v13）：input/output/cache 三部分之和即 Cost（computeCost 同时写四者，
+	// 保证「拆分之和 == 总额」这一不变量，避免两处口径漂移）。
+	InputCost  float64 `json:"input_cost"`
+	OutputCost float64 `json:"output_cost"`
+	CacheCost  float64 `json:"cache_cost"`
+	// 缓存 token（v13）：prompt cache 的写入/读取量，用于命中率与缓存成本分析。
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	// ErrorKind 错误分类（v13）。见 model.ErrorKind* 常量；成功为空串。
+	// 比自由文本 Error 更适合聚合：日志文本会带上游请求 id/模型标识，无法直接分组。
+	ErrorKind    string `json:"error_kind"`
+	IsStream     bool   `json:"is_stream"`
+	Status       string `json:"status"` // ok | error
+	LatencyMs    int64  `json:"latency_ms"`
+	FirstTokenMs int64  `json:"first_token_ms"` // 首字耗时（流式首字节；非流式为 0）
+	Error        string `json:"error"`
+	ClientIP     string `json:"client_ip"`  // 下游调用方 IP（代理场景取 XFF 首跳）
+	UserAgent    string `json:"user_agent"` // 下游 UA 摘要（截断；仅管理端可见）
 }
+
+// 错误分类枚举（usage_logs.error_kind）。区分的目的是把「不是上游故障」的失败
+// 从上游失败率里剔出去——否则成功率和熔断都会被客户端行为污染。
+const (
+	ErrorKindNone            = ""                  // 成功
+	ErrorKindUpstreamError   = "upstream_error"    // 真实上游 4xx/5xx
+	ErrorKindUpstreamTimeout = "upstream_timeout"  // 上游整体超时 / 首 token 超时
+	ErrorKindClientInvalid   = "client_invalid"    // 请求方参数/内容问题（含流类型错、上下文超限）
+	ErrorKindClientCancel    = "client_cancel"     // 下游断连（context canceled）
+	ErrorKindLocal           = "local_error"       // 无账号/全熔断/限流/无能力/转换拒绝
+)

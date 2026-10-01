@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1415,5 +1417,291 @@ func TestSyncEndpointUpstreamPresence(t *testing.T) {
 	restored, err = s.SyncEndpointUpstreamPresence("a1", []string{"ep-keep"})
 	if err != nil || restored != 0 {
 		t.Fatalf("idempotent restore count: restored=%d err=%v", restored, err)
+	}
+}
+
+// TestUsageBucketExprDSTSafe 锁定天桶在 DST 切换日不错桶。
+//
+// 回归背景：旧实现用「进程当前时区偏移」做算术平移
+//（((ts+off)/86400)*86400-off），隐含「区间内所有天共用同一偏移」。
+// 美国 DST 切换那天本地日有 23/25 小时，固定偏移会把日界线算错一小时，
+// 导致相邻两天各有一部分记录被归到错误的桶。
+func TestUsageBucketExprDSTSafe(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata 不可用: %v", err)
+	}
+	// 2026-03-08 是美国 DST 开始日（当地 02:00 → 03:00，该日只有 23 小时）。
+	from := time.Date(2026, 3, 7, 0, 0, 0, 0, loc).Unix()
+	to := time.Date(2026, 3, 10, 0, 0, 0, 0, loc).Unix()
+
+	expr := usageBucketExpr("day", from, to, loc)
+	// 每个自然日的起点必须恰好是当地 00:00。
+	for _, day := range []time.Time{
+		time.Date(2026, 3, 7, 0, 0, 0, 0, loc),
+		time.Date(2026, 3, 8, 0, 0, 0, 0, loc),
+		time.Date(2026, 3, 9, 0, 0, 0, 0, loc),
+	} {
+		want := day.Unix()
+		if !strings.Contains(expr, strconv.FormatInt(want, 10)) {
+			t.Fatalf("天桶缺少 %s 的起点 %d\nexpr=%s",
+				day.Format("2006-01-02"), want, expr)
+		}
+	}
+	// DST 切换日的长度必须是 23 小时——这正是不做 DST 感知就会算错的地方。
+	d7 := time.Date(2026, 3, 8, 0, 0, 0, 0, loc)
+	d8 := time.Date(2026, 3, 9, 0, 0, 0, 0, loc)
+	if h := d8.Sub(d7).Hours(); h != 23 {
+		t.Fatalf("2026-03-08 应为 23 小时, got %v", h)
+	}
+}
+
+// TestQueryUsageRightOpenInterval 锁定区间为右开 [from,to)：
+// 闭区间会让边界那一秒被相邻两次查询重复计入。
+func TestQueryUsageRightOpenInterval(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	base := time.Now().Unix() - 7200
+	mk := func(ts int64, name string) {
+		l := modelLog(ts, name, "s1", "a1", 10, 5, "ok", 0)
+		if err := s.AddUsageLog(&l); err != nil {
+			t.Fatalf("add log: %v", err)
+		}
+	}
+	mk(base, "m1")       // 落在 [from,to)
+	mk(base+3600, "m2")  // 恰好等于 to → 必须排除
+
+	res, err := s.QueryUsage(UsageQuery{From: base, To: base + 3600, Granularity: "hour"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if res.Summary.Requests != 1 {
+		t.Fatalf("右开区间应只含 1 条（边界那条排除）, got %d", res.Summary.Requests)
+	}
+	// 相邻区间（以 to 为起点）才能取到边界那条，且两条不重叠。
+	res2, err := s.QueryUsage(UsageQuery{From: base + 3600, To: base + 7200, Granularity: "hour"})
+	if err != nil {
+		t.Fatalf("query2: %v", err)
+	}
+	if res2.Summary.Requests != 1 {
+		t.Fatalf("相邻区间应含 1 条, got %d", res2.Summary.Requests)
+	}
+	if res.Summary.Requests+res2.Summary.Requests != 2 {
+		t.Fatalf("两区间之和应为 2（无重复无遗漏）, got %d",
+			res.Summary.Requests+res2.Summary.Requests)
+	}
+}
+
+// TestQueryUsageErrorKindAndCostSplit 锁定 v13 新增口径：
+//   - 成本拆分三者和 == cost（前端能看到成本构成）；
+//   - error_kind 把客户端侧失败与上游失败分开（成功率不再被前者污染）；
+//   - 历史行（error_kind=''）归入上游错误，与旧口径「非 ok 即失败」一致。
+func TestQueryUsageErrorKindAndCostSplit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().Unix()
+	add := func(status, kind string, pt, ct int64, inCost, outCost, cacheCost float64, stream bool) {
+		l := modelLog(now-10, "m1", "s1", "a1", pt, ct, status, inCost+outCost+cacheCost)
+		l.ErrorKind = kind
+		l.InputCost, l.OutputCost, l.CacheCost = inCost, outCost, cacheCost
+		l.IsStream = stream
+		if stream && status == "ok" {
+			l.FirstTokenMs = 120
+		}
+		if err := s.AddUsageLog(&l); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	add("ok", "", 100, 50, 0.10, 0.20, 0, true)                                 // 成功
+	add("error", model.ErrorKindClientCancel, 0, 0, 0, 0, 0, false)             // 下游断开
+	add("error", model.ErrorKindClientInvalid, 0, 0, 0, 0, 0, false)            // 参数非法
+	add("error", model.ErrorKindUpstreamError, 0, 0, 0, 0, 0, false)            // 上游 5xx
+	add("error", model.ErrorKindUpstreamTimeout, 0, 0, 0, 0, 0, false)          // 上游超时
+	add("error", "", 0, 0, 0, 0, 0, false)                                      // 历史行（无分类）
+
+	res, err := s.QueryUsage(UsageQuery{From: now - 3600, To: now, Granularity: "hour"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	sm := res.Summary
+	if sm.Requests != 6 || sm.Success != 1 {
+		t.Fatalf("requests/success: %d/%d", sm.Requests, sm.Success)
+	}
+	// 上游失败 = upstream_error + upstream_timeout + 无分类历史行 = 3
+	if sm.UpstreamErrors != 3 {
+		t.Fatalf("upstream_errors = %d, want 3", sm.UpstreamErrors)
+	}
+	// 客户端侧失败 = client_cancel + client_invalid = 2
+	if sm.ClientErrors != 2 {
+		t.Fatalf("client_errors = %d, want 2", sm.ClientErrors)
+	}
+	if sm.UpstreamErrors+sm.ClientErrors != sm.Requests-sm.Success {
+		t.Fatalf("失败分类之和应等于失败总数: %d+%d != %d",
+			sm.UpstreamErrors, sm.ClientErrors, sm.Requests-sm.Success)
+	}
+	// 成本拆分自洽
+	if d := sm.InputCost + sm.OutputCost + sm.CacheCost - sm.Cost; d > 1e-9 || d < -1e-9 {
+		t.Fatalf("成本拆分之和 != cost: %v vs %v", sm.InputCost+sm.OutputCost+sm.CacheCost, sm.Cost)
+	}
+	if sm.StreamRequests != 1 || sm.FirstTokenMsSum != 120 {
+		t.Fatalf("stream/ttft: %d/%d", sm.StreamRequests, sm.FirstTokenMsSum)
+	}
+	// 错误分布应含 5 个分类（无分类历史行标为 unclassified）
+	kinds := map[string]int64{}
+	for _, e := range res.Errors {
+		kinds[e.Kind] = e.Requests
+	}
+	if kinds["unclassified"] != 1 || kinds[model.ErrorKindUpstreamError] != 1 ||
+		kinds[model.ErrorKindUpstreamTimeout] != 1 || kinds[model.ErrorKindClientCancel] != 1 ||
+		kinds[model.ErrorKindClientInvalid] != 1 {
+		t.Fatalf("错误分布不符: %+v", kinds)
+	}
+	if res.Source != "raw" {
+		t.Fatalf("source = %q, want raw", res.Source)
+	}
+	// 时序桶的上游错误数也应与总量一致（同一口径）。
+	var seriesUp int64
+	for _, b := range res.Series {
+		seriesUp += b.UpstreamErrors
+	}
+	if seriesUp != sm.UpstreamErrors {
+		t.Fatalf("时序上游错误之和 %d != 总量 %d", seriesUp, sm.UpstreamErrors)
+	}
+}
+
+// TestSubKeyWhitelistExcludesV13Columns 锁定门户越权红线：
+// v13 新增列（错误分类、UA、上游成本、成本拆分、缓存 token）都不得进入
+// 门户列白名单。UA 可指纹化下游客户端、错误分类可推断上游拓扑，属管理端信息。
+func TestSubKeyWhitelistExcludesV13Columns(t *testing.T) {
+	forbidden := []string{
+		"error_kind", "user_agent", "upstream_cost", "input_cost", "output_cost",
+		"cache_cost", "cache_creation_tokens", "cache_read_tokens",
+		"error", "account_id", "account_name", "provider", "ep", "endpoint_id",
+		"client_ip", "first_token_ms",
+	}
+	cols := subKeyLogCols
+	for _, f := range forbidden {
+		// 按整词匹配，避免 "cost" 命中 "cache_cost" 这类误报。
+		for _, c := range strings.Split(cols, ",") {
+			if strings.TrimSpace(c) == f {
+				t.Fatalf("门户白名单不得包含 %q（越权风险）；当前白名单: %s", f, cols)
+			}
+		}
+	}
+	// 白名单里必须有的基础列（防止误删导致门户页面空白）。
+	for _, want := range []string{"ts", "model", "total_tokens", "cost", "status"} {
+		found := false
+		for _, c := range strings.Split(cols, ",") {
+			if strings.TrimSpace(c) == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("门户白名单缺少必要列 %q", want)
+		}
+	}
+}
+
+// TestUsageLogsV13Migration v13 迁移：旧库（usage_logs 无 v13 新列）打开后自动补列，
+// 历史行等价旧行为（成本只记总额、无错误分类、非流式），且数据原样保留。
+func TestUsageLogsV13Migration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "arkgate.db"))
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	// v12 形态的 usage_logs：有 first_token_ms，但没有 v13 的 8 个新列。
+	legacy := []string{
+		`CREATE TABLE usage_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts INTEGER NOT NULL,
+			subkey_id TEXT NOT NULL DEFAULT '',
+			subkey_name TEXT NOT NULL DEFAULT '',
+			account_id TEXT NOT NULL DEFAULT '',
+			account_name TEXT NOT NULL DEFAULT '',
+			endpoint_id TEXT NOT NULL DEFAULT '',
+			requested_model TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			ep TEXT NOT NULL DEFAULT '',
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT '',
+			latency_ms INTEGER NOT NULL DEFAULT 0,
+			first_token_ms INTEGER NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '',
+			provider TEXT NOT NULL DEFAULT '',
+			modality TEXT NOT NULL DEFAULT '',
+			image_count INTEGER NOT NULL DEFAULT 0,
+			cost REAL NOT NULL DEFAULT 0,
+			client_ip TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO usage_logs (ts,subkey_id,model,prompt_tokens,completion_tokens,
+			total_tokens,status,latency_ms,error,cost)
+			VALUES (strftime('%s','now')-3600,'s-old','m-old',100,50,150,'error',800,'upstream http 500',0.25)`,
+	}
+	for _, st := range legacy {
+		if _, err := db.Exec(st); err != nil {
+			t.Fatalf("legacy schema: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy: %v", err)
+	}
+
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("migrate open: %v", err)
+	}
+	defer s.Close()
+
+	logs, err := s.ListUsageLogs(10, 0)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("logs after migrate: %d (%v)", len(logs), err)
+	}
+	l := logs[0]
+	// 历史数据原样保留
+	if l.PromptTokens != 100 || l.CompletionTokens != 50 || l.Cost != 0.25 || l.Status != "error" {
+		t.Fatalf("legacy row altered: %+v", l)
+	}
+	// 新列全部为「等价旧行为」的零值
+	if l.ErrorKind != "" || l.IsStream || l.CacheCreationTokens != 0 || l.CacheReadTokens != 0 ||
+		l.InputCost != 0 || l.OutputCost != 0 || l.CacheCost != 0 || l.UserAgent != "" {
+		t.Fatalf("新列默认值不符（应等价旧行为）: %+v", l)
+	}
+	// 历史行在用量分析里归入「未分类」，且与旧口径一致地算作上游失败。
+	now := time.Now().Unix()
+	res, err := s.QueryUsage(UsageQuery{From: now - 86400, To: now, Granularity: "hour"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if res.Summary.UpstreamErrors != 1 || res.Summary.ClientErrors != 0 {
+		t.Fatalf("历史行应计为上游失败: %+v", res.Summary)
+	}
+	if len(res.Errors) != 1 || res.Errors[0].Kind != "unclassified" {
+		t.Fatalf("历史行应标为 unclassified: %+v", res.Errors)
+	}
+
+	// 迁移幂等：重开不报错。
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if v, ok := s2.GetSetting("schema_version"); !ok || v != schemaVersion {
+		t.Fatalf("schema_version = %q %v", v, ok)
 	}
 }

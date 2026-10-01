@@ -145,6 +145,7 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, st *messagesEntryState) {
 	start := time.Now()
 	ip := clientIP(r)
+	meta := newReqMeta(r, false)
 	var lastErr error
 	exclude := map[string]bool{}
 	// OpenAI 协议上游的请求转换只做一次（内容与叶子无关），失败直接 400。
@@ -164,7 +165,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -180,7 +181,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 			if convertedBody == nil {
 				convertedBody, ferr = provider.OpenAIRequestFromAnthropic(st.body)
 				if ferr != nil {
-					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start)
+					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start, meta)
 					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", ferr.Error()))
 					return
 				}
@@ -196,7 +197,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
 			}
-			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start, meta)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(respBody)
@@ -206,7 +207,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+		if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开：换叶子重试无意义（父 ctx 已死）
 		}
 		exclude[leaf.ID] = true
@@ -221,6 +222,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, sk *model.SubKey, st *messagesEntryState) {
 	start := time.Now()
 	ip := clientIP(r)
+	meta := newReqMeta(r, true) // 本函数只服务流式请求
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -245,7 +247,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 		}
 		ri, derr := g.resolveRoute(leaf)
 		if derr != nil {
-			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start)
+			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, derr, 0, start, meta)
 			exclude[leaf.ID] = true
 			lastErr = derr
 			continue
@@ -259,7 +261,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 			if convertedBody == nil {
 				convertedBody, oerr = provider.OpenAIRequestFromAnthropic(st.body)
 				if oerr != nil {
-					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start)
+					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start, meta)
 					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", oerr.Error()))
 					return
 				}
@@ -270,12 +272,12 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 			// 协议转换拒绝（请求内容问题）：不重试，直接 400。
 			var convErr *provider.ConversionError
 			if errors.As(oerr, &convErr) {
-				g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start)
+				g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start, meta)
 				writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", oerr.Error()))
 				return
 			}
 			// 首字节前打开失败：换叶子重试；下游断开则直接收尾。
-			if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start) {
+			if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start, meta) {
 				return
 			}
 			exclude[leaf.ID] = true
@@ -305,7 +307,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 			_, _ = w.Write([]byte("event: error\ndata: " + string(frames) + "\n\n"))
 			fl.Flush()
 		}
-		g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, perr, firstTokenMs, start)
+		g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, perr, firstTokenMs, start, meta)
 		return
 	}
 	g.writeUpstreamErrorAnthropic(w, lastErr)

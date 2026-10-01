@@ -52,6 +52,9 @@ const anthropicVersion = "2023-06-01"
 type MessageStream interface {
 	Pump(sink io.Writer) (pt, ct int64, err error)
 	Close()
+	// Usage 返回流式过程中累计的用量（含缓存 token）。应在 Pump 返回后调用；
+	// pt/ct 由调用方传入（Pump 已有返回值，不为改签名而重复传递）。
+	Usage(pt, ct int64) *TextUsage
 }
 
 // ─────────────────────────── 请求转换（OpenAI → Anthropic） ───────────────────────────
@@ -456,6 +459,10 @@ type anthropicMessageResponse struct {
 type anthropicUsage struct {
 	InputTokens  int64 `json:"input_tokens"`
 	OutputTokens int64 `json:"output_tokens"`
+	// prompt cache（v13）：写入与读取的 token 数。注意 input_tokens 不含这两项，
+	// 因此「实际输入总量」= input + cache_creation + cache_read。
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 }
 
 // openAIChatResponse 是转换产出的非流式响应（字段保持 OpenAI 客户端必需集）。
@@ -612,6 +619,9 @@ type anthropicStreamState struct {
 	model      string
 	pt         int64
 	ct         int64
+	// 缓存 token（v13）：Anthropic 的 prompt cache 写入/读取量。
+	cacheCreation int64
+	cacheRead     int64
 	stopReason string
 	roleSent   bool
 	done       bool
@@ -692,6 +702,8 @@ func (s *anthropicStreamState) convertEvent(data []byte) ([]byte, error) {
 				s.model = evt.Message.Model
 			}
 			s.pt = evt.Message.Usage.InputTokens
+			s.cacheCreation = evt.Message.Usage.CacheCreationInputTokens
+			s.cacheRead = evt.Message.Usage.CacheReadInputTokens
 		}
 		if s.model == "" {
 			s.model = "anthropic"
@@ -759,6 +771,12 @@ func (s *anthropicStreamState) convertEvent(data []byte) ([]byte, error) {
 			if evt.Usage.InputTokens > 0 {
 				s.pt = evt.Usage.InputTokens
 			}
+			if evt.Usage.CacheCreationInputTokens > 0 {
+				s.cacheCreation = evt.Usage.CacheCreationInputTokens
+			}
+			if evt.Usage.CacheReadInputTokens > 0 {
+				s.cacheRead = evt.Usage.CacheReadInputTokens
+			}
 		}
 		fr := anthropicFinishReason(s.stopReason, s.nextToolIdx > 0)
 		return s.emit([]openAIChunkChoice{{Index: 0, Delta: openAIChunkDelta{}, FinishReason: &fr}})
@@ -796,6 +814,19 @@ func (s *AnthropicStream) Close() {
 	}
 	if s.cancel != nil {
 		s.cancel()
+	}
+}
+
+// Usage 返回转换过程中累计的用量（含 Anthropic 的缓存 token 口径）。
+func (s *AnthropicStream) Usage(pt, ct int64) *TextUsage {
+	if s == nil || s.st == nil {
+		return &TextUsage{PromptTokens: pt, CompletionTokens: ct}
+	}
+	return &TextUsage{
+		PromptTokens:        pt,
+		CompletionTokens:    ct,
+		CacheCreationTokens: s.st.cacheCreation,
+		CacheReadTokens:     s.st.cacheRead,
 	}
 }
 
