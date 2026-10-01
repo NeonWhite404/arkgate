@@ -145,6 +145,7 @@ a { color: rgb(var(--primary-6)); text-decoration: none; }
 .ic-red { background: linear-gradient(135deg, #f53f3f, #cb2634); }
 .ic-purple { background: linear-gradient(135deg, #722ed1, #9254de); }
 .ic-gray { background: linear-gradient(135deg, #86909c, #a9aeb8); }
+.ic-teal { background: linear-gradient(135deg, #0fc6c2, #37d4cf); }
 .stat-card .v { font-size: 21px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
 .stat-card .l { font-size: 12px; color: var(--color-text-3); margin-top: 2px; }
 .stat-card .body { min-width: 0; }
@@ -567,3 +568,39 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
   }
   .stat-card:hover, .btn:not(:disabled):hover, .nav-item:hover { transform: none; }
 }
+
+
+/* ── 用量分析：细节区（费用构成 / 失败分布 / 缓存） ──────────────────────
+   三块并排但自适应换行：窄屏下自动堆成一列，不需要额外媒体查询。
+   细节内容默认展开（而非折叠）——这些正是运维排查时要看的，藏起来反而多一次点击。 */
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
+.detail-grid .card { margin-bottom: 0; }
+
+/* 费用构成的占比条：单条堆叠，段与段之间留 1px 缝避免同色相邻看不清边界。 */
+.split-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden;
+  background: var(--color-fill-2); margin-bottom: 12px; }
+.split-seg { height: 100%; transition: width .25s ease; }
+.split-seg + .split-seg { box-shadow: -1px 0 0 var(--color-bg-1); }
+
+/* 迷你表格：无边框、行高紧凑，适合卡片内的小结数据。 */
+.mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mini-table td { padding: 5px 0; border-bottom: 1px solid var(--color-border-1); }
+.mini-table tr:last-child td { border-bottom: none; }
+.mini-table td:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums; }
+.mini-table td:nth-child(3) { text-align: right; width: 64px; }
+.mini-table .total-row td { font-weight: 600; border-top: 1px solid var(--color-border-2); }
+.mini-table .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; }
+.mini-table .muted { color: var(--color-text-3); }
+
+/* 数据来源徽标（预聚合 / 实时）：颜色语义与统计卡图标一致。 */
+.src-badge { font-size: 12px; padding: 2px 9px; border-radius: 10px; white-space: nowrap;
+  border: 1px solid transparent; }
+.src-badge.ic-green { background: rgba(0, 180, 42, .12); color: #00a029; border-color: rgba(0, 180, 42, .3); }
+.src-badge.ic-blue { background: rgba(22, 93, 255, .12); color: #165dff; border-color: rgba(22, 93, 255, .3); }
+
+.card .hint { font-size: 12px; color: var(--color-text-3); line-height: 1.6; margin-top: 10px;
+  padding-top: 10px; border-top: 1px dashed var(--color-border-1); }
+
+/* 深色主题：徽标底色在深色下用半透明亮色，否则对比度不足。 */
+[data-theme="dark"] .src-badge.ic-green { background: rgba(60, 199, 94, .16); color: #6ee08a; }
+[data-theme="dark"] .src-badge.ic-blue { background: rgba(74, 139, 255, .16); color: #7fb0ff; }

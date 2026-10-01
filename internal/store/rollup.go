@@ -406,7 +406,8 @@ func (s *Store) queryUsageFromRollup(q UsageQuery) (*UsageQueryResult, error) {
 				COALESCE(SUM(requests),0), COALESCE(SUM(success),0),
 				COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 				COALESCE(SUM(total_tokens),0), COALESCE(SUM(images),0), COALESCE(SUM(cost),0),
-				COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0)
+				COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0),
+				COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0)
 			FROM usage_rollup_hourly
 			WHERE dim_kind=? AND bucket_start >= ? AND bucket_start < ?
 			GROUP BY dim_key
@@ -421,7 +422,8 @@ func (s *Store) queryUsageFromRollup(q UsageQuery) (*UsageQueryResult, error) {
 			f := &UsageFacet{}
 			if err := rows.Scan(&f.Key, &f.Label, &f.Requests, &f.Success,
 				&f.PromptTokens, &f.CompletionTokens, &f.TotalTokens, &f.Images, &f.Cost,
-				&f.CacheReadTokens, &f.UpstreamErrors); err != nil {
+				&f.CacheReadTokens, &f.UpstreamErrors,
+				&f.InputCost, &f.OutputCost, &f.CacheCost); err != nil {
 				return nil, err
 			}
 			pending = append(pending, f)
@@ -459,7 +461,9 @@ func (s *Store) rollupSeriesHourly(res *UsageQueryResult, q UsageQuery, kind, en
 			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 			COALESCE(SUM(requests),0), COALESCE(SUM(success),0),
 			COALESCE(SUM(images),0), COALESCE(SUM(cost),0),
-			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0)
+			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0),
+			COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0),
+			COALESCE(SUM(first_token_ms_sum),0), COALESCE(SUM(stream_requests),0)
 		FROM usage_rollup_hourly
 		WHERE dim_kind=?`+entityWhere+` AND bucket_start >= ? AND bucket_start < ?
 		GROUP BY bucket_start ORDER BY bucket_start ASC`,
@@ -472,7 +476,9 @@ func (s *Store) rollupSeriesHourly(res *UsageQueryResult, q UsageQuery, kind, en
 		b := &UsageBucket{}
 		if err := rows.Scan(&b.Bucket, &b.PromptTokens, &b.CompletionTokens,
 			&b.Requests, &b.Success, &b.Images, &b.Cost,
-			&b.CacheReadTokens, &b.UpstreamErrors); err != nil {
+			&b.CacheReadTokens, &b.UpstreamErrors,
+			&b.InputCost, &b.OutputCost, &b.CacheCost,
+			&b.FirstTokenMsSum, &b.StreamRequests); err != nil {
 			return err
 		}
 		res.Series = append(res.Series, b)
@@ -499,7 +505,9 @@ func (s *Store) rollupSeriesDaily(res *UsageQueryResult, q UsageQuery, kind, ent
 			COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 			COALESCE(SUM(requests),0), COALESCE(SUM(success),0),
 			COALESCE(SUM(images),0), COALESCE(SUM(cost),0),
-			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0)
+			COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(upstream_errors),0),
+			COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0),
+			COALESCE(SUM(first_token_ms_sum),0), COALESCE(SUM(stream_requests),0)
 		FROM usage_rollup_daily
 		WHERE dim_kind=?`+entityWhere+` AND bucket_date >= ? AND bucket_date <= ?
 		GROUP BY bucket_date ORDER BY bucket_date ASC`,
@@ -513,7 +521,9 @@ func (s *Store) rollupSeriesDaily(res *UsageQueryResult, q UsageQuery, kind, ent
 		b := &UsageBucket{}
 		if err := rows.Scan(&day, &b.PromptTokens, &b.CompletionTokens,
 			&b.Requests, &b.Success, &b.Images, &b.Cost,
-			&b.CacheReadTokens, &b.UpstreamErrors); err != nil {
+			&b.CacheReadTokens, &b.UpstreamErrors,
+			&b.InputCost, &b.OutputCost, &b.CacheCost,
+			&b.FirstTokenMsSum, &b.StreamRequests); err != nil {
 			return err
 		}
 		t, err := time.ParseInLocation("2006-01-02", day, loc)

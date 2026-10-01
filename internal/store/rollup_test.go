@@ -13,6 +13,10 @@ func mkRollupLog(ts int64, model_, sub, acc string, pt, ct int64, status, kind s
 	l.ErrorKind = kind
 	l.CacheReadTokens = pt / 4
 	l.IsStream = stream
+	// 写入成本拆分（input+output+cache == cost），否则比对恒为 0、测不到东西。
+	l.CacheCost = cost * 0.1
+	l.OutputCost = cost * 0.6
+	l.InputCost = cost - l.OutputCost - l.CacheCost
 	if stream && status == "ok" {
 		l.FirstTokenMs = 100
 	}
@@ -178,7 +182,10 @@ func assertUsageEqual(t *testing.T, label string, got, want *UsageQueryResult) {
 		if gb.PromptTokens != wb.PromptTokens || gb.CompletionTokens != wb.CompletionTokens ||
 			gb.Requests != wb.Requests || gb.Success != wb.Success ||
 			gb.Images != wb.Images || !feq(gb.Cost, wb.Cost) ||
-			gb.CacheReadTokens != wb.CacheReadTokens || gb.UpstreamErrors != wb.UpstreamErrors {
+			gb.CacheReadTokens != wb.CacheReadTokens || gb.UpstreamErrors != wb.UpstreamErrors ||
+			!feq(gb.InputCost, wb.InputCost) || !feq(gb.OutputCost, wb.OutputCost) ||
+			!feq(gb.CacheCost, wb.CacheCost) ||
+			gb.FirstTokenMsSum != wb.FirstTokenMsSum || gb.StreamRequests != wb.StreamRequests {
 			t.Fatalf("[%s] 桶 %d 不一致:\nrollup=%+v\nraw   =%+v", label, k, gb, wb)
 		}
 	}
@@ -196,7 +203,9 @@ func assertUsageEqual(t *testing.T, label string, got, want *UsageQueryResult) {
 		if gv.Requests != wv.Requests || gv.Success != wv.Success ||
 			gv.PromptTokens != wv.PromptTokens || gv.CompletionTokens != wv.CompletionTokens ||
 			gv.TotalTokens != wv.TotalTokens || gv.Images != wv.Images || !feq(gv.Cost, wv.Cost) ||
-			gv.CacheReadTokens != wv.CacheReadTokens || gv.UpstreamErrors != wv.UpstreamErrors {
+			gv.CacheReadTokens != wv.CacheReadTokens || gv.UpstreamErrors != wv.UpstreamErrors ||
+			!feq(gv.InputCost, wv.InputCost) || !feq(gv.OutputCost, wv.OutputCost) ||
+			!feq(gv.CacheCost, wv.CacheCost) {
 			t.Fatalf("[%s] facet %q 不一致:\nrollup=%+v\nraw   =%+v", label, k, gv, wv)
 		}
 	}
@@ -350,5 +359,73 @@ func TestRollupFallsBackToRaw(t *testing.T) {
 	if res2.Source != "raw" {
 		t.Fatalf("水位未覆盖区间右端应回落 raw, source=%q (watermark=%d to=%d)",
 			res2.Source, mustWM(t, s), now+10)
+	}
+}
+
+// TestLogFilterByErrorKind 日志页「失败原因」筛选（含 unclassified 特殊语义）。
+//
+// 锁定两点：① 各枚举值能精确筛出对应行；② "unclassified" 映射到历史行
+// （error_kind=''），而不是字面值匹配——否则界面上「未分类」永远筛不出东西。
+func TestLogFilterByErrorKind(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().Unix()
+	rows := []struct {
+		ts     int64
+		status string
+		kind   string
+	}{
+		{now - 10, "ok", ""},
+		{now - 20, "error", model.ErrorKindUpstreamError},
+		{now - 30, "error", model.ErrorKindUpstreamTimeout},
+		{now - 40, "error", model.ErrorKindClientInvalid},
+		{now - 50, "error", model.ErrorKindClientCancel},
+		{now - 60, "error", model.ErrorKindLocal},
+		{now - 70, "error", ""}, // 历史行：未分类
+	}
+	for i, r := range rows {
+		l := modelLog(r.ts, "m1", "s1", "a1", 10, 5, r.status, 0)
+		l.ErrorKind = r.kind
+		l.Error = "e"
+		if err := s.AddUsageLog(&l); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+
+	count := func(f LogFilter) int64 {
+		t.Helper()
+		_, n, err := s.QueryUsageLogs(f, 100, 0)
+		if err != nil {
+			t.Fatalf("query %+v: %v", f, err)
+		}
+		return n
+	}
+
+	for _, k := range []string{model.ErrorKindUpstreamError, model.ErrorKindUpstreamTimeout,
+		model.ErrorKindClientInvalid, model.ErrorKindClientCancel, model.ErrorKindLocal} {
+		if got := count(LogFilter{ErrorKind: k}); got != 1 {
+			t.Fatalf("error_kind=%s 应筛出 1 条, got %d", k, got)
+		}
+	}
+	// 历史行（error_kind=''）在界面上是「未分类」，必须能筛出来。
+	if got := count(LogFilter{ErrorKind: "unclassified"}); got != 1 {
+		t.Fatalf("unclassified 应筛出 1 条历史行, got %d", got)
+	}
+	// 不筛 = 全部 7 条。
+	if got := count(LogFilter{}); got != 7 {
+		t.Fatalf("不筛应返回 7 条, got %d", got)
+	}
+	// status=error + 上游两类 = 2（运维最常用视角：只看真实上游故障）。
+	if got := count(LogFilter{Status: "error"}); got != 6 {
+		t.Fatalf("status=error 应筛出 6 条, got %d", got)
+	}
+	// 成功行不应被 error_kind 筛出（ok 行的 error_kind 为空）。
+	if got := count(LogFilter{Status: "ok", ErrorKind: "unclassified"}); got != 0 {
+		t.Fatalf("ok + unclassified 应为 0, got %d", got)
 	}
 }

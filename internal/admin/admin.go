@@ -1641,9 +1641,14 @@ func (a *Admin) handleLogs(w http.ResponseWriter, r *http.Request) {
 		SubKeyID:  qv.Get("subkey"),
 		AccountID: qv.Get("account"),
 		Status:    qv.Get("status"),
+		ErrorKind: qv.Get("error_kind"),
 	}
 	if f.Status != "" && f.Status != "ok" && f.Status != "error" {
 		writeJSON(w, 400, map[string]any{"detail": "status 仅支持 ok / error"})
+		return
+	}
+	if !validErrorKind(f.ErrorKind) {
+		writeJSON(w, 400, map[string]any{"detail": "error_kind 取值非法"})
 		return
 	}
 	logs, total, err := a.store.QueryUsageLogs(f, limit, offset)
@@ -1831,4 +1836,16 @@ func stringSlice(v any) []string {
 		}
 	}
 	return out
+}
+
+// validErrorKind 校验日志筛选的失败原因取值（空 = 不筛）。
+// 用白名单而不是直接拼进 SQL：错误分类是枚举，非法值应明确报 400 而不是静默返回空结果
+// ——后者会让「筛出来是空的」被误读成「没有这类失败」。
+func validErrorKind(k string) bool {
+	switch k {
+	case "", "upstream_error", "upstream_timeout", "client_invalid", "client_cancel",
+		"local_error", "unclassified":
+		return true
+	}
+	return false
 }

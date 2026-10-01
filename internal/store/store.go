@@ -319,6 +319,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE usage_logs ADD COLUMN output_cost REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN cache_cost REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''`,
+		// 必须放在 ALTER 之后：旧库在这一步之前没有 error_kind 列，提前建索引会
+		// 报 "no such column: error_kind"（新库因为有列而正常，只有旧库升级才炸）。
+		`CREATE INDEX IF NOT EXISTS idx_usage_kind_ts ON usage_logs(status, error_kind, ts)`,
 		`ALTER TABLE usage_logs ADD COLUMN is_stream INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''`,
 	}
@@ -1219,6 +1222,10 @@ type LogFilter struct {
 	SubKeyID  string
 	AccountID string
 	Status    string // ok | error
+	// ErrorKind 精确匹配失败原因（upstream_error / upstream_timeout / client_invalid /
+	// client_cancel / local_error）。仅对 status=error 的行有意义；配合 Status="error"
+	// 使用可直接筛出「上游故障」（排除客户端侧失败），这是运维最常用的视角。
+	ErrorKind string
 }
 
 // likeEscape 转义 LIKE 的模式特殊字符（含转义符自身），使筛选输入按字面子串匹配。
@@ -1250,6 +1257,16 @@ func logFilterWhere(f LogFilter) (string, []any) {
 	if f.Status != "" {
 		where += " AND status = ?"
 		args = append(args, f.Status)
+	}
+	if f.ErrorKind != "" {
+		// "unclassified" 是界面上的特殊选项，对应升级前的历史行（error_kind=''）。
+		// 不能用 = '' 之外的写法：空串在库里就是「未分类」，必须精确匹配。
+		if f.ErrorKind == "unclassified" {
+			where += " AND status = 'error' AND error_kind = ''"
+		} else {
+			where += " AND error_kind = ?"
+			args = append(args, f.ErrorKind)
+		}
 	}
 	return where, args
 }
@@ -1549,6 +1566,13 @@ type UsageBucket struct {
 	Cost             float64 `json:"cost"`
 	CacheReadTokens  int64   `json:"cache_read_tokens"`
 	UpstreamErrors   int64   `json:"upstream_errors"`
+	// 成本拆分（input + output + cache == cost），供前端把费用柱按分项堆叠。
+	InputCost  float64 `json:"input_cost"`
+	OutputCost float64 `json:"output_cost"`
+	CacheCost  float64 `json:"cache_cost"`
+	// 首字耗时合计与样本数（仅流式成功请求有值），前端算均值。
+	FirstTokenMsSum int64 `json:"first_token_ms_sum"`
+	StreamRequests  int64 `json:"stream_requests"`
 }
 
 // UsageFacet 维度下实体的小计行（供下拉/表格选择实体）。
@@ -1564,6 +1588,9 @@ type UsageFacet struct {
 	Cost             float64 `json:"cost"`
 	CacheReadTokens  int64   `json:"cache_read_tokens"`
 	UpstreamErrors   int64   `json:"upstream_errors"`
+	InputCost        float64 `json:"input_cost"`
+	OutputCost       float64 `json:"output_cost"`
+	CacheCost        float64 `json:"cache_cost"`
 }
 
 // UsageQueryResult 一次查询的完整结果：总量 + 时序 + 维度实体列表。
@@ -1727,7 +1754,10 @@ func (s *Store) queryUsageRaw(q UsageQuery) (*UsageQueryResult, error) {
 			COUNT(*), COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0),
 			COALESCE(SUM(cache_read_tokens),0),
-			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0)
+			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0),
+			COALESCE(SUM(CASE WHEN status='ok' AND is_stream=1 THEN first_token_ms ELSE 0 END),0),
+			COALESCE(SUM(is_stream),0)
 		FROM usage_logs WHERE `+where+` GROUP BY `+bucketExpr+` ORDER BY 1 ASC`, whereArgs...)
 	if err != nil {
 		return nil, err
@@ -1737,7 +1767,9 @@ func (s *Store) queryUsageRaw(q UsageQuery) (*UsageQueryResult, error) {
 		b := &UsageBucket{}
 		if err := rows.Scan(&b.Bucket, &b.PromptTokens, &b.CompletionTokens,
 			&b.Requests, &b.Success, &b.Images, &b.Cost,
-			&b.CacheReadTokens, &b.UpstreamErrors); err != nil {
+			&b.CacheReadTokens, &b.UpstreamErrors,
+			&b.InputCost, &b.OutputCost, &b.CacheCost,
+			&b.FirstTokenMsSum, &b.StreamRequests); err != nil {
 			return nil, err
 		}
 		res.Series = append(res.Series, b)
@@ -1753,7 +1785,8 @@ func (s *Store) queryUsageRaw(q UsageQuery) (*UsageQueryResult, error) {
 				COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 				COALESCE(SUM(total_tokens),0), COALESCE(SUM(image_count),0), COALESCE(SUM(cost),0),
 			COALESCE(SUM(cache_read_tokens),0),
-			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0)
+			COALESCE(SUM(CASE WHEN status<>'ok' AND (error_kind='' OR error_kind IN ('upstream_error','upstream_timeout')) THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(input_cost),0), COALESCE(SUM(output_cost),0), COALESCE(SUM(cache_cost),0)
 			FROM usage_logs WHERE ts >= ? AND ts < ?
 			GROUP BY `+dim[0]+`, `+dim[1]+`
 			ORDER BY SUM(total_tokens) DESC, SUM(image_count) DESC
@@ -1766,7 +1799,8 @@ func (s *Store) queryUsageRaw(q UsageQuery) (*UsageQueryResult, error) {
 			f := &UsageFacet{}
 			if err := frows.Scan(&f.Key, &f.Label, &f.Requests, &f.Success,
 				&f.PromptTokens, &f.CompletionTokens, &f.TotalTokens, &f.Images, &f.Cost,
-				&f.CacheReadTokens, &f.UpstreamErrors); err != nil {
+				&f.CacheReadTokens, &f.UpstreamErrors,
+				&f.InputCost, &f.OutputCost, &f.CacheCost); err != nil {
 				return nil, err
 			}
 			res.Facets = append(res.Facets, f)

@@ -54,6 +54,28 @@ function fmtPct(x) {
   return Number(x || 0).toFixed(1) + "%";
 }
 
+// fmtMs 毫秒展示：小于 1 秒显示整数毫秒，否则显示秒（一位小数）。
+// 统计里的首字/总耗时跨越了「几十毫秒」到「几分钟」两个量级，统一带单位更好读。
+function fmtMs(ms) {
+  const v = Number(ms || 0);
+  if (!v) return "—";
+  return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(1) + "s";
+}
+
+// fmtAvg 求平均并带单位；无样本时返回「—」而不是 0。
+// **不能返回 0**：0ms 会被读成「极快」，而真相是「没有样本」。
+function fmtAvg(sum, n, unit) {
+  const c = Number(n || 0);
+  if (!c) return "—";
+  return fmtMs(sum / c);
+}
+
+// fmtPctRaw 已是百分数的值（成功率分桶用）；0 样本返回「—」不伪造 0%。
+function fmtPctRaw(p, ok, n) {
+  if (!n) return "—";
+  return Number(p || 0).toFixed(1) + "%";
+}
+
 // ── Toast ──
 const toasts = reactive([]);
 let toastSeq = 0;
@@ -637,7 +659,13 @@ function renderUsageChart(buckets, gran, metric) {
   const labelFn = gran === "hour" ? hourLabel : dayLabel;
   if (!buckets || !buckets.length) return '<div class="empty">所选区间暂无数据</div>';
   if (metric === "cost") {
-    return renderBarChart(buckets, (b) => b.cost, "#f59e0b", fmtCost, labelFn, true);
+    // 费用按「输入/缓存/输出」堆叠：单色柱看不出钱花在哪，而分项才是定价排查的依据。
+    // 注意：三者之和等于成本总额（后台不做 clamp，浮点除法保证不丢分），
+    // 所以堆叠总高与旧的单系列柱一致，老读数习惯不被破坏。
+    return renderStackedBarChart(buckets,
+      (b) => (b.cost || 0) - (b.output_cost || 0),
+      (b) => b.output_cost || 0,
+      "#f59e0b", "#8b5cf6", "输入+缓存", "输出", fmtCost, labelFn);
   }
   if (metric === "requests") {
     return renderBarChart(buckets, (b) => b.requests, "#3b82f6", fmtInt, labelFn, true);
@@ -908,7 +936,16 @@ const LogsPage = {
       logs: [], total: 0, page: 1,
       pageSize: Number(localStorage.getItem("arkgate_log_page_size") || 50),
       sizes: [20, 50, 100, 200, 500],
-      filters: { ip: "", model: "", subkey: "", account: "", status: "" },
+      filters: { ip: "", model: "", subkey: "", account: "", status: "", error_kind: "" },
+      errorKinds: [
+        { v: "", label: "全部原因" },
+        { v: "upstream_error", label: "上游报错" },
+        { v: "upstream_timeout", label: "上游超时" },
+        { v: "client_invalid", label: "请求非法（客户端侧）" },
+        { v: "client_cancel", label: "下游断开（客户端侧）" },
+        { v: "local_error", label: "网关内部错误" },
+        { v: "unclassified", label: "未分类（历史数据）" },
+      ],
       subkeys: [], accounts: [], models: [], loading: false,
     };
   },
@@ -955,8 +992,10 @@ const LogsPage = {
       this.load();
     },
     applyFilters() { this.page = 1; this.load(); },
+    kindLabel(k) { return ERROR_KIND_LABELS[k] || "—"; },
+    kindColor(k) { return ERROR_KIND_COLORS[k] || "#9ca3af"; },
     resetFilters() {
-      this.filters = { ip: "", model: "", subkey: "", account: "", status: "" };
+      this.filters = { ip: "", model: "", subkey: "", account: "", status: "", error_kind: "" };
       this.page = 1;
       this.load();
     },
@@ -996,6 +1035,9 @@ const LogsPage = {
       <select v-model="filters.status" style="width:110px">
         <option value="">全部状态</option><option value="ok">成功</option><option value="error">失败</option>
       </select>
+      <select v-model="filters.error_kind" style="width:190px" title="按失败原因筛选；选「上游报错/超时」可排除客户端侧失败">
+        <option v-for="k in errorKinds" :key="k.v" :value="k.v">{{ k.label }}</option>
+      </select>
       <button class="btn btn-primary btn-sm" @click="applyFilters">筛选</button>
       <button class="btn btn-outline btn-sm" @click="resetFilters">重置</button>
     </div>
@@ -1015,7 +1057,10 @@ const LogsPage = {
         <td>{{ l.modality === 'image' ? (l.image_count || 0) + ' 张' : '—' }}</td>
         <td class="cost">{{ fmtCost(l.cost) }}</td>
         <td class="mono">{{ l.first_token_ms ? l.first_token_ms + 'ms' : '—' }} / {{ l.latency_ms }}ms</td>
-        <td><span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span></td>
+        <td>
+          <span :class="l.status === 'ok' ? 'tag tag-green' : 'tag tag-red'">{{ l.status === 'ok' ? 'OK' : 'ERR' }}</span>
+          <span v-if="l.status !== 'ok' && l.error_kind" class="tag tag-gray" :title="'失败原因：' + kindLabel(l.error_kind)">{{ kindLabel(l.error_kind) }}</span>
+        </td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-3)" :title="l.error">{{ l.error }}</td>
       </tr>
     </tbody></table></div>
@@ -1033,6 +1078,25 @@ const LogsPage = {
 };
 
 // ── 用量分析（对齐火山方舟「用量统计」交互：区间 + 粒度 + 维度下钻） ──
+// 失败原因的可读名与配色。后端 model.ErrorKind* 的取值必须在这里有对应项，
+// 否则界面会露出英文枚举（errLabel 有兜底，但配色会退化成灰色）。
+const ERROR_KIND_LABELS = {
+  upstream_error: "上游报错",
+  upstream_timeout: "上游超时",
+  client_invalid: "请求非法（客户端侧）",
+  client_cancel: "下游断开（客户端侧）",
+  local_error: "网关内部错误",
+  unclassified: "未分类（历史数据）",
+};
+const ERROR_KIND_COLORS = {
+  upstream_error: "#ef4444",
+  upstream_timeout: "#f59e0b",
+  client_invalid: "#9ca3af",
+  client_cancel: "#a3a3a3",
+  local_error: "#8b5cf6",
+  unclassified: "#d1d5db",
+};
+
 const USAGE_DIMS = [
   { v: "", label: "全部" },
   { v: "model", label: "模型" },
@@ -1060,12 +1124,62 @@ const UsagePage = {
       ],
       r: null,
       loading: false,
+      // 展示开关：默认折叠细节（统计卡与分项表），避免首屏过载。
+      showDetail: false,
     };
   },
   computed: {
     summary() { return (this.r && this.r.summary) || {}; },
     facets() { return (this.r && this.r.facets) || []; },
     buckets() { return (this.r && this.r.series) || []; },
+    errors() { return (this.r && this.r.errors) || []; },
+    // 数据来源：rollup（预聚合）/ raw（原始表）。预聚合区间查得快，但实时数据
+    // （水位未覆盖）走原始表——展示出来，避免「刚发的请求没出现」被误判成 bug。
+    sourceBadge() {
+      const s = this.r && this.r.source;
+      if (s === "rollup") return { label: "预聚合", cls: "ic-green", tip: "该区间已聚合，查询走预聚合表" };
+      if (s === "raw") return { label: "实时", cls: "ic-blue", tip: "区间含未聚合数据，直接查原始日志表" };
+      return null;
+    },
+    // 平均首字耗时（TTFT）：只对流式成功请求有样本，无样本显示 — 而不是 0。
+    avgFirstToken() { return fmtAvg(this.summary.first_token_ms_sum, this.summary.stream_requests); },
+    avgLatency() {
+      const s = this.summary;
+      return fmtAvg(s.latency_ms_sum, s.requests);
+    },
+    // 上游失败 / 客户端断开分开算。这两者混在一起算「失败率」会误导运维：
+    // 客户端断开不是上游故障，不该推动熔断，也不该让人以为要换供应商。
+    upstreamFailRate() { return this.rateOf({ requests: this.summary.requests, success: this.summary.requests - (this.summary.upstream_errors || 0) }); },
+    clientAbortRate() {
+      const s = this.summary;
+      if (!s.requests) return "—";
+      return fmtPct(((s.client_errors || 0) / s.requests) * 100);
+    },
+    // 成本分项占比（用于分项条的宽度）。
+    costParts() {
+      const s = this.summary;
+      const total = (s.input_cost || 0) + (s.output_cost || 0) + (s.cache_cost || 0);
+      const mk = (v, color, name) => ({ name, color, value: v || 0, pct: total > 0 ? ((v || 0) / total) * 100 : 0 });
+      return {
+        total,
+        items: [
+          mk(s.input_cost, "#f59e0b", "输入"),
+          mk(s.output_cost, "#8b5cf6", "输出"),
+          mk(s.cache_cost, "#14b8a6", "缓存"),
+        ],
+      };
+    },
+    // 是否存在「未分类」失败（升级前的历史行）。有则给一句解释，免得被当成数据错误。
+    hasUnclassified() { return this.errors.some((e) => e.kind === "unclassified" || !e.kind); },
+    // 缓存命中率 = 缓存读取 /（缓存读取 + 输入）。只用输入侧口径：
+    // 缓存读是「输入被缓存掉的部分」，与输出无关。
+    cacheHitRate() {
+      const s = this.summary;
+      const read = s.cache_read_tokens || 0;
+      const denom = read + (s.prompt_tokens || 0);
+      if (!denom) return "—";
+      return fmtPct((read / denom) * 100);
+    },
     successRate() {
       const s = this.summary;
       return s.requests ? fmtPct((s.success / s.requests) * 100) : "—";
@@ -1107,6 +1221,15 @@ const UsagePage = {
       this.load();
     },
     rateOf(s) { return s && s.requests ? fmtPct((s.success / s.requests) * 100) : "—"; },
+    fmtInt(v) { return fmtInt(v); },
+    errLabel(kind) { return ERROR_KIND_LABELS[kind] || kind || "未知"; },
+    errColor(kind) { return ERROR_KIND_COLORS[kind] || "#9ca3af"; },
+    // 各失败原因占「全部失败」的比例（分母是失败总数，不是请求总数）。
+    errShare(n) {
+      const total = this.errors.reduce((a, e) => a + (e.requests || 0), 0);
+      if (!total) return "—";
+      return ((n / total) * 100).toFixed(1) + "%";
+    },
   },
   template: `
   <div class="page">
@@ -1148,25 +1271,82 @@ const UsagePage = {
       <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(summary.cost) }}</div><div class="l">费用</div></div></div>
     </div>
 
+    <div class="stat-row">
+      <div class="stat-card"><div class="ic ic-red">⚠</div><div class="body"><div class="v">{{ fmtInt(summary.upstream_errors || 0) }}</div><div class="l">上游失败</div></div></div>
+      <div class="stat-card"><div class="ic ic-gray">✕</div><div class="body"><div class="v">{{ fmtInt(summary.client_errors || 0) }}</div><div class="l">客户端侧失败</div></div></div>
+      <div class="stat-card"><div class="ic ic-purple">⇄</div><div class="body"><div class="v">{{ fmtInt(summary.stream_requests || 0) }}</div><div class="l">流式请求</div></div></div>
+      <div class="stat-card"><div class="ic ic-blue">⏱</div><div class="body"><div class="v">{{ avgFirstToken }}</div><div class="l">平均首字耗时</div></div></div>
+      <div class="stat-card"><div class="ic ic-green">⏳</div><div class="body"><div class="v">{{ avgLatency }}</div><div class="l">平均总耗时</div></div></div>
+      <div class="stat-card"><div class="ic ic-teal">♻</div><div class="body"><div class="v">{{ cacheHitRate }}</div><div class="l">缓存命中占输入</div></div></div>
+    </div>
+
     <div class="card">
-      <div class="card-head"><div class="card-title">{{ chartTitle }}（{{ chartUnit }}） · {{ dimLabel }}<template v-if="dim">：{{ entityLabel }}</template> · 按{{ gran === 'hour' ? '小时' : '天' }}</div></div>
+      <div class="card-head">
+        <div class="card-title">{{ chartTitle }}（{{ chartUnit }}） · {{ dimLabel }}<template v-if="dim">：{{ entityLabel }}</template> · 按{{ gran === 'hour' ? '小时' : '天' }}</div>
+        <span v-if="sourceBadge" class="src-badge" :class="sourceBadge.cls" :title="sourceBadge.tip">{{ sourceBadge.label }}</span>
+      </div>
       <div class="chart-wrap" v-html="chartHtml"></div>
+    </div>
+
+    <div class="detail-grid">
+      <div class="card" v-if="costParts.total > 0">
+        <div class="card-head"><div class="card-title">费用构成</div></div>
+        <div class="split-bar">
+          <div v-for="it in costParts.items" :key="it.name" class="split-seg"
+               :style="{width: it.pct + '%', background: it.color}" :title="it.name + ' ' + fmtCost(it.value)"></div>
+        </div>
+        <table class="mini-table">
+          <tr v-for="it in costParts.items" :key="it.name">
+            <td><span class="dot" :style="{background: it.color}"></span>{{ it.name }}</td>
+            <td>{{ fmtCost(it.value) }}</td>
+            <td class="muted">{{ it.pct.toFixed(1) }}%</td>
+          </tr>
+          <tr class="total-row"><td>合计</td><td>{{ fmtCost(costParts.total) }}</td><td class="muted">100%</td></tr>
+        </table>
+      </div>
+
+      <div class="card" v-if="errors.length">
+        <div class="card-head"><div class="card-title">失败原因分布</div></div>
+        <table class="mini-table">
+          <tr v-for="e in errors" :key="e.kind">
+            <td><span class="dot" :style="{background: errColor(e.kind)}"></span>{{ errLabel(e.kind) }}</td>
+            <td>{{ fmtInt(e.requests) }}</td>
+            <td class="muted">{{ errShare(e.requests) }}</td>
+          </tr>
+        </table>
+        <div class="hint">
+          客户端侧失败（不合法的请求 / 下游主动断开）不计入上游失败率，也不推动熔断。
+          <span v-if="hasUnclassified">「未分类」是升级前写入的历史记录，其失败一律按上游失败统计。</span>
+        </div>
+      </div>
+
+      <div class="card" v-if="(summary.cache_read_tokens || 0) + (summary.cache_creation_tokens || 0) > 0">
+        <div class="card-head"><div class="card-title">缓存 Token</div></div>
+        <table class="mini-table">
+          <tr><td>缓存读取</td><td>{{ fmtTokens(summary.cache_read_tokens) }}</td><td class="muted">命中占输入 {{ cacheHitRate }}</td></tr>
+          <tr><td>缓存写入</td><td>{{ fmtTokens(summary.cache_creation_tokens) }}</td><td class="muted"></td></tr>
+        </table>
+      </div>
     </div>
 
     <div class="card" v-if="dim">
       <div class="card-head"><div class="card-title">{{ dimLabel }}拆分（点击行下钻，再点取消）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th>Tokens</th><th>图像</th><th>成本</th>
+        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th>Tokens</th><th>缓存读取</th><th>图像</th><th>成本</th><th>上游失败</th>
       </tr></thead><tbody>
         <tr class="clickable" :class="{selected: entity===''}" @click="pick('')">
           <td>全部</td><td>{{ summary.requests || 0 }}</td><td>{{ successRate }}</td>
-          <td>{{ fmtTokens(summary.total_tokens) }}</td><td>{{ summary.images || '—' }}</td><td class="cost">{{ fmtCost(summary.cost) }}</td>
+          <td>{{ fmtTokens(summary.total_tokens) }}</td><td>{{ fmtTokens(summary.cache_read_tokens) }}</td>
+          <td>{{ summary.images || '—' }}</td><td class="cost">{{ fmtCost(summary.cost) }}</td>
+          <td>{{ summary.upstream_errors || '—' }}</td>
         </tr>
         <tr v-for="f in facets" :key="f.key" class="clickable" :class="{selected: entity===f.key}" @click="pick(f.key)">
           <td class="mono">{{ f.label }}</td><td>{{ f.requests }}</td><td>{{ rateOf(f) }}</td>
-          <td>{{ fmtTokens(f.total_tokens) }}</td><td>{{ f.images || '—' }}</td><td class="cost">{{ fmtCost(f.cost) }}</td>
+          <td>{{ fmtTokens(f.total_tokens) }}</td><td>{{ fmtTokens(f.cache_read_tokens) }}</td>
+          <td>{{ f.images || '—' }}</td><td class="cost">{{ fmtCost(f.cost) }}</td>
+          <td>{{ f.upstream_errors || '—' }}</td>
         </tr>
-        <tr v-if="!facets.length"><td colspan="6" class="empty">所选区间暂无数据</td></tr>
+        <tr v-if="!facets.length"><td colspan="8" class="empty">所选区间暂无数据</td></tr>
       </tbody></table></div>
     </div>
   </div>`,
@@ -1923,6 +2103,8 @@ app.config.globalProperties.fmtTokens = fmtTokens;
 app.config.globalProperties.fmtTime = fmtTime;
 app.config.globalProperties.fmtCost = fmtCost;
 app.config.globalProperties.fmtPct = fmtPct;
+app.config.globalProperties.fmtMs = fmtMs;
+app.config.globalProperties.fmtInt = fmtInt;
 app.config.globalProperties.toggleDark = toggleDark;
 app.config.globalProperties.capOptions = capOptions;
 app.component("ProbeTest", ProbeTest)
