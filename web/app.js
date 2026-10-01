@@ -336,6 +336,7 @@ const OverviewPage = {
     <div class="stat-row" v-if="o">
       <div class="stat-card"><div class="ic ic-blue">🏛</div><div class="body"><div class="v">{{ o.account_active }}<span style="font-size:13px;color:var(--color-text-3)">/{{ o.account_total }}</span></div><div class="l">启用账号</div></div></div>
       <div class="stat-card"><div class="ic ic-red">⏳</div><div class="body"><div class="v">{{ o.endpoint_circuit }}</div><div class="l">元组熔断</div></div></div>
+      <div class="stat-card"><div class="ic ic-orange">◎</div><div class="body"><div class="v">{{ o.endpoint_halfopen || 0 }}</div><div class="l">探测中（待验证）</div></div></div>
       <div class="stat-card"><div class="ic ic-purple">🧩</div><div class="body"><div class="v">{{ o.model_count }}</div><div class="l">模型</div></div></div>
       <div class="stat-card"><div class="ic ic-orange">🔑</div><div class="body"><div class="v">{{ o.subkey_count }}</div><div class="l">子 Key</div></div></div>
       <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ o.total_requests }}</div><div class="l">总请求</div></div></div>
@@ -1416,7 +1417,11 @@ const RoutingPage = {
             ...e, color: ROUTE_COLORS[i % ROUTE_COLORS.length],
             eff: w, inherited: !(Number(e.weight) > 0),
             circuit: !!rt.circuit_open, concurrency: rt.concurrency || 0,
-            live: e.enabled && !rt.circuit_open,
+            // half_open：冷却已到期但探测尚未成功。此时**不算 live**——它还不能
+            // 放心承接流量（最多只有一个探测请求在试）。若把它算作健康，分流页的
+            // 占比条会虚高，让人误以为容量已经恢复。
+            halfOpen: !!rt.half_open,
+            live: e.enabled && !rt.circuit_open && !rt.half_open,
           };
         });
     },
@@ -1697,6 +1702,7 @@ const RoutingPage = {
                 <td>
                   <span v-if="!l.enabled" class="tag tag-gray">停用</span>
                   <span v-else-if="l.circuit" class="tag tag-red">熔断中</span>
+                  <span v-else-if="l.halfOpen" class="tag tag-warn" title="冷却已到期，正放行一个探测请求验证上游；成功即恢复承接，失败则继续熔断。">探测中</span>
                   <span v-else class="tag tag-green">承接中</span>
                 </td>
                 <td>{{ l.total_requests || 0 }}</td>

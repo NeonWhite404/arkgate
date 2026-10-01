@@ -196,8 +196,19 @@ type EndpointRuntime struct {
 	Concurrency         int32
 	ConsecutiveFailures int32
 	CircuitOpenUntil    int64 // unix nano；0 表示未熔断
-	RPM                 *Window
-	TPM                 *Window
+	// Probing 为 1 表示「冷却已到期，正有一个探测请求在试」——即 HalfOpen 态。
+	//
+	// 为什么需要它：没有探测闸门时，冷却到期那一瞬间所有被压住的请求会**同时**
+	// 涌向刚恢复（或压根没恢复）的上游（探针实测：50 个并发请求 50 个全部放行）。
+	// 后果是双向的：上游只是抖动 → 涌入的流量把它再次打挂，退避被反复重置；
+	// 上游真没恢复 → 这批请求全失败、立刻重新熔断，等于白等一轮冷却。
+	// HalfOpen 只放**一个**请求去探，用最小代价换取「不集体冲击上游」。
+	Probing int32
+	// ProbeStartedAt 是探测租约的开始时间（unix nano），供判断探测者是否失联，
+	// 避免叶子永久卡在 HalfOpen（一个请求都不放）。
+	ProbeStartedAt int64
+	RPM     *Window
+	TPM     *Window
 }
 
 // EndpointRuntimeInfo 是 EndpointRuntime 的 JSON 可见快照。
@@ -205,8 +216,10 @@ type EndpointRuntimeInfo struct {
 	Concurrency     int32 `json:"concurrency"`
 	CircuitOpen     bool  `json:"circuit_open"`      // 是否熔断中
 	CircuitRemainMS int64 `json:"circuit_remain_ms"` // 剩余冷却毫秒
-	RPMCurrent      int64 `json:"rpm_current"`
-	TPMCurrent      int64 `json:"tpm_current"`
+	// HalfOpen 表示冷却已到期、正在放行一个探测请求试上游（界面可展示为「探测中」）。
+	HalfOpen  bool `json:"half_open"`
+	RPMCurrent int64 `json:"rpm_current"`
+	TPMCurrent int64 `json:"tpm_current"`
 }
 
 // EnsureRuntime 初始化叶节点运行时状态（由 balancer 在持锁的 Refresh 中调用，避免数据竞争）。

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -864,5 +865,156 @@ func TestCloseDrainsPendingStats(t *testing.T) {
 	}
 	if total != n {
 		t.Fatalf("Close 后应落盘全部 %d 条, got %d", n, total)
+	}
+}
+
+// ── 熔断 HalfOpen（探测态） ──
+//
+// 修复的缺陷：冷却到期后原先**无条放行**。探针实测 50 个并发请求 50 个全部通过，
+// 会把刚恢复（或压根没恢复）的上游瞬间打满：上游只是抖动 → 被涌入流量再次打挂，
+// 退避反复重置；上游真没恢复 → 这批请求全失败、立刻重新熔断，白等一轮冷却。
+//
+// 下面三条分别锁定：① 只放一个；② 探测成功转 Closed；③ 探测失败回 Open。
+func halfOpenFixture(t *testing.T, cooldownAgo time.Duration) (*Balancer, string) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	b := New(st, 0)
+	t.Cleanup(b.Close)
+
+	acc := &model.Account{ID: "a1", Name: "a1", Provider: "openai", Status: "active", Weight: 1}
+	ep := &model.Endpoint{ID: "e1", AccountID: "a1", Model: "m1", EP: "up1", Enabled: true, Weight: 1}
+	mdl := &model.Model{Name: "m1", Type: model.ModelTypeText, Enabled: true}
+	b.seed([]*model.Account{acc}, []*model.Endpoint{ep}, []*model.Model{mdl})
+	b.endpoints["e1"].EnsureRuntime()
+	// 冷却在 cooldownAgo 前到期（正数 = 已到期，负数 = 仍在冷却）。
+	b.endpoints["e1"].Runtime.CircuitOpenUntil = time.Now().Add(-cooldownAgo).UnixNano()
+	return b, "e1"
+}
+
+// TestHalfOpenOnlyOneProbeAdmitted 冷却到期后只允许**一个**请求作探测，其余挡住。
+func TestHalfOpenOnlyOneProbeAdmitted(t *testing.T) {
+	b, id := halfOpenFixture(t, time.Millisecond) // 已到期
+	const n = 50
+	admitted := 0
+	for i := 0; i < n; i++ {
+		if _, err := b.Select("m1", nil, nil, APIChat, ""); err == nil {
+			admitted++
+		}
+	}
+	if admitted != 1 {
+		t.Fatalf("HalfOpen 应只放行 1 个探测请求, 实际放行 %d（旧实现在此会全放）", admitted)
+	}
+	if !b.CircuitOpen(id) {
+		// CircuitOpen 只看 CircuitOpenUntil（已到期故为 false），这里确认探测标志生效
+		t.Log("熔断冷却已到期（预期），探测闸门由 Probing 标志控制")
+	}
+	rt := b.endpoints[id].Runtime
+	if atomic.LoadInt32(&rt.Probing) != 1 {
+		t.Fatal("探测请求放行后应置 Probing=1，否则闸门无效")
+	}
+}
+
+// TestHalfOpenProbeSuccessClosesCircuit 探测成功 → 转 Closed，后续流量全放。
+func TestHalfOpenProbeSuccessClosesCircuit(t *testing.T) {
+	b, id := halfOpenFixture(t, time.Millisecond)
+
+	// 先让一个探测请求通过。
+	ep, err := b.Select("m1", nil, nil, APIChat, "")
+	if err != nil {
+		t.Fatalf("首个探测请求应放行: %v", err)
+	}
+	// 探测成功。
+	b.Record(&model.UsageLog{Model: "m1", EndpointID: id, AccountID: "a1", Status: "ok"},
+		ep, true, false)
+
+	// 熔断状态应被完全清零（回到 Closed），后续请求不再受闸门限制。
+	rt := b.endpoints[id].Runtime
+	if atomic.LoadInt64(&rt.CircuitOpenUntil) != 0 {
+		t.Fatal("探测成功后应清零熔断状态")
+	}
+	if atomic.LoadInt32(&rt.Probing) != 0 {
+		t.Fatal("探测成功后应释放探测标志，否则叶子卡在 HalfOpen")
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := b.Select("m1", nil, nil, APIChat, ""); err != nil {
+			t.Fatalf("探测成功后第 %d 个请求应放行: %v", i, err)
+		}
+	}
+}
+
+// TestHalfOpenProbeFailureReopensCircuit 探测失败 → 立即回 Open，且能再次探测。
+func TestHalfOpenProbeFailureReopensCircuit(t *testing.T) {
+	b, id := halfOpenFixture(t, time.Millisecond)
+
+	ep, err := b.Select("m1", nil, nil, APIChat, "")
+	if err != nil {
+		t.Fatalf("首个探测请求应放行: %v", err)
+	}
+	// 探测失败（非客户端错误 = 真上游故障）。
+	b.Record(&model.UsageLog{Model: "m1", EndpointID: id, AccountID: "a1", Status: "error"},
+		ep, false, false)
+
+	rt := b.endpoints[id].Runtime
+	if atomic.LoadInt64(&rt.CircuitOpenUntil) <= time.Now().UnixNano() {
+		t.Fatal("探测失败后应立即重新熔断（CircuitOpenUntil 指向未来）")
+	}
+	if atomic.LoadInt32(&rt.Probing) != 0 {
+		t.Fatal("探测失败后应释放探测租约，否则无法再次探测")
+	}
+	// 冷却期内一个都不放。
+	for i := 0; i < 5; i++ {
+		if _, err := b.Select("m1", nil, nil, APIChat, ""); err == nil {
+			t.Fatal("探测失败后的冷却期内不应放行任何请求")
+		}
+	}
+}
+
+// TestHalfOpenClientErrReleasesProbe 探测收到「请求方错误」时也必须释放租约。
+//
+// 这是个容易被忽略的泄漏点：客户端错误不计熔断（正确），但若不释放探测标志，
+// 叶子会永久卡在 HalfOpen——既不恢复也不探测，一个请求都不放。
+func TestHalfOpenClientErrReleasesProbe(t *testing.T) {
+	b, id := halfOpenFixture(t, time.Millisecond)
+
+	ep, err := b.Select("m1", nil, nil, APIChat, "")
+	if err != nil {
+		t.Fatalf("探测请求应放行: %v", err)
+	}
+	b.Record(&model.UsageLog{Model: "m1", EndpointID: id, AccountID: "a1", Status: "error"},
+		ep, false, true) // clientErr = true
+
+	rt := b.endpoints[id].Runtime
+	if atomic.LoadInt32(&rt.Probing) != 0 {
+		t.Fatal("客户端错误也应释放探测租约，否则叶子永久卡在 HalfOpen")
+	}
+}
+
+// TestHalfOpenStaleProbeReleased 探测者失联（崩溃/永不返回）后，租约过期应可重新探测。
+func TestHalfOpenStaleProbeReleased(t *testing.T) {
+	b, id := halfOpenFixture(t, time.Millisecond)
+	rt := b.endpoints[id].Runtime
+
+	// 模拟一个早已失联的探测者：Probing=1 但开始时间远早于 probeTTL。
+	atomic.StoreInt32(&rt.Probing, 1)
+	atomic.StoreInt64(&rt.ProbeStartedAt, time.Now().Add(-2*probeTTL).UnixNano())
+
+	// 过期租约应被释放，于是新请求可以接管探测。
+	if _, err := b.Select("m1", nil, nil, APIChat, ""); err != nil {
+		t.Fatalf("过期探测租约应被释放并允许新探测: %v", err)
+	}
+
+	// 对照：租约未过期时不应被抢走。
+	b2, id2 := halfOpenFixture(t, time.Millisecond)
+	rt2 := b2.endpoints[id2].Runtime
+	atomic.StoreInt32(&rt2.Probing, 1)
+	atomic.StoreInt64(&rt2.ProbeStartedAt, time.Now().UnixNano()) // 刚认领
+	if _, err := b2.Select("m1", nil, nil, APIChat, ""); err == nil {
+		t.Fatal("探测租约未过期时不应放行第二个请求（否则又是集体涌入）")
 	}
 }

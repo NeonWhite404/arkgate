@@ -395,12 +395,34 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 
 	// 会话粘性：同 Key + 模型的后续请求在 TTL 内固定到同一叶子，提升上游
 	// prompt cache 命中率。粘性命中同样要做并发/RPM 占位。
+	//
+	// 若粘住的叶子正处于 HalfOpen 探索期，而探测资格已被别人拿走（claimProbe
+	// 返回 false），则**不粘**：继续走 WRR 选其它健康叶子。把请求堆在一个
+	// 待验证的叶子上没有必要。
 	if stickyKey != "" && b.sessionTTL > 0 {
 		if pinned := b.sessionPick(stickyKey+"|"+modelName, cands); pinned != nil {
-			atomic.AddInt32(&pinned.Runtime.Concurrency, 1)
-			pinned.Runtime.RPM.Add(1)
-			return pinned, nil
+			if b.claimProbe(pinned) {
+				atomic.AddInt32(&pinned.Runtime.Concurrency, 1)
+				pinned.Runtime.RPM.Add(1)
+				return pinned, nil
+			}
 		}
+	}
+
+	// HalfOpen 闸门：优先让「冷却已到期但还没人探测」的叶子先接受一次验证；
+	// 同时把「正在探测中（资格已被别人拿走）」的叶子从本次候选里剔除，否则下面的
+	// WRR 会把它当普通叶子选中，探测闸门形同虚设（实测：50 个并发全部放行）。
+	var probing *model.Endpoint
+	cands, probing = b.splitProbeCandidates(cands)
+	if probing != nil {
+		atomic.AddInt32(&probing.Runtime.Concurrency, 1)
+		probing.Runtime.RPM.Add(1)
+		return probing, nil
+	}
+	if len(cands) == 0 {
+		// 所有候选都在探测中：本次不放行。返回 ErrAllThrottled（“暂不可用”），
+		// 与全部熔断/限流的语义一致，调用方会尝试 fallback 或重试。
+		return nil, ErrAllThrottled
 	}
 
 	// 权重表只算一次，供 WRR 累计与总数两处共用（此前 getWrrState 与 Select
@@ -433,8 +455,7 @@ func (b *Balancer) Select(modelName string, allowed []string, exclude map[string
 	atomic.AddInt32(&picked.Runtime.Concurrency, 1)
 	picked.Runtime.RPM.Add(1)
 
-	return picked, nil
-}
+	return picked, nil}
 
 // sessionPick 查询粘性会话：TTL 内且目标叶在候选集中才命中（读时惰性淘汰过期项）。
 func (b *Balancer) sessionPick(key string, cands []*model.Endpoint) *model.Endpoint {
@@ -692,6 +713,8 @@ func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, excl
 	if rt == nil { // 防御：极小概率未初始化
 		return false
 	}
+	// 熔断中（冷却未到期）不可选。冷却到期后进入 HalfOpen 候选：不再无条放行，
+	// 由 claimProbe 决定谁去做那个探测请求（见该函数）。
 	if atomic.LoadInt64(&rt.CircuitOpenUntil) > now.UnixNano() {
 		return false
 	}
@@ -707,7 +730,104 @@ func (b *Balancer) endpointUsable(e *model.Endpoint, allow map[string]bool, excl
 	return true
 }
 
-// hasAnyEndpoint 判断模型是否存在「账号可用 + 能力匹配」的叶节点（不含运行态判断）。
+// ── 熔断 HalfOpen（探测态） ──
+//
+// 背景：冷却到期后原来的实现是**无条放行**。探针实测：50 个并发请求 50 个全部
+// 通过。这会把刚恢复（或压根没恢复）的上游瞬间打满：上游只是抖动 → 被涌入流量
+// 再次打挂，退避反复重置；上游真没恢复 → 这批请求全失败、立刻重新熔断，白等一轮。
+//
+// 现在的语义：
+//   Closed（未熔断）：正常运行。
+//   Open（冷却中）：一个不放行。
+//   HalfOpen（冷却到期、探测中）：**只放一个**请求去试，其余仍视为不可用。
+//     探测成功 → 立即转 Closed（Record 里清零熔断状态）。
+//     探测失败 → 立即转回 Open（Record 里重新置 CircuitOpenUntil）。
+
+// probeTTL 探测态的「租约」时长。
+//
+// 为什么需要过期：探测请求可能因进程崩溃/连接池异常而永远不回来，
+// 若不在一定时间后释放 Probing 标志，该叶子会永久卡在 HalfOpen（一个请求都不放）。
+// 取 30 秒：远大于正常请求耗时，又短到不会让故障叶子长期无法恢复探测。
+const probeTTL = 30 * time.Second
+
+// claimProbe 尝试认领某叶子的探测资格。返回 true 表示本次请求作为探测请求放行。
+//
+// 只在「熔断冷却已到期」时有意义：此时该叶处于 HalfOpen 候选，谁抢到谁去试。
+// 用 CAS 而非 Load+Store：并发下必须保证**只有一个**胜出，否则又是集体涌入。
+func (b *Balancer) claimProbe(e *model.Endpoint) bool {
+	rt := e.Runtime
+	if rt == nil {
+		return false
+	}
+	// 未熔断过（CircuitOpenUntil == 0）的叶子不是探测对象，直接放行。
+	openUntil := atomic.LoadInt64(&rt.CircuitOpenUntil)
+	if openUntil == 0 {
+		return true
+	}
+	if openUntil > time.Now().UnixNano() {
+		return false // 仍在冷却中（应该到不了这里，双保险）
+	}
+	// 冷却已到期：抢探测资格。
+	if !atomic.CompareAndSwapInt32(&rt.Probing, 0, 1) {
+		// 已有人在探测：本请求不放行。注意**不重置** Probing——否则会把
+		// 探测者的租约抢走，导致多个请求同时去试。
+		return false
+	}
+	// 记下探测开始时间，供 releaseStaleProbe 判断租约是否过期。
+	atomic.StoreInt64(&rt.ProbeStartedAt, time.Now().UnixNano())
+	return true
+}
+
+// releaseStaleProbe 释放过期未归还的探测租约（探测请求可能崩溃/永不返回）。
+// 由 Record 与 selectable 两侧偶尔调用，无需额外协程。
+func releaseStaleProbe(rt *model.EndpointRuntime) {
+	if rt == nil || atomic.LoadInt32(&rt.Probing) == 0 {
+		return
+	}
+	started := atomic.LoadInt64(&rt.ProbeStartedAt)
+	if started == 0 || time.Since(time.Unix(0, started)) > probeTTL {
+		// 租约过期：允许后续请求重新探测，避免叶子永久卡在 HalfOpen。
+		atomic.StoreInt32(&rt.Probing, 0)
+	}
+}
+
+// selectedRuntime 返回叶子运行时（可能为 nil）。
+func selectedRuntime(e *model.Endpoint) *model.EndpointRuntime {
+	if e == nil {
+		return nil
+	}
+	return e.Runtime
+}
+
+
+// splitProbeCandidates 把候选集拆成「可正常参与 WRR 的」与「探测归属」。
+//
+// 返回：
+//   - keep：可正常承接流量的叶子（含从未熔断的，以及探测资格被本次认领到的）。
+//   - probe：本次认领到探测资格的叶子（非 nil 时应直接选它并 return）。
+//
+// 语义要点：处于 HalfOpen 且**别人正在探测**的叶子会从 keep 中剔除——它既不该
+// 参与 WRR，也不该被选中，直到探测结束（成功转 Closed / 失败回 Open）。
+func (b *Balancer) splitProbeCandidates(cands []*model.Endpoint) (keep []*model.Endpoint, probe *model.Endpoint) {
+	keep = make([]*model.Endpoint, 0, len(cands))
+	for _, e := range cands {
+		rt := e.Runtime
+		if rt == nil || atomic.LoadInt64(&rt.CircuitOpenUntil) == 0 {
+			keep = append(keep, e) // 从未熔断：普通候选
+			continue
+		}
+		// 熔断过且冷却已到期（selectable 已保证未到期的不会进来）= HalfOpen 候选。
+		releaseStaleProbe(rt) // 探测者可能已失联，先释放过期租约
+		if probe == nil && atomic.CompareAndSwapInt32(&rt.Probing, 0, 1) {
+			atomic.StoreInt64(&rt.ProbeStartedAt, time.Now().UnixNano())
+			probe = e
+			continue
+		}
+		// 本次没抢到探测资格（别人在探）：本叶子不参与本轮选举。
+	}
+	return keep, probe
+}
+
 func (b *Balancer) hasAnyEndpoint(modelName string, allowed []string, api API) bool {
 	allow := setOf(allowed)
 	b.mu.RLock()
@@ -844,14 +964,37 @@ func (b *Balancer) ModelLimits(name string) (context, maxOut int64) {
 func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr bool) {
 	if ep != nil && ep.Runtime != nil {
 		rt := ep.Runtime
-		if ok {
+		switch {
+		case ok:
+			// 成功：无论之前是 Closed 还是 HalfOpen，都回到 Closed。
+			// 探测成功就是走这里——清零熔断状态与探测标志，叶子恢复承接流量。
 			atomic.StoreInt32(&rt.ConsecutiveFailures, 0)
 			atomic.StoreInt64(&rt.CircuitOpenUntil, 0)
-		} else if !clientErr {
-			fails := atomic.AddInt32(&rt.ConsecutiveFailures, 1)
-			if fails >= model.CircuitBreakerThreshold {
-				atomic.StoreInt64(&rt.CircuitOpenUntil, nowPlusCooldown(fails))
+			atomic.StoreInt32(&rt.Probing, 0)
+			atomic.StoreInt64(&rt.ProbeStartedAt, 0)
+		case clientErr:
+			// 请求方问题（上下文超限等）：不算上游故障。
+			// 但若该叶子正处于探测中，必须**释放探测租约**——否则探测标志一直挂着，
+			// 后续请求再也不会去试，叶子永久卡在 HalfOpen。
+			atomic.StoreInt32(&rt.Probing, 0)
+			atomic.StoreInt64(&rt.ProbeStartedAt, 0)
+		default:
+			// 探测失败是「上游还没好」的直接证据，必须**立即重新熔断**，而不是等
+			// 再次累积到阈值——否则探测失败后闸门被释放，下一批请求会立刻涌入
+			// 一个已知故障的上游。
+			if atomic.LoadInt32(&rt.Probing) == 1 {
+				atomic.StoreInt32(&rt.ConsecutiveFailures, model.CircuitBreakerThreshold)
+				atomic.StoreInt64(&rt.CircuitOpenUntil, nowPlusCooldown(model.CircuitBreakerThreshold))
+			} else {
+				fails := atomic.AddInt32(&rt.ConsecutiveFailures, 1)
+				if fails >= model.CircuitBreakerThreshold {
+					atomic.StoreInt64(&rt.CircuitOpenUntil, nowPlusCooldown(fails))
+				}
 			}
+			// 无论哪种路径都释放探测租约，让下一个冷却周期能重新探测；
+			// 不释放会让叶子在 HalfOpen 上挂死（既不恢复也不探测）。
+			atomic.StoreInt32(&rt.Probing, 0)
+			atomic.StoreInt64(&rt.ProbeStartedAt, 0)
 		}
 	}
 	op := statOp{
@@ -1001,6 +1144,11 @@ func (b *Balancer) SnapshotEndpoints() []*model.Endpoint {
 			}
 			if info.CircuitOpen {
 				info.CircuitRemainMS = (openUntil - now) / int64(time.Millisecond)
+			} else if openUntil != 0 {
+				// 熔断过、冷却已到期：处于 HalfOpen（要么正有探测在跑，要么等下一个
+				// 请求去探）。展示出来以免界面把「刚过冷却但还没验证成功」误显示为
+				// 完全健康——此时其实还不能放心承接流量。
+				info.HalfOpen = true
 			}
 			if e.Runtime.RPM != nil {
 				info.RPMCurrent = e.Runtime.RPM.Count()
@@ -1038,6 +1186,23 @@ func (b *Balancer) CircuitOpen(id string) bool {
 		return false
 	}
 	return atomic.LoadInt64(&e.Runtime.CircuitOpenUntil) > time.Now().UnixNano()
+}
+
+// CircuitHalfOpen 按 ID 判断叶节点是否处于 HalfOpen（熔断冷却已到期、探测尚未成功）。
+//
+// 与 CircuitOpen 分开而不是合并成一个三态枚举：两者在界面上的含义不同
+// （“熔断中”= 完全不转移量；“探测中”= 只放一个请求验证），而且调用方大多只关心
+// 其中一种。需要区分时两个函数各调一次即可（总览页就是这么用的）。
+func (b *Balancer) CircuitHalfOpen(id string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	e := b.endpoints[id]
+	if e == nil || e.Runtime == nil {
+		return false
+	}
+	openUntil := atomic.LoadInt64(&e.Runtime.CircuitOpenUntil)
+	// 熔断过（非 0）且冷却已到期 → 处于探测态。
+	return openUntil != 0 && openUntil <= time.Now().UnixNano()
 }
 
 // AccountActive 判断账号是否启用。

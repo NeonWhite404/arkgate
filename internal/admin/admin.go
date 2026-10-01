@@ -1687,15 +1687,24 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 			disabled++
 		}
 	}
-	// 元组级健康度：启用数 / 熔断数（熔断按 ID 查内存运行态，
+	// 元组级健康度：启用数 / 熔断数 / 探测数（熔断按 ID 查内存运行态，
 	// 快照副本不带 Runtime，不能直接判可用性）。
-	var epEnabled, epCircuit int64
+	//
+	// 探测数必须与熔断数分开报：两者都“不承接流量”，但含义完全不同——
+	// 熔断中是等冷却，探测中是差一个成功请求就能恢复。合在一起会让运维
+	// 无法区分「上游还坏着」与「正在恢复中」。
+	var epEnabled, epCircuit, epHalfOpen int64
 	for _, e := range eps {
 		if e.Enabled {
 			epEnabled++
 		}
-		if e.Enabled && a.bal.CircuitOpen(e.ID) {
+		if !e.Enabled {
+			continue
+		}
+		if a.bal.CircuitOpen(e.ID) {
 			epCircuit++
+		} else if a.bal.CircuitHalfOpen(e.ID) {
+			epHalfOpen++
 		}
 	}
 	// 成本核算（来自 usage_logs.cost 聚合）。
@@ -1707,6 +1716,7 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"endpoint_total":   len(eps),
 		"endpoint_enabled": epEnabled,
 		"endpoint_circuit": epCircuit,
+		"endpoint_halfopen": epHalfOpen,
 		"model_count":      modelCount,
 		"subkey_count":     subkeyCount,
 		"total_requests":   totalReq,
