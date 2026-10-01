@@ -2,11 +2,13 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 )
 
@@ -130,6 +132,17 @@ var requestFaultHints = []string{
 	"max_output_tokens", "supports at most", "exceed",
 }
 
+// requestTypeFaultHints 是「请求体字段类型/取值非法」类错误体特征。这类错误
+// 由下游把参数写错类型引发（典型：stream 写成字符串 "false"），不是端点故障。
+// 与 requestFaultHints 分开维护：这些特征在 5xx 上也可能是请求方问题——不少
+// 上游（Go 系聚合器）把「JSON 解码失败」包装成 500 返回。
+var requestTypeFaultHints = []string{
+	"must be a boolean", "must be boolean", "expected a boolean", "expected boolean",
+	"must be a string", "must be an integer", "must be a number",
+	"cannot unmarshal", "unmarshal", "invalid type",
+	"不是布尔", "必须是布尔值", "字段类型", "参数类型",
+}
+
 // IsRequestFault 判断 err 是否由客户端请求自身问题导致（上下文超限、
 // max_tokens 超上限、参数非法、协议转换不支持的内容等 4xx）。这类错误是
 // 请求方的错，不是端点故障，调用方应据此跳过端点熔断计数（透传行为不变）。
@@ -142,18 +155,53 @@ func IsRequestFault(err error) bool {
 	if !ok {
 		return false
 	}
+	body := strings.ToLower(string(he.Body))
 	switch he.Code {
 	case 400, 413, 422:
+		for _, h := range requestFaultHints {
+			if strings.Contains(body, h) {
+				return true
+			}
+		}
+		// 类型错误词条在 4xx 上同样成立（如 400 + "must be a boolean"）。
+		for _, h := range requestTypeFaultHints {
+			if strings.Contains(body, h) {
+				return true
+			}
+		}
+		return false
+	case 500, 502:
+		// 部分上游把「请求体 JSON 解码失败」包装成 5xx——这仍是请求方问题。
+		// 只认明确的解码/类型失败短语，避免把真实的 5xx 故障误判为客户端问题。
+		for _, h := range requestTypeFaultHints {
+			if strings.Contains(body, h) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}
-	body := strings.ToLower(string(he.Body))
-	for _, h := range requestFaultHints {
-		if strings.Contains(body, h) {
-			return true
-		}
+}
+
+// IsClientCancel 判断错误是否由「下游客户端断开/取消」导致，而非上游故障。
+//
+// 网关把 r.Context() 一路传给上游调用，因此下游客户端主动断开（用户 Ctrl-C、
+// SDK 取消、中间反代超时切断）会让上游请求以 context.Canceled 收尾。这既不是
+// 端点故障、也不是请求内容问题：调用方应据此跳过端点熔断计数、终止重试循环
+//（父 ctx 已死，换叶子重试必然立刻再次取消），并把日志单独归类。
+func IsClientCancel(err error) bool {
+	if err == nil {
+		return false
 	}
-	return false
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	// 流式写 sink 失败（客户端已断开）同样归入此类。
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "client disconnected")
 }
 
 func truncate(b []byte, n int) string {
@@ -277,6 +325,95 @@ func useReasoningEffort(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return out, true
+}
+
+// NormalizeStreamFlag 把下游请求体里的 stream 字段归一为 JSON 布尔。
+//
+// 动机：wantsStream 用 `struct{ Stream bool }` 解码，字符串 "true"/"false" 会
+// 让解码整体失败并被静默当作非流式；此时请求走 prepareBody 原样透传，字符串
+// 就照发给上游，上游直接 4xx/5xx：
+//
+//	stream 必须是布尔值 / InvalidParameter: expected a boolean, but got "false"
+//	json: cannot unmarshal string into Go struct field ***.stream of type bool
+//
+// 归一后再判定流式，两条路径发出去的都是干净布尔。规则：
+//   - 已经是布尔 / 数字 0|1 → 原样；
+//   - 字符串可识别的真值/假值 → 改写为布尔；
+//   - 其它无法识别的字符串 → 删除该字段（字段缺失等价于默认非流式，语义不变
+//     且绝不会引发上游类型错误）；
+//   - 字段不存在 / 请求体非法 → 原样返回，不改写（保持字节透传语义）。
+func NormalizeStreamFlag(body []byte) ([]byte, bool) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return body, false
+	}
+	v, ok := raw["stream"]
+	if !ok {
+		return body, false
+	}
+	trimmed := bytes.TrimSpace(v)
+	if len(trimmed) == 0 {
+		return body, false
+	}
+
+	switch trimmed[0] {
+	case 't', 'f':
+		return body, false // 已是布尔字面量
+	}
+
+	normalized, replaced := normalizeStreamValue(trimmed)
+	if !replaced {
+		return body, false
+	}
+	if normalized == nil {
+		delete(raw, "stream") // 无法识别：删字段而非留脏值
+	} else {
+		raw["stream"] = normalized
+	}
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// normalizeStreamValue 归一单个 stream 取值。返回 (新值, 是否命中需要改写)；
+// 新值为 nil 表示应删除该字段。布尔字面量由调用方提前短路，这里只处理
+// 字符串与数字形态。
+func normalizeStreamValue(v []byte) (json.RawMessage, bool) {
+	// 数字：1/0（含 1.0/0.0）映射为布尔，其它数字视为无法识别 → 删除。
+	if c := v[0]; c == '-' || (c >= '0' && c <= '9') {
+		f, err := strconv.ParseFloat(string(v), 64)
+		if err != nil {
+			return nil, true
+		}
+		switch f {
+		case 0:
+			return json.RawMessage("false"), true
+		case 1:
+			return json.RawMessage("true"), true
+		default:
+			return nil, true
+		}
+	}
+
+	// 字符串：解出内容后按真值/假值表判定。
+	if v[0] == '"' {
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return nil, true
+		}
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "true", "1", "yes", "on", "enable", "enabled":
+			return json.RawMessage("true"), true
+		case "false", "0", "no", "off", "disable", "disabled", "":
+			return json.RawMessage("false"), true
+		}
+		return nil, true // 无法识别的字符串：删除字段
+	}
+
+	// null / 对象 / 数组等：删除字段（stream 无这些合法形态）。
+	return nil, true
 }
 
 // prepareStreamBody 在 prepareBody 基础上强制流式 + include_usage

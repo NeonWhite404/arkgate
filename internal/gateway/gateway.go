@@ -10,6 +10,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -135,12 +136,47 @@ func extractModel(body []byte) string {
 	return strings.TrimSpace(v.Model)
 }
 
+// wantsStream 判定下游是否请求流式。
+//
+// 不能直接用 `struct{ Stream bool }` 解码：字符串 "true"/"false" 会让整个解码
+// 失败并被静默当成非流式，随后请求体被原样透传给上游，触发上游的类型错误
+//（"stream 必须是布尔值"）。这里读 RawMessage 后宽容解析，与
+// provider.normalizeStreamFlag 的取值口径保持一致。
 func wantsStream(body []byte) bool {
 	var v struct {
-		Stream bool `json:"stream"`
+		Stream json.RawMessage `json:"stream"`
 	}
-	if json.Unmarshal(body, &v) == nil {
-		return v.Stream
+	if json.Unmarshal(body, &v) != nil || len(bytes.TrimSpace(v.Stream)) == 0 {
+		return false
+	}
+	return truthyJSON(v.Stream)
+}
+
+// truthyJSON 判定一个 JSON 标量是否表达「真」：布尔直接取值；数字非 0 为真；
+// 字符串按真值表判定（yes/on/enable 等常见写法）；其它一律为假。
+// 口径必须与 provider.normalizeStreamFlag 一致，否则会出现「判定为流式但归一
+// 成 false」这类自相矛盾的分流。
+func truthyJSON(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case 't':
+		return true // true
+	case 'f':
+		return false // false
+	}
+	var num float64
+	if json.Unmarshal(trimmed, &num) == nil {
+		return num != 0
+	}
+	var s string
+	if json.Unmarshal(trimmed, &s) == nil {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "true", "1", "yes", "on", "enable", "enabled":
+			return true
+		}
 	}
 	return false
 }
@@ -211,14 +247,35 @@ func (g *Gateway) applyRouter(name string, tokens int64, allowModels []string) (
 	return resolved, allowModels, nil
 }
 
+// upstreamCtx 返回用于上游调用的 context，直接透传下游的 ctx。
+//
+// 为什么不切断下游取消：曾尝试用 context.WithoutCancel 让非流式请求「即使下游
+// 断开也把上游跑完」，以避免丢掉用量/成本账，但实测发现代价更大——被断开的
+// 请求会一直持有叶节点的并发槽位（runtime.Concurrency）直到整体超时（默认
+// 300s）才释放。下游高频断开（移动端、Claude Code 重试）时会把 max_concurrency
+// 配额耗尽，直接影响正常请求。
+//
+// 现在的语义：下游断开 → 上游请求随之取消、槽位立即释放，错误由
+// provider.IsClientCancel 识别为「客户端侧」——不计端点熔断、不计入上游失败率、
+// 不白白重试。丢失的那部分用量本就属于「未完成即放弃」的请求，可接受。
+//
+// 注意：流式与非流式共用本函数，两端行为一致（下游断开即取消上游）。
+func upstreamCtx(r *http.Request) context.Context {
+	return r.Context()
+}
+
 // recordAttempt 结算一次尝试：叶节点熔断 + 统计 + 日志 + 释放并发 + 喂 TPM。
 // ip 为下游调用方地址（由各链路入口用 clientIP(r) 取一次后传入）。
 // firstTokenMs 为流式首字耗时（非流式/失败传 0）。
 func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
 	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time) {
 	ok := ferr == nil
-	// 客户端请求自身导致的失败（上下文超限等）：统计/日志照记，但不计入端点熔断。
-	clientErr := !ok && provider.IsRequestFault(ferr)
+	// 两类「不是端点故障」的失败都不计入熔断：
+	//   - clientErr：客户端请求自身问题（上下文超限、参数类型非法等）；
+	//   - cancelErr：下游客户端断开/取消导致的上游请求取消。
+	// 两者的区别只在日志标注上（便于分别统计），对熔断的影响一致。
+	clientErr := !ok && (provider.IsRequestFault(ferr) || provider.IsClientCancel(ferr))
+	cancelErr := !ok && provider.IsClientCancel(ferr)
 	l := &model.UsageLog{
 		TS:               time.Now().Unix(),
 		SubKeyID:         sk.ID,
@@ -243,9 +300,14 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 	if !ok {
 		l.Status = "error"
 		l.Error = errText(ferr)
-		if clientErr {
+		switch {
+		case cancelErr:
+			// 下游断连：既不是端点故障也不是请求内容问题，单独标注便于统计口径
+			// 把这类噪声从「上游失败率」里剔出去。
+			l.Error = "请求取消（下游断开）：" + l.Error
+		case clientErr:
 			// 标注请求方责任：日志页可直接过滤定位，且不计入端点熔断。
-			l.Error = "请求超限（客户端侧）：" + l.Error
+			l.Error = "请求非法（客户端侧）：" + l.Error
 		}
 	}
 	// 喂 TPM：计费单位与叶节点 tpm_limit 的语义一致——文本喂 token 数，
@@ -257,6 +319,16 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 	g.bal.TPMAdd(leaf, units)
 	g.bal.Record(l, leaf, ok, clientErr)
 	g.bal.Release(leaf)
+}
+
+// failAttempt 结算一次失败尝试，并返回是否应当「立即终止整个请求」。
+// 返回 true 表示错误由下游断开/取消引起：父 ctx 已死，换叶子重试必然立刻
+// 再次取消，因此不再进入下一轮 attempt，也不再把错误回写响应（客户端已走）。
+// 熔断计数已由 recordAttempt 内部按 clientCancel 排除。
+func (g *Gateway) failAttempt(sk *model.SubKey, ip string, leaf *model.Endpoint, ri routeInfo,
+	requestedModel, actualModel, modality string, pt, ct, images int64, ferr error, firstTokenMs int64, start time.Time) bool {
+	g.recordAttempt(sk, ip, leaf, ri, requestedModel, actualModel, modality, pt, ct, images, ferr, firstTokenMs, start)
+	return provider.IsClientCancel(ferr)
 }
 
 // chatOutputKeys / responsesOutputKeys 各端点中表达「输出上限」的请求字段。
@@ -338,6 +410,11 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
 		return
+	}
+	// stream 归一：下游可能把 stream 写成字符串（"false"），若直接透传会让上游
+	// 报类型错误。归一后再判定流式，两条路径发出的都是干净布尔。
+	if nb, changed := provider.NormalizeStreamFlag(body); changed {
+		body = nb
 	}
 
 	modelName := extractModel(body)
@@ -422,10 +499,10 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		var usage *provider.TextUsage
 		var ferr error
 		if g.bal.ModelProtocol(actualModel) == model.ModelProtocolAnthropic {
-			respBody, usage, ferr = g.mgr.AnthropicChat(r.Context(), ri.rt, body, leaf.EP,
+			respBody, usage, ferr = g.mgr.AnthropicChat(upstreamCtx(r), ri.rt, body, leaf.EP,
 				g.anthropicMaxTokens(body, actualModel), g.cfg.Timeouts.Request())
 		} else {
-			respBody, usage, ferr = g.mgr.Chat(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
+			respBody, usage, ferr = g.mgr.Chat(upstreamCtx(r), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		}
 		if ferr == nil {
 			var pt, ct int64
@@ -451,7 +528,9 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start)
+		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+			return // 下游已断开：换叶子重试无意义（父 ctx 已死）
+		}
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -476,6 +555,10 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
 		return
+	}
+	// stream 归一：同 chat（字符串型 stream 会被上游拒绝）。
+	if nb, changed := provider.NormalizeStreamFlag(body); changed {
+		body = nb
 	}
 	modelName := extractModel(body)
 	if modelName == "" {
@@ -547,7 +630,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Responses(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
+		respBody, usage, ferr := g.mgr.Responses(upstreamCtx(r), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		if ferr == nil {
 			var pt, ct int64
 			if usage != nil {
@@ -563,7 +646,9 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start)
+		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+			return // 下游已断开（见 chatNonStream 同款说明）
+		}
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -587,6 +672,10 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
 		return
+	}
+	// stream 归一：同 chat（图像接口也有流式 partial images 形态）。
+	if nb, changed := provider.NormalizeStreamFlag(body); changed {
+		body = nb
 	}
 	modelName := extractModel(body)
 	if modelName == "" {
@@ -643,7 +732,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 			continue
 		}
 
-		respBody, usage, ferr := g.mgr.Images(r.Context(), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
+		respBody, usage, ferr := g.mgr.Images(upstreamCtx(r), ri.rt, body, leaf.EP, g.cfg.Timeouts.Request())
 		if ferr == nil {
 			var images int64
 			var pt, ct int64
@@ -661,7 +750,9 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, 0, start)
+		if g.failAttempt(sk, ip, leaf, ri, modelName, actualModel, model.ModelTypeImage, pt, ct, 0, ferr, 0, start) {
+			return // 下游已断开
+		}
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -737,7 +828,11 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", oerr.Error()))
 				return
 			}
-			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start)
+			// 首 token 前打开失败：换叶子重试（此时尚未向客户端写过任何字节）。
+			// 若失败源于下游断开，重试必然立即再次取消，直接收尾。
+			if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start) {
+				return
+			}
 			exclude[leaf.ID] = true
 			lastErr = oerr
 			continue
@@ -777,6 +872,8 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 				writeSSEError(w, perr, api)
 			}
 		}
+		// 流已开始，无法更改状态码；用 SSE error 帧收尾。流中失败若源于下游断开，
+		// 写错误帧同样会失败（客户端已走），但记账口径一致：不计熔断、单独归类。
 		g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, pt, ct, images, perr, firstTokenMs, start)
 		return
 	}

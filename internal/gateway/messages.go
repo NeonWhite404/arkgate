@@ -91,6 +91,11 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "读取请求体失败"))
 		return
 	}
+	// stream 归一：Anthropic 客户端也可能会发字符串型 stream；归一后无论走
+	// 原生透传还是 OpenAI 转换桥，发出的 stream 都是合法布尔。
+	if nb, changed := provider.NormalizeStreamFlag(body); changed {
+		body = nb
+	}
 	// Anthropic 协议必填字段：model / max_tokens（缺失时按 Anthropic 语义 400）。
 	modelName := extractModel(body)
 	if modelName == "" {
@@ -98,8 +103,8 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var probe struct {
-		MaxTokens *int64 `json:"max_tokens"`
-		Stream    bool   `json:"stream"`
+		MaxTokens *int64          `json:"max_tokens"`
+		Stream    json.RawMessage `json:"stream"`
 	}
 	if json.Unmarshal(body, &probe) != nil {
 		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "请求体不是合法的 JSON"))
@@ -128,7 +133,7 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	st := &messagesEntryState{origName: origName, selName: selName,
 		allowModels: allowModels, body: body}
-	if probe.Stream {
+	if wantsStream(body) {
 		g.messagesStreamForward(w, r, sk, st)
 		return
 	}
@@ -170,7 +175,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 		var ferr error
 		if g.bal.ModelProtocol(actualModel) == model.ModelProtocolAnthropic {
 			// 原生透传：请求体仅替换 model，响应/错误原样（Anthropic 形状）。
-			respBody, usage, ferr = g.mgr.AnthropicNativeChat(r.Context(), ri.rt, st.body, leaf.EP, g.cfg.Timeouts.Request())
+			respBody, usage, ferr = g.mgr.AnthropicNativeChat(upstreamCtx(r), ri.rt, st.body, leaf.EP, g.cfg.Timeouts.Request())
 		} else {
 			if convertedBody == nil {
 				convertedBody, ferr = provider.OpenAIRequestFromAnthropic(st.body)
@@ -180,7 +185,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 					return
 				}
 			}
-			respBody, usage, ferr = g.mgr.Chat(r.Context(), ri.rt, convertedBody, leaf.EP, g.cfg.Timeouts.Request())
+			respBody, usage, ferr = g.mgr.Chat(upstreamCtx(r), ri.rt, convertedBody, leaf.EP, g.cfg.Timeouts.Request())
 			if ferr == nil {
 				// 响应反向转换：OpenAI chat.completion → Anthropic message。
 				respBody, usage, ferr = provider.AnthropicResponseFromOpenAI(respBody, actualModel)
@@ -201,7 +206,9 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
 		}
-		g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start)
+		if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start) {
+			return // 下游已断开：换叶子重试无意义（父 ctx 已死）
+		}
 		exclude[leaf.ID] = true
 		lastErr = ferr
 	}
@@ -267,7 +274,10 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 				writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", oerr.Error()))
 				return
 			}
-			g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start)
+			// 首字节前打开失败：换叶子重试；下游断开则直接收尾。
+			if g.failAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start) {
+				return
+			}
 			exclude[leaf.ID] = true
 			lastErr = oerr
 			continue
