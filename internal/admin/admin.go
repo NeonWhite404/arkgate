@@ -149,8 +149,60 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/overview", a.handleOverview)
 	reg("/api/usage/series", a.handleUsageSeries)
 	reg("/api/usage/stats", a.handleUsageStats)
+	reg("/api/usage/rollup", a.handleUsageRollup)
+	reg("/api/usage/rollup/rebuild", a.handleUsageRollupRebuild)
 
 	return mux
+}
+
+// handleUsageRollup 预聚合健康度（watermark / 滞后秒数 / 聚合表行数）。
+// 供管理端展示「统计延迟」——滞后持续变大说明聚合器卡住，但查询仍会回落原始表。
+func (a *Admin) handleUsageRollup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	h, err := a.store.RollupHealthReport(time.Now().Unix())
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, h)
+}
+
+// handleUsageRollupRebuild 在指定区间重算预聚合（修复/回填）。
+//
+// 用途：改价后重算成本、时区修正、或发现口径问题后重建。**不推进水位**——
+// 重建历史不应影响实时聚合进度。
+//
+// 参数：from/to 为 unix 秒（省略时默认最近 7 天）。区间上限沿用查询上限（92 天），
+// 避免一次请求把整库拖死（SQLite 单写者，长事务会阻塞转发热路径的统计落库）。
+func (a *Admin) handleUsageRollupRebuild(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	qv := r.URL.Query()
+	from, _ := strconv.ParseInt(qv.Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(qv.Get("to"), 10, 64)
+	now := time.Now().Unix()
+	if to <= 0 || to > now {
+		to = now
+	}
+	if from <= 0 || from >= to {
+		from = to - 7*86400
+	}
+	const maxSpan = 92 * 86400
+	if to-from > maxSpan {
+		writeJSON(w, 400, map[string]any{"detail": "区间过大（上限 92 天）"})
+		return
+	}
+	rows, err := a.store.RebuildRollup(from, to)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"success": true, "rows": rows, "from": from, "to": to})
 }
 
 // handleUsageStats 交互式用量分析查询：区间 + 粒度（day/hour）+ 维度（模型/子Key/

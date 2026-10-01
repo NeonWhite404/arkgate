@@ -27,6 +27,7 @@ import (
 	"arkgate/internal/model"
 	"arkgate/internal/portal"
 	"arkgate/internal/provider"
+	"arkgate/internal/rollup"
 	"arkgate/internal/secure"
 	"arkgate/internal/store"
 	"arkgate/internal/upstreamcheck"
@@ -61,6 +62,12 @@ func main() {
 	// 先停检查器再走 bal.Close / st.Close：检查器在途的上游请求会因取消及时终止，
 	// 且不再写库，保证存储关闭前无残留访问。
 	defer checker.Stop()
+
+	// 用量分析预聚合：周期把原始日志滚动聚合进小时/天表，让历史区间查询不必扫全表。
+	// 与 upstreamcheck 同样先于存储关闭停止，避免关闭后仍写库。
+	ru := rollup.New(st, rollup.DefaultInterval)
+	ru.Start()
+	defer ru.Stop()
 
 	gw := gateway.New(cfg, st, box, bal)
 	adm := admin.New(st, box, bal, cfg)

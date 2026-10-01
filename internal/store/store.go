@@ -180,6 +180,70 @@ func (s *Store) migrate() error {
 			requests INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (day, subkey_id)
 		)`,
+		// ────────── v13：用量分析预聚合（rollup） ──────────
+		// 设计要点（对标 sub2api 的 hourly/daily 两级聚合，但适配 SQLite 单文件）：
+		//   - 用 (dim_kind, dim_key) 单表覆盖全部维度，而非每个维度建一张表；
+		//     ArkGate 的分析维度是固定枚举（model/subkey/account/endpoint/provider），
+		//     单表避免表爆炸，dim_kind 上的索引已足够。
+		//   - dim_kind='' AND dim_key='' 是「全局合计」行，服务不带实体的总量/趋势。
+		//   - 小时表用 bucket_start（UTC 整点）；天表用本地日期字符串 + tz，
+		//     因本地日不是固定 86400 秒（DST），不能由小时表可靠地重算。
+		//   - 幂等 upsert：重复聚合同一区间结果一致，可安全重放与回填。
+		`CREATE TABLE IF NOT EXISTS usage_rollup_hourly (
+			bucket_start INTEGER NOT NULL,
+			dim_kind TEXT NOT NULL DEFAULT '',
+			dim_key TEXT NOT NULL DEFAULT '',
+			requests INTEGER NOT NULL DEFAULT 0,
+			success INTEGER NOT NULL DEFAULT 0,
+			upstream_errors INTEGER NOT NULL DEFAULT 0,
+			client_errors INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			images INTEGER NOT NULL DEFAULT 0,
+			cost REAL NOT NULL DEFAULT 0,
+			input_cost REAL NOT NULL DEFAULT 0,
+			output_cost REAL NOT NULL DEFAULT 0,
+			cache_cost REAL NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			stream_requests INTEGER NOT NULL DEFAULT 0,
+			first_token_ms_sum INTEGER NOT NULL DEFAULT 0,
+			latency_ms_sum INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_start, dim_kind, dim_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rollup_hourly_kind ON usage_rollup_hourly(dim_kind, bucket_start)`,
+		`CREATE TABLE IF NOT EXISTS usage_rollup_daily (
+			bucket_date TEXT NOT NULL,
+			dim_kind TEXT NOT NULL DEFAULT '',
+			dim_key TEXT NOT NULL DEFAULT '',
+			requests INTEGER NOT NULL DEFAULT 0,
+			success INTEGER NOT NULL DEFAULT 0,
+			upstream_errors INTEGER NOT NULL DEFAULT 0,
+			client_errors INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			images INTEGER NOT NULL DEFAULT 0,
+			cost REAL NOT NULL DEFAULT 0,
+			input_cost REAL NOT NULL DEFAULT 0,
+			output_cost REAL NOT NULL DEFAULT 0,
+			cache_cost REAL NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			stream_requests INTEGER NOT NULL DEFAULT 0,
+			first_token_ms_sum INTEGER NOT NULL DEFAULT 0,
+			latency_ms_sum INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_date, dim_kind, dim_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rollup_daily_kind ON usage_rollup_daily(dim_kind, bucket_date)`,
+		// 水位表：单行（id=1）记录「已聚合到哪个时间点」。
+		// watermark 只在水位行与聚合数据都写成功后才推进（见 store.AdvanceRollup）。
+		`CREATE TABLE IF NOT EXISTS usage_rollup_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			watermark_ts INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 	for _, st := range stmts {
 		if _, err := s.db.Exec(st); err != nil {
@@ -1571,9 +1635,28 @@ func usageBucketExpr(gran string, from, to int64, loc *time.Location) string {
 	return sb.String()
 }
 
-// QueryUsage 聚合 usage_logs 返回总量、按时间粒度的时序，以及维度实体小计。
-// 结果三部分共用同一 WHERE（区间 + 可选实体过滤），前端据此做交互式下钻。
+// QueryUsage 聚合用量数据，返回总量、按时间粒度的时序、维度实体小计与错误分布。
+//
+// 路由策略（预聚合优先、原始表兜底）：
+//   - 区间已被 rollup 水位完全覆盖 → 走预聚合表（快）；
+//   - 否则（含刚发生的实时数据、未覆盖维度、水位未建立）→ 回落原始表（准）。
+//
+// 无论走哪条路径，**口径必须一致**（同样的成功/上游错误/成本拆分定义），否则同一批
+// 数据会出现两种答案。两条路径的口径由测试 TestRollupMatchesRaw 逐字段比对锁定。
 func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
+	q = normalizeUsageQuery(q)
+	if s.rollupCovers(q) {
+		if res, err := s.queryUsageFromRollup(q); err == nil {
+			return res, nil
+		}
+		// 预聚合出错不向调用方暴露：静默回落原始表，保证查询永远可用。
+	}
+	return s.queryUsageRaw(q)
+}
+
+// normalizeUsageQuery 收敛查询参数（区间、粒度、维度），供两条路径共用，
+// 避免「路由判断用了一套参数、真正执行用另一套」导致 rollupCovers 误判。
+func normalizeUsageQuery(q UsageQuery) UsageQuery {
 	now := nowUnix()
 	if q.To <= 0 || q.To > now {
 		q.To = now
@@ -1587,10 +1670,15 @@ func (s *Store) QueryUsage(q UsageQuery) (*UsageQueryResult, error) {
 	if q.Granularity != "hour" && q.Granularity != "day" {
 		q.Granularity = "day"
 	}
-	dim, dimOK := usageDims[q.Dim]
-	if !dimOK {
+	if _, ok := usageDims[q.Dim]; !ok {
 		q.Dim, q.Entity = "", ""
 	}
+	return q
+}
+
+// queryUsageRaw 实时聚合 usage_logs（原始表路径，也是语义基准）。
+func (s *Store) queryUsageRaw(q UsageQuery) (*UsageQueryResult, error) {
+	dim, dimOK := usageDims[q.Dim]
 
 	// 右开区间 [from, to)：闭区间会让相邻两次查询把边界那一秒重复计入，
 	// 前端翻页/切换区间时会看到总量对不上。
