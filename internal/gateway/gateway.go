@@ -570,6 +570,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 			var pt, ct int64
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
+				meta.cacheCreation, meta.cacheRead = usage.CacheCreationTokens, usage.CacheReadTokens
 			}
 			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start, meta)
 			// 透传上游真实状态码与 body。
@@ -589,6 +590,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		var pt, ct int64
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
+			meta.cacheCreation, meta.cacheRead = usage.CacheCreationTokens, usage.CacheReadTokens
 		}
 		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开：换叶子重试无意义（父 ctx 已死）
@@ -698,6 +700,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 			var pt, ct int64
 			if usage != nil {
 				pt, ct = usage.PromptTokens, usage.CompletionTokens
+				meta.cacheCreation, meta.cacheRead = usage.CacheCreationTokens, usage.CacheReadTokens
 			}
 			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, nil, 0, start, meta)
 			w.Header().Set("Content-Type", "application/json")
@@ -708,6 +711,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 		var pt, ct int64
 		if usage != nil {
 			pt, ct = usage.PromptTokens, usage.CompletionTokens
+			meta.cacheCreation, meta.cacheRead = usage.CacheCreationTokens, usage.CacheReadTokens
 		}
 		if g.failAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, pt, ct, 0, ferr, 0, start, meta) {
 			return // 下游已断开（见 chatNonStream 同款说明）

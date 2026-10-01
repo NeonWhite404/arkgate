@@ -297,3 +297,62 @@ func TestPrepareBodyStillPassesThroughUnknownFields(t *testing.T) {
 }
 
 var _ = http.MethodPost
+
+// TestExtractChatUsageCacheTokens 锁定缓存 token 抽取：OpenAI 走
+// prompt_tokens_details.cached_tokens，Anthropic 风格走 cache_* 顶层字段，
+// 两者都要能识别，且 prompt/completion 不受影响。
+//
+// 回归背景：缓存字段曾只接在流式路径上，非流式响应里的 cached_tokens 被丢弃，
+// 导致缓存命中率恒为 0（假指标比没有指标更糟）。
+func TestExtractChatUsageCacheTokens(t *testing.T) {
+	cases := []struct {
+		name         string
+		body         string
+		wantPt, wantCt int64
+		wantCreate, wantRead int64
+	}{
+		{
+			name: "OpenAI prompt_tokens_details.cached_tokens",
+			body: `{"usage":{"prompt_tokens":1000,"completion_tokens":200,
+			        "prompt_tokens_details":{"cached_tokens":800}}}`,
+			wantPt: 1000, wantCt: 200, wantRead: 800,
+		},
+		{
+			name: "Anthropic 风格顶层 cache 字段",
+			body: `{"usage":{"prompt_tokens":1000,"completion_tokens":200,
+			        "cache_creation_input_tokens":300,"cache_read_input_tokens":500}}`,
+			wantPt: 1000, wantCt: 200, wantCreate: 300, wantRead: 500,
+		},
+		{
+			name: "无缓存字段（旧上游）",
+			body: `{"usage":{"prompt_tokens":10,"completion_tokens":5}}`,
+			wantPt: 10, wantCt: 5,
+		},
+		{
+			name: "cached_tokens=0 不应覆盖已有的 cache_read",
+			body: `{"usage":{"prompt_tokens":10,"completion_tokens":5,
+			        "cache_read_input_tokens":7,"prompt_tokens_details":{"cached_tokens":0}}}`,
+			wantPt: 10, wantCt: 5, wantRead: 7,
+		},
+		{
+			name: "无 usage",
+			body: `{"choices":[]}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			u := ExtractChatUsage([]byte(c.body))
+			if u == nil {
+				t.Fatal("nil usage")
+			}
+			if u.PromptTokens != c.wantPt || u.CompletionTokens != c.wantCt {
+				t.Fatalf("prompt/completion = %d/%d, want %d/%d",
+					u.PromptTokens, u.CompletionTokens, c.wantPt, c.wantCt)
+			}
+			if u.CacheCreationTokens != c.wantCreate || u.CacheReadTokens != c.wantRead {
+				t.Fatalf("cache = create %d read %d, want create %d read %d",
+					u.CacheCreationTokens, u.CacheReadTokens, c.wantCreate, c.wantRead)
+			}
+		})
+	}
+}
