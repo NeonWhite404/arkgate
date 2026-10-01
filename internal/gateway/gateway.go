@@ -467,9 +467,8 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
+	body, ok := readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	// stream 归一：下游可能把 stream 写成字符串（"false"），若直接透传会让上游
@@ -615,9 +614,8 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
+	body, ok := readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	// stream 归一：同 chat（字符串型 stream 会被上游拒绝）。
@@ -735,9 +733,8 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
+	body, ok := readBodyOrFail(w, r)
+	if !ok {
 		return
 	}
 	// stream 归一：同 chat（图像接口也有流式 partial images 形态）。
@@ -1100,6 +1097,54 @@ func writeSSEError(w http.ResponseWriter, err error, api balancer.API) {
 }
 
 // ─────────────────────────── 工具 ───────────────────────────
+
+// maxRequestBody 下游请求体的上限。
+//
+// 为什么需要：原先 5 处入口都是裸 io.ReadAll(r.Body)——单个客户端只要发一个超大
+// 请求体（或慢速持续发送）就能把网关内存吃光，而网关是整个集群的单点。这是最容易
+// 被利用、也最容易忽视的一类问题（不需要任何凭据即可触发）。
+//
+// 取 64MB：多模态请求会把图片 base64 编进 body（base64 后约 +33%），实际业务里
+// 几 MB 已算很大；64MB 给足了余量，同时把「无限」变成「有界」。
+// 超限返回 413（语义正确：请求体过大，重试无用），而不是静默截断——截断会让
+// JSON 解析失败并报成「请求格式错误」，把真正的原因盖掉。
+const maxRequestBody = 64 << 20
+
+// errRequestBodyTooLarge 供调用方区分「超限」与「读取失败」。
+var errRequestBodyTooLarge = errors.New("请求体超过上限")
+
+// readBody 读取请求体并施加大小上限。
+//
+// 用 MaxBytesReader 而不是 LimitReader：它会同时**关闭连接**并让后续读取立即失败，
+// 从而既限制了内存，也阻止客户端继续慢速灌数据（LimitReader 只截断，连接照旧被占）。
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return nil, errRequestBodyTooLarge
+		}
+		return nil, err
+	}
+	return body, nil
+}
+
+// readBodyOrFail 读取并直接写出错误响应；返回 ok=false 时调用方应立即 return。
+// 统一 5 处入口的报错口径，避免各写各的（有的报「读取失败」有的报 400）。
+func readBodyOrFail(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := readBody(w, r)
+	if err == nil {
+		return body, true
+	}
+	if errors.Is(err, errRequestBodyTooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, errBody("invalid_request_error",
+			"请求体过大：上限 64MB"))
+		return nil, false
+	}
+	writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "读取请求体失败"))
+	return nil, false
+}
 
 func errBody(typ, msg string) map[string]any {
 	return map[string]any{"error": map[string]any{"type": typ, "message": msg, "code": nil}}

@@ -13,7 +13,6 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"time"
 
@@ -86,9 +85,11 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, errBodyAnthropic("authentication_error", err.Error()))
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "读取请求体失败"))
+	// 与 /v1 其它入口共用限长读取；Anthropic 入站需用 Anthropic 错误信封回错。
+	body, berr := readBody(w, r)
+	if berr != nil {
+		writeJSON(w, anthropicBodyErrCode(berr), errBodyAnthropic("invalid_request_error",
+			anthropicBodyErrMsg(berr)))
 		return
 	}
 	// stream 归一：Anthropic 客户端也可能会发字符串型 stream；归一后无论走
@@ -325,9 +326,11 @@ func (g *Gateway) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusUnauthorized, errBodyAnthropic("authentication_error", err.Error()))
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "读取请求体失败"))
+	// 与 /v1 其它入口共用限长读取；Anthropic 入站需用 Anthropic 错误信封回错。
+	body, berr := readBody(w, r)
+	if berr != nil {
+		writeJSON(w, anthropicBodyErrCode(berr), errBodyAnthropic("invalid_request_error",
+			anthropicBodyErrMsg(berr)))
 		return
 	}
 	modelName := extractModel(body)
@@ -340,4 +343,21 @@ func (g *Gateway) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": estimateAnthropicInputTokens(body)})
+}
+
+// anthropicBodyErrCode 请求体读取失败的 HTTP 状态码。
+// 超限用 413（语义正确：重试无用），其它读取失败用 400。
+func anthropicBodyErrCode(err error) int {
+	if errors.Is(err, errRequestBodyTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+// anthropicBodyErrMsg 请求体读取失败的文案（与 OpenAI 入口保持同样的信息量）。
+func anthropicBodyErrMsg(err error) string {
+	if errors.Is(err, errRequestBodyTooLarge) {
+		return "请求体过大：上限 64MB"
+	}
+	return "读取请求体失败"
 }
