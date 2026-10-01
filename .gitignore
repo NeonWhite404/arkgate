@@ -1,6 +1,9 @@
 # 构建产物
 arkgate
 arkgate.exe
+arkgate-*.exe
+arkgate-*.exe~
+*.exe~
 
 # 运行时数据
 arkgate.db
