@@ -79,7 +79,11 @@ type Balancer struct {
 
 	logCh  chan *model.UsageLog
 	statCh chan statOp
-	done   chan struct{}
+	// 通道満导致的同步落库次数（atomic 自增：Record 在并发请求路径上）。
+	// 非零即「落库跟不上」的信号，供管理端观测。
+	statsOverflow atomic.Int64
+	logsOverflow  atomic.Int64
+	done          chan struct{}
 	wg     sync.WaitGroup
 	store  *store.Store
 	once   sync.Once
@@ -96,6 +100,18 @@ type sessEntry struct {
 	endpointID string
 	ts         time.Time
 }
+
+// statChCap / logChCap 统计通道容量。
+//
+// 2024 设计回顾：原先通道满时会在 HTTP 请求路径上**永久阻寨**（阻塞投递）。
+// 后果是「一个卡住的数据库写入会把响应拖延」——但此时客户端的回复已经发出、
+// 上游已经计费，阻塞只会把可观测故障放大成全线拖慢（实测：把 consume 停掉后
+// Record 在第 4097 次调用上永久挂住）。改成「优先入队，满则直接同步落库」，
+// 既不丢数据也不阻寨转发。
+const (
+	statChCap = 4096
+	logChCap  = 4096
+)
 
 type statOp struct {
 	accountID  string
@@ -121,8 +137,8 @@ func New(st *store.Store, sessionTTL time.Duration) *Balancer {
 		wrrState:   map[string]*wrrState{},
 		sessions:   map[string]sessEntry{},
 		sessionTTL: sessionTTL,
-		logCh:      make(chan *model.UsageLog, 4096),
-		statCh:     make(chan statOp, 4096),
+		logCh:      make(chan *model.UsageLog, logChCap),
+		statCh:     make(chan statOp, statChCap),
 		done:       make(chan struct{}),
 		store:      st,
 	}
@@ -156,6 +172,11 @@ func (b *Balancer) consume() {
 }
 
 func (b *Balancer) applyStat(op statOp) {
+	if b.store == nil {
+		// 无 store（单测构造）：只同步内存副本，不碰数据库。
+		b.accumulateInMemory(op)
+		return
+	}
 	if op.endpointID != "" {
 		_ = b.store.AccumulateEndpoint(op.endpointID, op.ok, op.prompt, op.completion)
 	}
@@ -847,13 +868,57 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr b
 	op.cost = b.computeCost(l.Model, l.PromptTokens, l.CompletionTokens, l.ImageCount)
 	l.Cost = op.cost
 	l.InputCost, l.OutputCost, l.CacheCost = b.splitCost(l.Model, l)
-	// 阻塞投递，保证不丢。
+	b.enqueueStat(op, l)
+}
+
+// enqueueStat 投递一次统计：优先入队（不阻塞）；通道满时**在调用方同步落库**。
+//
+// 为什么不阻塞入队：Record 在 HTTP 请求路径上。阻塞意味着「数据库写不动」
+// 会反过来拖死转发（客户端已在等响应），把一个可观测的存储问题放大成全线故障。
+// 为什么不丢弃：统计是计费与限额的依据，丢了就是少计费/超发额度。
+//
+// 退化成同步写是安全的选择：此时转发确实变慢，但数据不丢、故障仍然可见。
+//
+// 注意顺序：先写 stat 再写 log。stat 供实时聚合/日用量（限流依据），必须先落地。
+func (b *Balancer) enqueueStat(op statOp, l *model.UsageLog) {
 	if b.statCh != nil {
-		b.statCh <- op
+		select {
+		case b.statCh <- op:
+			b.enqueueLog(l)
+			return
+		default:
+		}
 	}
-	if b.logCh != nil {
-		b.logCh <- l
+	// 通道已满（或未初始化）：同步落库，不再入队以免重复计数。
+	b.statsOverflow.Add(1)
+	b.applyStat(op)
+	b.enqueueLogForce(l)
+}
+
+// enqueueLog 投递日志：同样不阻塞。満时同步写入。
+func (b *Balancer) enqueueLog(l *model.UsageLog) {
+	if b.logCh == nil {
+		return
 	}
+	select {
+	case b.logCh <- l:
+	default:
+		b.enqueueLogForce(l)
+	}
+}
+
+// enqueueLogForce 同步写日志（通道満或未初始化）。
+func (b *Balancer) enqueueLogForce(l *model.UsageLog) {
+	b.logsOverflow.Add(1)
+	if b.store != nil {
+		_ = b.store.AddUsageLog(l)
+	}
+}
+
+// StatsOverflow 返回因通道満而退化为同步写库的次数（stat, log）。
+// 非零本身就是信号：说明落库速度跟不上请求速度，或者 consume 卡住了。
+func (b *Balancer) StatsOverflow() (stats, logs int64) {
+	return b.statsOverflow.Load(), b.logsOverflow.Load()
 }
 
 // computeCost 按模型定价折算一次请求的成本：

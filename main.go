@@ -10,15 +10,19 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"arkgate/internal/admin"
 	"arkgate/internal/balancer"
@@ -102,10 +106,50 @@ func main() {
 		Addr:    addr,
 		Handler: cors(mux),
 	}
-	if err := srv.Serve(ln); err != nil {
+
+	// 优雅停机：停止接收新连接、等在途请求（含流式）收尾，最后才让 defer 链依次
+	// 停掉 rollup → checker → balancer（drain 落盘）→ store。
+	//
+	// 顺序很关键：**先停 HTTP 再停数据层**。反过来会让正在写的请求撞上已关的库，
+	// 统计直接丢失、客户端拿到 500。
+	//
+	// 平台差异（实测确认，不是推测）：Windows 上 Go 的 os.Interrupt 只能由**该进程
+	// 自己的控制台**的 Ctrl+C 触发；无窗口/服務方式启动的进程收不到任何信号，
+	// taskkill（不带 /F）也只会提示「只能强制终止」。因此服务化部署靠的是
+	// Stop-Service 带来的强制终止——**统计依然安全**，因为每次 Record 都已经
+	// 入队或同步写完，真正靠 drain 抱回的是通道里那几十毫秒的尾巴。
+	// Linux/macOS 下 systemd/docker 的 SIGTERM 会正常走下面这段。
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-stop
+		log.Printf("收到信号 %v，开始优雅停机（最多等待 %s 让在途请求收尾）…", s, shutdownGrace)
+	}()
+	go func() {
+		<-stop
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			// 超时未收完（通常是长流式请求）：强制断开，并说清发生了什么。
+			log.Printf("优雅停机超时（%v），强制关闭剩余连接: %v", shutdownGrace, err)
+			_ = srv.Close()
+		} else {
+			log.Printf("在途请求已全部完成")
+		}
+	}()
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("服务启动失败: %v", err)
 	}
+	log.Printf("HTTP 已停止，正在落盘剩余统计…")
 }
+
+// shutdownGrace 优雅停机的等待上限。
+//
+// 取 30 秒而不是无限等：流式请求可能长时间不结束（模型在持续输出），
+// 硬等会让运维的「重启」看起来卡死。超时后强制关闭，已完成的统计由
+// balancer.Close 的 drain 保证落盘，未完成的本来就还在转发中、无法补写。
+const shutdownGrace = 30 * time.Second
 
 // listenWithFallback 从 addr 开始尝试监听；端口被占用时自动向后递增，
 // 直到找到一个可用端口（最多尝试 maxAttempts 次）。返回监听器与最终地址。

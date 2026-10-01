@@ -7,6 +7,7 @@ import (
 
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
+	"arkgate/internal/store"
 )
 
 // newTestBalancer 构造一个不走真实 store 的 Balancer（不启动 consumer）。
@@ -706,5 +707,162 @@ func TestAnthropicProtocolFiltering(t *testing.T) {
 	ep, name, err := b.SelectWithFallback("gpt", nil, nil, nil, APIResponses, "")
 	if err != nil || name != "gpt" || ep.ID != "e2" {
 		t.Fatalf("fallback must skip anthropic target for responses, got (%v, %q, %v)", ep, name, err)
+	}
+}
+
+// ── 统计投递不得阻塞请求路径 ──
+//
+// 历史缺陷：Record 用阻塞投递（`b.statCh <- op`）。通道只有 4096 缓冲，一旦
+// consume 停摆（例如 SQLite 写锁被长事务占住、磁盘打满），第 4097 次 Record 会
+// **永久挂住**。而 Record 在 HTTP 请求路径上——此时客户端回复已发出、上游已计费，
+// 阻塞只是把一个可观测的存储问题放大成全线拖慢。
+//
+// 现在语义：优先入队；满则同步落库（不丢数据，也不阻塞）。下面两条测试分别锁
+// 「不阻塞」与「不丢数据」——少任何一条都能把缺陷改回去而测试全绿。
+func newStoreBalancer(t *testing.T) (*Balancer, *store.Store) {
+	t.Helper()
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	return New(st, 0), st
+}
+
+// TestRecordDoesNotBlockWhenConsumerStalled 消费者停摆时 Record 必须立即返回。
+//
+// 注意测试构造：这里把 statCh 填满后**直接把 store 换成一个不会阻塞的**，
+// 以便把「通道不阻塞」与「落库会阻塞」两件事分开验证。真实环境下同步落库确实
+// 可能变慢（DB 卡住），那是存储层的故障且必然可见；但**通道本身不得成为阻塞源**
+// ——否则一次消费抖动会让请求在 4096 之后永久排队。
+func TestRecordDoesNotBlockWhenConsumerStalled(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	b := &Balancer{
+		accounts: map[string]*model.Account{}, models: map[string]*model.Model{},
+		endpoints: map[string]*model.Endpoint{}, modelApps: map[string][]*model.Endpoint{},
+		defs: map[string]provider.Def{}, prices: map[string][3]float64{},
+		wrrState: map[string]*wrrState{}, sessions: map[string]sessEntry{},
+		logCh: make(chan *model.UsageLog, logChCap),
+		// 故意留 nil store：溢出路径不会真的写库，从而只测「通道是否阻塞」。
+		statCh: make(chan statOp, statChCap),
+		done:   make(chan struct{}),
+	}
+	for i := 0; i < statChCap; i++ {
+		b.statCh <- statOp{} // 填满，迫使后续走溢出分支
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < statChCap+1000; i++ {
+			b.Record(&model.UsageLog{Model: "m"}, nil, true, false)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Record 在通道満时阻塞了——请求路径不得被统计管道拖住")
+	}
+	if s, _ := b.StatsOverflow(); s == 0 {
+		t.Fatal("应记录溢出次数，否则运维无从发现落库跟不上")
+	}
+}
+
+// TestStatChannelNeverBlocks 直接把通道填满后继续入队，验证不会挂住。
+// 这是上面那条的纯通道版本（不依赖 store），锁定「入队非阻塞」本身。
+func TestStatChannelNeverBlocks(t *testing.T) {
+	b := &Balancer{
+		statCh: make(chan statOp, statChCap), logCh: make(chan *model.UsageLog, logChCap),
+		done: make(chan struct{}),
+	}
+	for i := 0; i < statChCap; i++ {
+		b.statCh <- statOp{}
+	}
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 5000; i++ {
+			b.enqueueStat(statOp{}, &model.UsageLog{Model: "m"})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("enqueueStat 在通道満时阻塞")
+	}
+}
+
+// TestRecordStatsNotLostOnOverflow 通道満而退化同步写时，数据必须完整落库。
+// 这是「不阻塞」的配套约束：宁可慢，不能丢。
+func TestRecordStatsNotLostOnOverflow(t *testing.T) {
+	b, st := newStoreBalancer(t)
+	defer st.Close()
+
+	// 造一个真实可累计的账号/叶子，验证溢出路径真的写进库了。
+	acc := &model.Account{ID: "acc_1", Name: "a1", Provider: "openai", Status: "active", Weight: 1}
+	if err := st.UpsertAccount(acc); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	b.Refresh()
+
+	// 停掉消费者，让后续投递全部走溢出（同步落库）分支。
+	b.Close()
+	for i := 0; i < statChCap; i++ {
+		b.statCh <- statOp{} // 填满，确保新投递必然溢出
+	}
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		l := &model.UsageLog{
+			Model: "m", AccountID: "acc_1", SubKeyID: "sk_1",
+			PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15, Status: "ok",
+		}
+		b.Record(l, nil, true, false)
+	}
+
+	// 日志：溢出路径应同步写入 n 条（前面填通道的是空 op，不产生日志）。
+	_, total, err := st.QueryUsageLogs(store.LogFilter{}, 1000, 0)
+	if err != nil {
+		t.Fatalf("query logs: %v", err)
+	}
+	if total != n {
+		t.Fatalf("溢出路径应完整落库 %d 条日志, got %d（丢数据 = 少计费）", n, total)
+	}
+	// 账号统计：也应累计 n 次。
+	got, err := st.GetAccount("acc_1")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if got.TotalRequests != n {
+		t.Fatalf("溢出路径应累计 %d 次请求, got %d", n, got.TotalRequests)
+	}
+}
+
+// TestCloseDrainsPendingStats 关闭时必须把已入队的数据全部落盘（优雅收尾）。
+func TestCloseDrainsPendingStats(t *testing.T) {
+	b, st := newStoreBalancer(t)
+	defer st.Close()
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		l := &model.UsageLog{
+			Model: "m", SubKeyID: "sk_1", PromptTokens: 3, CompletionTokens: 1,
+			TotalTokens: 4, Status: "ok",
+		}
+		b.Record(l, nil, true, false)
+	}
+	b.Close() // 应 drain 后返回
+
+	_, total, err := st.QueryUsageLogs(store.LogFilter{}, 1000, 0)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != n {
+		t.Fatalf("Close 后应落盘全部 %d 条, got %d", n, total)
 	}
 }
