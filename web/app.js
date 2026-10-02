@@ -1127,6 +1127,13 @@ const UsagePage = {
       loading: false,
       // 展示开关：默认折叠细节（统计卡与分项表），避免首屏过载。
       showDetail: false,
+      // 历史成本重算（v14 缓存计费修正后的回填）。分两步：先 dry-run 看影响面，
+      // 再由用户确认写入——因为重算会改变已出账的数字，不该一键直接落库。
+      bfOpen: false,
+      bfBusy: false,
+      bfPreview: null,
+      bfResult: null,
+      bfErr: "",
     };
   },
   computed: {
@@ -1217,6 +1224,30 @@ const UsagePage = {
         .finally(() => { this.loading = false; });
     },
     onDimChange() { this.entity = ""; this.load(); },
+    // ── 历史成本重算 ──
+    // 区间沿用当前页面的日期选择，用户看到什么区间就重算什么区间（避免
+    // 「界面上看的是 7 天，重算的却是全部」这种错位）。
+    bfRange() {
+      return {
+        from: Math.floor(new Date(this.from + "T00:00:00").getTime() / 1000),
+        to: Math.floor(new Date(this.to + "T23:59:59").getTime() / 1000),
+      };
+    },
+    openBackfill() {
+      this.bfOpen = true; this.bfPreview = null; this.bfResult = null; this.bfErr = "";
+      this.runBackfill(true);
+    },
+    runBackfill(dry) {
+      const { from, to } = this.bfRange;
+      this.bfBusy = true; this.bfErr = "";
+      req("POST", "/api/usage/cost/backfill?from=" + from + "&to=" + to + (dry ? "&dry_run=1" : ""))
+        .then((d) => {
+          if (dry) this.bfPreview = d;
+          else { this.bfResult = d; this.load(); }
+        })
+        .catch((e) => { this.bfErr = e.message; })
+        .finally(() => { this.bfBusy = false; });
+    },
     pick(key) {
       this.entity = this.entity === key ? "" : key;
       this.load();
@@ -1260,6 +1291,8 @@ const UsagePage = {
       <div class="seg">
         <div class="seg-item" v-for="m in metrics" :key="m.v" :class="{active: metric===m.v}" @click="metric=m.v; load()">{{ m.label }}</div>
       </div>
+      <div class="spacer"></div>
+      <button class="btn" :disabled="bfBusy" @click="openBackfill">重算历史成本</button>
     </div>
 
     <div class="stat-row">
@@ -1350,6 +1383,71 @@ const UsagePage = {
         <tr v-if="!facets.length"><td colspan="8" class="empty">所选区间暂无数据</td></tr>
       </tbody></table></div>
     </div>
+
+    <ui-drawer :open="bfOpen" title="重算历史成本" subtitle="按当前模型定价重新计算所选区间的成本" :width="560" @close="bfOpen=false">
+      <div class="sec">
+        <div class="sec-title">为什么要重算</div>
+        <div class="hint" style="padding:0 0 8px">
+          缓存计费修正后，<b>新请求</b>已按缓存读取/写入各自单价计算；但<b>修正前已落库</b>
+          的成本仍是旧口径（prompt_token 全额按输入价计，缓存命中被多收、缓存写入被漏收）。
+          本操作按当前定价重算，仅影响已发生的日志，不改变请求处理行为。
+        </div>
+        <div class="hint" style="padding:0 0 12px">
+          区间取自上方日期选择：<b>{{ from }} ~ {{ to }}</b>。重算会同时刷新预聚合，
+          因而界面上显示的数值会随之变化。请避免用与已对账的报表对齐的区间。
+        </div>
+      </div>
+
+      <div class="sec" v-if="bfPreview && !bfResult">
+        <div class="sec-title">影响面（预演，尚未写入）</div>
+        <table class="mini-table">
+          <tr><td>区间内日志</td><td>{{ fmtInt(bfPreview.scanned) }} 条</td></tr>
+          <tr><td>成本将变化</td><td>{{ fmtInt(bfPreview.updated) }} 条</td></tr>
+          <tr v-if="bfPreview.unpriced">
+            <td>无定价（置 0）</td>
+            <td><span style="color:var(--color-danger-6)">{{ fmtInt(bfPreview.unpriced) }} 条</span></td>
+          </tr>
+          <tr><td>重算前总额</td><td>{{ fmtCost(bfPreview.old_total) }}</td></tr>
+          <tr><td>重算后总额</td><td>{{ fmtCost(bfPreview.new_total) }}</td></tr>
+          <tr class="total-row">
+            <td>差额</td>
+            <td :style="{color: bfPreview.delta < 0 ? 'var(--color-success-6)' : 'var(--color-danger-6)'}">
+              {{ (bfPreview.delta > 0 ? '+' : '') + fmtCost(bfPreview.delta) }}
+            </td>
+          </tr>
+        </table>
+        <div class="hint" v-if="bfPreview.unpriced">
+          「无定价」表示该模型当前没有单价配置（通常已被删除或从未定价）。
+          这些行的成本会被置 0——若这不是预期结果，请先补齐模型定价再重算。
+        </div>
+      </div>
+
+      <div class="sec" v-if="bfResult">
+        <div class="sec-title">重算完成</div>
+        <table class="mini-table">
+          <tr><td>已更新</td><td>{{ fmtInt(bfResult.updated) }} / {{ fmtInt(bfResult.scanned) }} 条</td></tr>
+          <tr><td>总额</td><td>{{ fmtCost(bfResult.old_total) }} → {{ fmtCost(bfResult.new_total) }}</td></tr>
+          <tr><td>预聚合刷新</td><td>{{ fmtInt(bfResult.rollup_rows) }} 行</td></tr>
+        </table>
+        <div class="hint" v-if="bfResult.rollup_error" style="color:var(--color-danger-6)">
+          预聚合刷新失败：{{ bfResult.rollup_error }}（原始日志已重算完成，仅聚合视图滞后）
+        </div>
+      </div>
+
+      <div class="sec" v-if="bfErr">
+        <div class="hint" style="color:var(--color-danger-6)">{{ bfErr }}</div>
+      </div>
+
+      <template #foot>
+        <button class="btn" @click="bfOpen=false">关闭</button>
+        <div class="spacer"></div>
+        <button class="btn" :disabled="bfBusy || !bfPreview || bfResult" @click="runBackfill(true)">重新预演</button>
+        <button class="btn btn-primary" :disabled="bfBusy || !bfPreview || bfResult || bfPreview.updated === 0"
+                @click="runBackfill(false)">
+          {{ bfBusy ? '处理中…' : '确认重算' }}
+        </button>
+      </template>
+    </ui-drawer>
   </div>`,
 };
 
