@@ -155,8 +155,76 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/usage/stats", a.handleUsageStats)
 	reg("/api/usage/rollup", a.handleUsageRollup)
 	reg("/api/usage/rollup/rebuild", a.handleUsageRollupRebuild)
+	reg("/api/usage/cost/backfill", a.handleCostBackfill)
 
 	return mux
+}
+
+// handleCostBackfill 按当前定价重算历史成本（v14 缓存计费修正后的回填）。
+//
+// 为什么不放进迁移自动跑：迁移必须快且无副作用，而回填可能扫数百万行。
+// 更重要的是「是否重算」是业务决定——历史账单若已对外结算，重算会改变已出账的数字。
+// 所以做成显式触发。
+//
+// 参数：from/to（unix 秒，默认最近 7 天）、dry_run=1 只统计不写。
+// 区间上限沿用 92 天（与 rollup 重建一致，防止一次请求把库拖死）。
+//
+// 返回前后总额对比，便于判断影响面。
+func (a *Admin) handleCostBackfill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	qv := r.URL.Query()
+	from, _ := strconv.ParseInt(qv.Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(qv.Get("to"), 10, 64)
+	now := time.Now().Unix()
+	if to <= 0 || to > now {
+		to = now
+	}
+	if from <= 0 || from >= to {
+		from = to - 7*86400
+	}
+	const maxSpan = 92 * 86400
+	if to-from > maxSpan {
+		writeJSON(w, 400, map[string]any{"detail": "区间过大（上限 92 天）"})
+		return
+	}
+	dryRun := qv.Get("dry_run") == "1" || qv.Get("dry_run") == "true"
+
+	res, err := a.store.BackfillCosts(from, to, a.bal.CostForBackfill, dryRun)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	// 非 dry-run 写入后，预聚合表里的成本已过期——必须重算，否则用量分析
+	// 默认走聚合表会继续显示旧数字（“回填了但界面没变”的假象）。
+	// 失败不当作整体失败：原始表已经正确，只是聚合视图滞后。
+	rollupRows, rollupErr := int64(0), ""
+	if !dryRun {
+		if n, err := a.store.RebuildRollup(from, to); err != nil {
+			rollupErr = err.Error()
+		} else {
+			rollupRows = n
+		}
+	}
+	out := map[string]any{
+		"success":     rollupErr == "",
+		"from":        from,
+		"to":          to,
+		"scanned":     res.Scanned,
+		"updated":     res.Updated,
+		"unpriced":    res.Unpriced,
+		"old_total":   res.OldTotal,
+		"new_total":   res.NewTotal,
+		"delta":       res.NewTotal - res.OldTotal,
+		"dry_run":     res.DryRun,
+		"rollup_rows": rollupRows,
+	}
+	if rollupErr != "" {
+		out["rollup_error"] = rollupErr
+	}
+	writeJSON(w, 200, out)
 }
 
 // handleUsageRollup 预聚合健康度（watermark / 滞后秒数 / 聚合表行数）。

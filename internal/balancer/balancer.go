@@ -1168,6 +1168,23 @@ func (b *Balancer) computeCost(modelName string, pt, ct, images int64) float64 {
 	return in + out + cache
 }
 
+// CostForBackfill 按模型名与 token 计数计算成本三拆分，供历史成本回填使用。
+//
+// 与 splitCost 共用同一套单价与拆分逻辑（billablePrompt + 回落规则），
+// 保证「回填出来的数」与「新请求记的数」口径完全一致——否则回填本身会制造
+// 新一轮不一致，比不回填更糟。
+//
+// 返回 priced=false 表示该模型无定价（回填时该行成本置 0）。
+func (b *Balancer) CostForBackfill(modelName string, prompt, completion, images, cacheRead, cacheWrite int64) (in, out, cache float64, priced bool) {
+	return b.splitCostOf(modelName, &model.UsageLog{
+		PromptTokens:        prompt,
+		CompletionTokens:    completion,
+		ImageCount:          images,
+		CacheReadTokens:     cacheRead,
+		CacheCreationTokens: cacheWrite,
+	})
+}
+
 // splitCost 把一次请求的成本拆成输入/输出/缓存三部分（供用量分析按成本构成下钻）。
 //
 // 关系：**Cost = in + out + cache**（Record 里就是三者相加得到 Cost）。
