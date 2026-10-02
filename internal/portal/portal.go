@@ -171,6 +171,31 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// 缓存节省量：让用户能看出「缓存命中降了多少成本」。
+	//
+	// **必须按 same 区间做聚合查询，不能拿 rawLogs 算**：rawLogs 只有最近 100 条
+	// 且以时间为序，而 week/total 是全量聚合——用 rawLogs 会让「7 天缓存读取 600」
+	// 与「节省 $0」同时出现（历史上真出现过这个自相矛盾的响应）。
+	//
+	// 按模型分组是必要的：不同模型单价不同，拿总量乘单一单价算出来的节省是错的。
+	// 单价取自**当前**模型配置；模型已删或未定价时不能当作 0，而是标记
+	// cache_savings_priced=false，让界面显示「—」而不是「省了 $0」。
+	cacheSavings, allPriced, anyCache := 0.0, true, false
+	byModel, err := p.store.SubKeyCacheByModel(sk.ID, time.Now().Unix()-7*86400)
+	if err == nil {
+		for _, mc := range byModel {
+			if mc.Read == 0 && mc.Write == 0 {
+				continue
+			}
+			anyCache = true
+			saved, priced := p.bal.CacheSavings(mc.Model, mc.Read, mc.Write)
+			if !priced {
+				allPriced = false
+				continue
+			}
+			cacheSavings += saved
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":               sk.Name,
 		"expires_at":         sk.ExpiresAt,
@@ -182,6 +207,11 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"total":              total,
 		"success_rate_7d":    successRate,
 		"logs":               logs,
+		// 缓存节省：负值 = 省钱。anyCache=false 表示区间内无缓存用量，
+		// allPriced=false 表示有模型未定价——两种情况下界面都应显示「—」而非 $0。
+		"cache_savings":        cacheSavings,
+		"cache_has_usage":      anyCache,
+		"cache_savings_priced": allPriced,
 	})
 }
 

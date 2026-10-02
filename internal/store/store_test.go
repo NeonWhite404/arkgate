@@ -1705,3 +1705,113 @@ func TestUsageLogsV13Migration(t *testing.T) {
 		t.Fatalf("schema_version = %q %v", v, ok)
 	}
 }
+
+// TestSubKeyCacheByModelAggregatesAllRows 门户「缓存节省」必须基于全量聚合，
+// 而不是最近 100 条日志。
+//
+// 回归背景：初版实现拿 ListUsageLogsBySubKey（上限 100 条、按时间倒序）来算节省量，
+// 于是同一份响应里出现自相矛盾的组合——「7 天缓存读取 1800」但「cache_has_usage=false
+// / 节省 $0」。原因是聚合统计走 SQL 全量、节省量走 100 条明细。
+// 本测试写入超过 100 条带缓存的日志，断言聚合覆盖全部而非被截断。
+func TestSubKeyCacheByModelAggregatesAllRows(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	const n = 150 // 刻意超过 100 条明细上限
+	for i := 0; i < n; i++ {
+		if err := st.AddUsageLog(&model.UsageLog{
+			TS: int64(1000 + i), Model: "m", SubKeyID: "sk1", Status: "ok",
+			PromptTokens: 100, TotalTokens: 100,
+			CacheReadTokens: 10, CacheCreationTokens: 5,
+		}); err != nil {
+			t.Fatalf("add log %d: %v", i, err)
+		}
+	}
+	// 另一个模型也有缓存，验证按模型分组（不同模型单价不同，不能合并）。
+	if err := st.AddUsageLog(&model.UsageLog{
+		TS: 2000, Model: "other", SubKeyID: "sk1", Status: "ok",
+		PromptTokens: 50, TotalTokens: 50, CacheReadTokens: 7,
+	}); err != nil {
+		t.Fatalf("add other: %v", err)
+	}
+
+	got, err := st.SubKeyCacheByModel("sk1", 0)
+	if err != nil {
+		t.Fatalf("SubKeyCacheByModel: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("应按模型分成 2 组, got %d 组: %+v", len(got), got)
+	}
+	byModel := map[string]SubKeyCacheStat{}
+	for _, c := range got {
+		byModel[c.Model] = c
+	}
+	// 关键断言：必须聚合**全部** 150 条（1500/750），而不是被截断成 100 条（1000/500）。
+	if byModel["m"].Read != n*10 {
+		t.Fatalf("模型 m 缓存读取应聚合全部 %d 条 = %d, got %d（被明细上限截断？）",
+			n, n*10, byModel["m"].Read)
+	}
+	if byModel["m"].Write != n*5 {
+		t.Fatalf("模型 m 缓存写入应为 %d, got %d", n*5, byModel["m"].Write)
+	}
+	if byModel["other"].Read != 7 {
+		t.Fatalf("模型 other 缓存读取应为 7, got %d", byModel["other"].Read)
+	}
+
+	// 与 SubKeyLogStats 的口径必须一致（同一区间、同一批数据）。
+	stats, err := st.SubKeyLogStats("sk1", 0)
+	if err != nil {
+		t.Fatalf("SubKeyLogStats: %v", err)
+	}
+	var sum int64
+	for _, c := range got {
+		sum += c.Read
+	}
+	if sum != stats.CacheReadTokens {
+		t.Fatalf("按模型汇总的缓存读取(%d) 应与总统计(%d) 一致——两者口径不同会让"+
+			"门户同时显示「有缓存用量」与「节省 $0」", sum, stats.CacheReadTokens)
+	}
+
+	// 无缓存用量的子 Key 应返回空（而非报错）。
+	empty, err := st.SubKeyCacheByModel("nobody", 0)
+	if err != nil {
+		t.Fatalf("空结果不应报错: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("无缓存应返回空, got %+v", empty)
+	}
+}
+
+// TestSubKeyLogStatsIncludesCacheTokens 门户统计必须带上缓存 token 聚合。
+func TestSubKeyLogStatsIncludesCacheTokens(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	for i := 0; i < 3; i++ {
+		if err := st.AddUsageLog(&model.UsageLog{
+			TS: int64(100 + i), Model: "m", SubKeyID: "sk1", Status: "ok",
+			PromptTokens: 1000, TotalTokens: 1100, CacheReadTokens: 600,
+			CacheCreationTokens: 100, Cost: 0.01,
+		}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	s, err := st.SubKeyLogStats("sk1", 0)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if s.CacheReadTokens != 1800 {
+		t.Fatalf("缓存读取聚合应为 1800, got %d", s.CacheReadTokens)
+	}
+	if s.CacheCreationTokens != 300 {
+		t.Fatalf("缓存写入聚合应为 300, got %d", s.CacheCreationTokens)
+	}
+}

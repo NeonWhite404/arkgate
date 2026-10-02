@@ -99,7 +99,9 @@ const ModelsPage = {
         form: { type: m.type || "text", provider: m.provider || "", display: m.display || "",
           description: m.description || "", enabled: !!m.enabled,
           price_input: m.price_input || 0, price_output: m.price_output || 0,
-          price_image: m.price_image || 0, context_tokens: m.context_tokens || 0,
+          price_image: m.price_image || 0,
+          price_cache_read: m.price_cache_read || 0, price_cache_write: m.price_cache_write || 0,
+          context_tokens: m.context_tokens || 0,
           max_output_tokens: m.max_output_tokens || 0 },
         catHint: "",
         epRows: this.eps.filter((e) => e.model === m.name).map((e) => this.rowFromEp(e)),
@@ -108,6 +110,7 @@ const ModelsPage = {
         originalType: "text",
         form: { type: "text", provider: "", display: "", description: "", enabled: true,
           price_input: 0, price_output: 0, price_image: 0,
+          price_cache_read: 0, price_cache_write: 0,
           context_tokens: 0, max_output_tokens: 0 },
         catHint: "",
         epRows: [],
@@ -245,6 +248,8 @@ const ModelsPage = {
         enabled: f.enabled,
         price_input: Number(f.price_input) || 0,
         price_output: Number(f.price_output) || 0, price_image: Number(f.price_image) || 0,
+        price_cache_read: Number(f.price_cache_read) || 0,
+        price_cache_write: Number(f.price_cache_write) || 0,
         context_tokens: Number(f.context_tokens) || 0, max_output_tokens: Number(f.max_output_tokens) || 0,
       };
       if (f.type === "router" || (name && d.originalType !== f.type)) payload.fallback = [];
@@ -469,6 +474,19 @@ const ModelsPage = {
           <div class="form-row" v-else>
             <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model.number="mDrawer.form.price_input" type="number" step="0.0001"/></div>
             <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model.number="mDrawer.form.price_output" type="number" step="0.0001"/></div>
+          </div>
+          <!-- 缓存单价：0 = 未设置，计费回落到输入单价。上游报告的 prompt_tokens
+               是含缓存命中的总量，缓存读/写单价若与输入价不同（Anthropic 读约
+               10%、写约 125%），不填会导致多收（命中按原价）与漏收（写入未计价）。 -->
+          <div class="form-row" v-if="mDrawer.form.type==='text'">
+            <div class="form-item">
+              <label>缓存读取单价（$ / 1M，0 = 按输入价）</label>
+              <input v-model.number="mDrawer.form.price_cache_read" type="number" step="0.000001"/>
+            </div>
+            <div class="form-item">
+              <label>缓存写入单价（$ / 1M，0 = 按输入价）</label>
+              <input v-model.number="mDrawer.form.price_cache_write" type="number" step="0.000001"/>
+            </div>
           </div>
           <div class="form-row" v-if="mDrawer.form.type==='text'">
             <div class="form-item"><label>上下文窗口（tokens，0 = 不校验）</label><input v-model.number="mDrawer.form.context_tokens" type="number"/></div>

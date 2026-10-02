@@ -27,6 +27,10 @@ type Entry struct {
 	CostIn    float64 `json:"cost_in"`    // 输入单价 $ / 1M tokens
 	CostOut   float64 `json:"cost_out"`   // 输出单价 $ / 1M tokens
 	CostImage float64 `json:"cost_image"` // 图像单价 $ / 张
+	// 缓存单价（$ / 1M）。上游目录里缓存读通常为输入价的 10%、写入为 125%，
+	// 与输入价差异很大，必须单列——混用输入单价会同时多收（读）与漏收（写）。
+	CostCacheRead  float64 `json:"cost_cache_read"`
+	CostCacheWrite float64 `json:"cost_cache_write"`
 	Mode      string  `json:"mode"`       // chat | completion | image_generation
 	Provider  string  `json:"provider"`   // LiteLLM 供应商标识（仅供展示）
 }
@@ -40,8 +44,12 @@ type rawEntry struct {
 	OutputCost      *float64 `json:"output_cost_per_token"`
 	OutputCostImage *float64 `json:"output_cost_per_image"`
 	InputCostImage  *float64 `json:"input_cost_per_image"`
-	Mode            string   `json:"mode"`
-	Provider        string   `json:"litellm_provider"`
+	// 缓存单价：LiteLLM 用这两个字段名（不带 _above_* 后缀的是基础档），
+	// 本项目只取基础档——分级定价（按上下文长度分档）不建模，避免误用高价档。
+	CacheReadCost  *float64 `json:"cache_read_input_token_cost"`
+	CacheWriteCost *float64 `json:"cache_creation_input_token_cost"`
+	Mode           string   `json:"mode"`
+	Provider       string   `json:"litellm_provider"`
 }
 
 func (r *rawEntry) normalize() Entry {
@@ -53,11 +61,13 @@ func (r *rawEntry) normalize() Entry {
 		return *v
 	}
 	e := Entry{
-		Mode:     r.Mode,
-		Provider: r.Provider,
-		CostIn:   pos(r.InputCost) * 1e6,
-		CostOut:  pos(r.OutputCost) * 1e6,
-		MaxInput: int64(pos(r.MaxInputTokens)),
+		Mode:           r.Mode,
+		Provider:       r.Provider,
+		CostIn:         pos(r.InputCost) * 1e6,
+		CostOut:        pos(r.OutputCost) * 1e6,
+		CostCacheRead:  pos(r.CacheReadCost) * 1e6,
+		CostCacheWrite: pos(r.CacheWriteCost) * 1e6,
+		MaxInput:       int64(pos(r.MaxInputTokens)),
 	}
 	// 图像单价：部分条目记 output_cost_per_image，部分记 input_cost_per_image，语义一致。
 	if v := pos(r.OutputCostImage); v > 0 {

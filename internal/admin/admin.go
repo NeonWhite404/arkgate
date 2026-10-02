@@ -1052,6 +1052,16 @@ func fillModelFromCatalog(c *catalog.Catalog, m *model.Model) []string {
 		m.PriceImage = e.CostImage
 		filled = append(filled, "price_image")
 	}
+	// 缓存单价：同样只补空缺。目录里缓存读/写通常与输入价不同
+	// （读约 10%、写约 125%），补全后计费才能反映真实折扣与溢价。
+	if m.PriceCacheRead == 0 && e.CostCacheRead > 0 {
+		m.PriceCacheRead = e.CostCacheRead
+		filled = append(filled, "price_cache_read")
+	}
+	if m.PriceCacheWrite == 0 && e.CostCacheWrite > 0 {
+		m.PriceCacheWrite = e.CostCacheWrite
+		filled = append(filled, "price_cache_write")
+	}
 	return filled
 }
 
@@ -1264,6 +1274,13 @@ func (a *Admin) handleModelItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if v, ok := probe["price_image"]; ok {
 			existing.PriceImage = floatField(v)
+		}
+		// 缓存单价（0 = 未设置，计费回落到输入单价）。
+		if v, ok := probe["price_cache_read"]; ok {
+			existing.PriceCacheRead = floatField(v)
+		}
+		if v, ok := probe["price_cache_write"]; ok {
+			existing.PriceCacheWrite = floatField(v)
 		}
 		// 能力上限：0 = 未设置（不校验，允许目录自动补全）。
 		if v, ok := probe["context_tokens"]; ok {

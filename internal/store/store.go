@@ -62,7 +62,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
 // v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
 // v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
-const schemaVersion = "13"
+const schemaVersion = "14"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -324,6 +324,11 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_kind_ts ON usage_logs(status, error_kind, ts)`,
 		`ALTER TABLE usage_logs ADD COLUMN is_stream INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''`,
+		// —— v14：缓存单价（0 = 未设置，计费回落到输入单价，等价旧行为） ——
+		// 背景：prompt_tokens 是含缓存命中的**总量**，只用输入单价会把命中部分按原价
+		// 多收、把缓存写入漏收。单列缓存读/写单价后才能正确拆分。
+		`ALTER TABLE models ADD COLUMN price_cache_read REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE models ADD COLUMN price_cache_write REAL NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -548,6 +553,7 @@ func scanModel(sc scanner) (*model.Model, error) {
 	var fb, routerJSON string
 	if err := sc.Scan(&m.Name, &m.Display, &m.Description, &m.Enabled, &fb, &m.CreatedAt,
 		&m.Type, &m.Provider, &m.PriceInput, &m.PriceOutput, &m.PriceImage,
+		&m.PriceCacheRead, &m.PriceCacheWrite,
 		&m.ContextTokens, &m.MaxOutputTokens, &routerJSON); err != nil {
 		return nil, err
 	}
@@ -562,7 +568,7 @@ func scanModel(sc scanner) (*model.Model, error) {
 	return m, nil
 }
 
-const modelCols = `name,display,description,enabled,fallback,created_at,type,provider,price_input,price_output,price_image,context_tokens,max_output_tokens,router`
+const modelCols = `name,display,description,enabled,fallback,created_at,type,provider,price_input,price_output,price_image,price_cache_read,price_cache_write,context_tokens,max_output_tokens,router`
 
 func (s *Store) ListModels() ([]*model.Model, error) {
 	s.mu.RLock()
@@ -611,15 +617,16 @@ func (s *Store) UpsertModel(m *model.Model) error {
 	defer s.mu.Unlock()
 	fb, _ := json.Marshal(m.Fallback)
 	_, err := s.db.Exec(`INSERT INTO models(name,display,description,enabled,fallback,created_at,type,provider,
-			price_input,price_output,price_image,context_tokens,max_output_tokens,router)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
+			price_input,price_output,price_image,price_cache_read,price_cache_write,context_tokens,max_output_tokens,router)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET display=excluded.display,
 		description=excluded.description, enabled=excluded.enabled, fallback=excluded.fallback,
 		type=excluded.type, provider=excluded.provider,
 		price_input=excluded.price_input, price_output=excluded.price_output,
-		price_image=excluded.price_image, context_tokens=excluded.context_tokens,
+		price_image=excluded.price_image, price_cache_read=excluded.price_cache_read,
+		price_cache_write=excluded.price_cache_write, context_tokens=excluded.context_tokens,
 		max_output_tokens=excluded.max_output_tokens, router=excluded.router`,
 		m.Name, m.Display, m.Description, boolInt(m.Enabled), string(fb), nonzero(m.CreatedAt, nowUnix()), m.Type, m.Provider,
-		m.PriceInput, m.PriceOutput, m.PriceImage, m.ContextTokens, m.MaxOutputTokens,
+		m.PriceInput, m.PriceOutput, m.PriceImage, m.PriceCacheRead, m.PriceCacheWrite, m.ContextTokens, m.MaxOutputTokens,
 		routerJSON(m.Router))
 	return err
 }
@@ -1456,6 +1463,20 @@ type SubKeyStats struct {
 	Tokens   int64   `json:"tokens"`
 	Images   int64   `json:"images"`
 	Cost     float64 `json:"cost"`
+	// 缓存 token（聚合值，非行级明细）。
+	//
+	// 为什么网关要把这个告诉终端用户：缓存命中直接决定他们的实际花费
+	// （缓存读取通常只有输入价的一小部分），是他们能自主优化的唯一变量
+	// （把稳定不变的前缀放在请求开头才能命中）。只给个总花费，用户无法
+	// 判断“贵是因为缓存没命中”还是“本来就这么贵”。
+	//
+	// 安全性：这是**区间聚合**，不泄露账号/ep/上游错误等运维信息，
+	// 与行级明细的脱敏红线（subKeyLogCols 不含 error）不冲突。
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	// CostNoCache 是「假设全部缓存未命中」的对照成本，用于展示缓存节省量。
+	// 由 Cost 与缓存 token 折算，不单独落库——避免两处口径发散。
+	CostNoCache float64 `json:"cost_no_cache"`
 }
 
 // SubKeyLogStats 统计某子 Key 自 since 起的请求概况（来自 usage_logs，仅本 Key）。
@@ -1467,13 +1488,54 @@ func (s *Store) SubKeyLogStats(subkeyID string, since int64) (*SubKeyStats, erro
 			COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(total_tokens),0),
 			COALESCE(SUM(image_count),0),
-			COALESCE(SUM(cost),0)
+			COALESCE(SUM(cost),0),
+			COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(cache_creation_tokens),0)
 		FROM usage_logs WHERE subkey_id=? AND ts>=?`, subkeyID, since).
-		Scan(&st.Requests, &st.Success, &st.Tokens, &st.Images, &st.Cost)
+		Scan(&st.Requests, &st.Success, &st.Tokens, &st.Images, &st.Cost,
+			&st.CacheReadTokens, &st.CacheCreationTokens)
 	if err != nil {
 		return nil, err
 	}
 	return st, nil
+}
+
+// SubKeyCacheStat 是某子 Key 在某个模型上的缓存 token 聚合（门户算节省量用）。
+type SubKeyCacheStat struct {
+	Model string `json:"model"`
+	Read  int64  `json:"read"`
+	Write int64  `json:"write"`
+}
+
+// SubKeyCacheByModel 按模型聚合某子 Key 自 since 起的缓存 token。
+//
+// 为什么需要单独一个聚合查询：门户的「缓存节省」必须与 week/total 的统计口径
+// 完全一致（都是全量聚合），不能拿「最近 100 条日志」凑——那会让同一份响应里
+// 「7 天缓存读取 600」与「节省 $0」同时出现。按模型分组是因为各模型单价不同，
+// 拿总量乘单一单价算出的节省是错的。
+func (s *Store) SubKeyCacheByModel(subkeyID string, since int64) ([]SubKeyCacheStat, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT model,
+			COALESCE(SUM(cache_read_tokens),0),
+			COALESCE(SUM(cache_creation_tokens),0)
+		FROM usage_logs
+		WHERE subkey_id=? AND ts>=?
+		GROUP BY model
+		HAVING SUM(cache_read_tokens)+SUM(cache_creation_tokens) > 0`, subkeyID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SubKeyCacheStat{}
+	for rows.Next() {
+		var c SubKeyCacheStat
+		if err := rows.Scan(&c.Model, &c.Read, &c.Write); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // ListUsageLogsBySubKey 返回某子 Key 自己的近期日志。

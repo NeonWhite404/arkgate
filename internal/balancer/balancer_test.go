@@ -19,7 +19,7 @@ func newTestBalancer() *Balancer {
 		endpoints: map[string]*model.Endpoint{},
 		modelApps: map[string][]*model.Endpoint{},
 		defs:      map[string]provider.Def{},
-		prices:    map[string][3]float64{},
+		prices:    map[string]modelPrice{},
 		wrrState:  map[string]*wrrState{},
 		sessions:  map[string]sessEntry{},
 	}
@@ -548,7 +548,7 @@ func TestSessionSticky(t *testing.T) {
 // 未定价模型为 0；Record 会把成本写回日志。
 func TestComputeCost(t *testing.T) {
 	b := newTestBalancer()
-	b.prices["m"] = [3]float64{2, 8, 0.5} // 输入 $2/M、输出 $8/M、图像 $0.5/张
+	b.prices["m"] = modelPrice{in: 2, out: 8, image: 0.5} // 输入 $2/M、输出 $8/M、图像 $0.5/张
 
 	got := b.computeCost("m", 1_000_000, 500_000, 2)
 	if diff := got - (2 + 4 + 1); diff > 1e-9 || diff < -1e-9 {
@@ -746,7 +746,7 @@ func TestRecordDoesNotBlockWhenConsumerStalled(t *testing.T) {
 	b := &Balancer{
 		accounts: map[string]*model.Account{}, models: map[string]*model.Model{},
 		endpoints: map[string]*model.Endpoint{}, modelApps: map[string][]*model.Endpoint{},
-		defs: map[string]provider.Def{}, prices: map[string][3]float64{},
+		defs: map[string]provider.Def{}, prices: map[string]modelPrice{},
 		wrrState: map[string]*wrrState{}, sessions: map[string]sessEntry{},
 		logCh: make(chan *model.UsageLog, logChCap),
 		// 故意留 nil store：溢出路径不会真的写库，从而只测「通道是否阻塞」。

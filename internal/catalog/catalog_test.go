@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 )
@@ -110,5 +111,73 @@ func TestDigitDots(t *testing.T) {
 		if got := digitDots(in); got != want {
 			t.Fatalf("digitDots(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestParseCachePrices 缓存单价解析：LiteLLM 的 cache_read_input_token_cost /
+// cache_creation_input_token_cost 必须换算为 $/1M，且**只取基础档**。
+//
+// 为什么要锁「只取基础档」：上游目录里同名价格有几十个分级变体
+// （_above_200k_tokens、_batches、_priority、_flex…），那些是特定上下文长度/
+// 服务档位的价格。本项目不建模分级定价，误取高价档会让计费偏高——比不填更糟。
+func TestParseCachePrices(t *testing.T) {
+	var entries map[string]rawEntry
+	raw := []byte(`{
+		"claude-3-5-sonnet": {
+			"input_cost_per_token": 3e-06,
+			"output_cost_per_token": 1.5e-05,
+			"cache_read_input_token_cost": 3e-07,
+			"cache_creation_input_token_cost": 3.75e-06,
+			"cache_read_input_token_cost_above_200k_tokens": 6e-07,
+			"cache_creation_input_token_cost_above_200k_tokens": 7.5e-06,
+			"cache_read_input_token_cost_batches": 1.5e-07,
+			"litellm_provider": "anthropic",
+			"mode": "chat"
+		},
+		"no-cache-prices": {
+			"input_cost_per_token": 1e-06,
+			"output_cost_per_token": 2e-06,
+			"mode": "chat"
+		},
+		"zero-cache-price": {
+			"input_cost_per_token": 1e-06,
+			"cache_read_input_token_cost": 0,
+			"mode": "chat"
+		}
+	}`)
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	cr := entries["claude-3-5-sonnet"]
+	e := cr.normalize()
+	// 换算为 $/1M：3e-07 → 0.3，3.75e-06 → 3.75。
+	if !almost(e.CostCacheRead, 0.3) {
+		t.Fatalf("缓存读取单价应为 $0.3/M, got %v", e.CostCacheRead)
+	}
+	if !almost(e.CostCacheWrite, 3.75) {
+		t.Fatalf("缓存写入单价应为 $3.75/M, got %v", e.CostCacheWrite)
+	}
+	// 分级变体不得被误取（基础档才是默认档）。
+	if almost(e.CostCacheRead, 0.6) || almost(e.CostCacheWrite, 7.5) {
+		t.Fatal("取到了 _above_200k_tokens 分级档，应按基础档计价")
+	}
+	// 商业含义：读 10% 折扣、写 25% 溢价，与输入价的关系应成立。
+	if !(e.CostCacheRead < e.CostIn) {
+		t.Fatalf("缓存读取应低于输入价: read=%v in=%v", e.CostCacheRead, e.CostIn)
+	}
+	if !(e.CostCacheWrite > e.CostIn) {
+		t.Fatalf("缓存写入应高于输入价: write=%v in=%v", e.CostCacheWrite, e.CostIn)
+	}
+
+	// 上游没有缓存价格 → 保持 0（= 未设置），计费回落到输入价。
+	nc := entries["no-cache-prices"]
+	if got := nc.normalize(); got.CostCacheRead != 0 || got.CostCacheWrite != 0 {
+		t.Fatalf("无缓存价格时应为 0, got read=%v write=%v", got.CostCacheRead, got.CostCacheWrite)
+	}
+	// 显式 0（非正值）同样按未设置处理，避免用 0 当作「免费」。
+	zc := entries["zero-cache-price"]
+	if got := zc.normalize(); got.CostCacheRead != 0 {
+		t.Fatalf("显式 0 应按未设置处理, got %v", got.CostCacheRead)
 	}
 }

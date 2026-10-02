@@ -67,7 +67,7 @@ type Balancer struct {
 	endpoints map[string]*model.Endpoint   // endpointID -> endpoint（叶节点）
 	modelApps map[string][]*model.Endpoint // 易读名 -> 该模型下全部叶子
 	defs      map[string]provider.Def      // accountID -> 供应商定义（Refresh 时解析缓存）
-	prices    map[string][3]float64        // 易读名 -> [输入,输出,图像] 单价（含停用模型，供成本核算）
+	prices    map[string]modelPrice         // 易读名 -> 单价（含停用模型，供成本核算）
 	limits    map[string][2]int64          // 易读名 -> [上下文,最大输出] 上限（含停用模型；0=不校验）
 
 	wrrMu    sync.Mutex
@@ -132,7 +132,7 @@ func New(st *store.Store, sessionTTL time.Duration) *Balancer {
 		endpoints:  map[string]*model.Endpoint{},
 		modelApps:  map[string][]*model.Endpoint{},
 		defs:       map[string]provider.Def{},
-		prices:     map[string][3]float64{},
+		prices:     map[string]modelPrice{},
 		limits:     map[string][2]int64{},
 		wrrState:   map[string]*wrrState{},
 		sessions:   map[string]sessEntry{},
@@ -255,7 +255,7 @@ func (b *Balancer) Refresh() {
 	epMap := map[string]*model.Endpoint{}
 	modelApps := map[string][]*model.Endpoint{}
 	defMap := map[string]provider.Def{}
-	priceMap := map[string][3]float64{}
+	priceMap := map[string]modelPrice{}
 	limitMap := map[string][2]int64{}
 
 	for _, a := range accounts {
@@ -264,7 +264,10 @@ func (b *Balancer) Refresh() {
 	}
 	for _, m := range modelsList {
 		// 价格索引包含停用模型：日志里的历史用量仍要按当时定价折算。
-		priceMap[m.Name] = [3]float64{m.PriceInput, m.PriceOutput, m.PriceImage}
+		priceMap[m.Name] = modelPrice{
+			in: m.PriceInput, out: m.PriceOutput, image: m.PriceImage,
+			cacheRead: m.PriceCacheRead, cacheWrite: m.PriceCacheWrite,
+		}
 		limitMap[m.Name] = [2]int64{m.ContextTokens, m.MaxOutputTokens}
 		if m.Enabled {
 			modMap[m.Name] = m
@@ -1007,10 +1010,10 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr b
 		images:     l.ImageCount,
 	}
 	// 成本核算：即使请求失败（tokens 全 0）结果也是 0，无需分支。
-	// 同时写回拆分列——computeCost 是唯一写入口，保证「拆分之和 == 总额」。
-	op.cost = b.computeCost(l.Model, l.PromptTokens, l.CompletionTokens, l.ImageCount)
-	l.Cost = op.cost
+	// 同时写回拆分列——**先算拆分再汇总**，保证「拆分之和 == 总额」是结构上成立的，
+	// 而不是两条独立公式碰巧相等（旧实现分两路算，缓存单价改动后必然发散）。
 	l.InputCost, l.OutputCost, l.CacheCost = b.splitCost(l.Model, l)
+	l.Cost = l.InputCost + l.OutputCost + l.CacheCost
 	b.enqueueStat(op, l)
 }
 
@@ -1066,32 +1069,130 @@ func (b *Balancer) StatsOverflow() (stats, logs int64) {
 
 // computeCost 按模型定价折算一次请求的成本：
 // 输入/输出单价为 $ / 1M tokens，图像单价为 $ / 张；未定价模型返回 0。
-func (b *Balancer) computeCost(modelName string, pt, ct, images int64) float64 {
+//
+// 保留该函数供测试与「手上只有三个计数」的场景；**主路径（Record）不走它**，
+// 而是先算三拆分再相加——缓存计费需要 cache token，这里只能拿到 prompt 总数。
+// 语义差异：本函数把传入的 pt 视为**非缓存**输入。
+// modelPrice 是某个模型的单价集合（单位：$ / 1M tokens；图像为 $ / 张）。
+//
+// 为什么要单列缓存读/写单价：上游报告的 prompt_tokens 是**含缓存命中的总量**。
+// 若一律按 PriceInput 计费，会产生两个方向的错账：
+//   - 缓存命中部分被按原价**多收**（Anthropic 读取仅约输入价 10%）；
+//   - 缓存写入实际**漏收**（Anthropic 写入约输入价 125%，高于原价）。
+// 拆分后才能三项相加得出正确总额。
+type modelPrice struct {
+	in, out, image       float64
+	cacheRead, cacheWrite float64
+}
+
+// inRate 返回非缓存输入 token 的有效单价。
+//
+// 注意语义：这是**非缓存部分**的单价，调用方需先从 prompt_tokens 里扣除缓存量
+// （见 billablePrompt）。直接把 prompt_tokens 乘这个单价会把缓存部分重复计费。
+func (p modelPrice) inRate() float64 { return p.in }
+
+// cacheReadRate / cacheWriteRate 返回缓存单价；**0 = 未设置回落输入单价**。
+//
+// 回落而非置零：0 在项目里的约定是「未设置」而不是「免费」。若把未定价当作免费，
+// 管理员不填缓存单价就会静默少计费（而不是按原价多计费）——前者更难被发现。
+func (p modelPrice) cacheReadRate() float64 {
+	if p.cacheRead != 0 {
+		return p.cacheRead
+	}
+	return p.in
+}
+
+func (p modelPrice) cacheWriteRate() float64 {
+	if p.cacheWrite != 0 {
+		return p.cacheWrite
+	}
+	return p.in
+}
+
+// billablePrompt 拆分 prompt_tokens 为「非缓存输入」与「缓存读/写」三部分，
+// 保证三者之和 == prompt_tokens（不重不漏）。
+//
+// 防御点：上游字段可能自相矛盾（缓存量之和大于 prompt_tokens，或单一缓存量
+// 就是超了）。此时不能让非缓存部分变成负数凭空减少费用，也不能让总额超出实际
+// 报告的 prompt_tokens——夹紧到 [0, prompt] 并把两个缓存量按比例收敛。
+func billablePrompt(prompt, cacheRead, cacheWrite int64) (plain, read, write int64) {
+	if prompt < 0 {
+		prompt = 0
+	}
+	if cacheRead < 0 {
+		cacheRead = 0
+	}
+	if cacheWrite < 0 {
+		cacheWrite = 0
+	}
+	read, write = cacheRead, cacheWrite
+	if read+write > prompt {
+		// 缓存量超报：按比例缩到恰好等于 prompt_tokens，避免负数输入或总额膨胀。
+		total := read + write
+		read = read * prompt / total
+		write = prompt - read
+	}
+	return prompt - read - write, read, write
+}
+
+// pricesFor 读价格表（持读锁）。
+func (b *Balancer) pricesFor(modelName string) (modelPrice, bool) {
 	b.mu.RLock()
 	p, ok := b.prices[modelName]
 	b.mu.RUnlock()
-	if !ok {
-		return 0
+	return p, ok
+}
+
+// CacheSavings 估算某模型下「缓存命中」相对「全部未命中」节省/多付的金额。
+//
+// 返回值 = 缓存部分实付 - 同量 token 按输入价应付。
+//   - 负值 = 节省（缓存读便宜，常态）；
+//   - 正值 = 多付（缓存写入溢价的贡献往往小于读取折扣，所以通常仍为负）。
+//
+// 供门户展示「缓存为你省了多少钱」。未定价模型返回 (0, false)，调用方应显示
+// “—”而不是 $0——后者会被读成“没有节省”，而真相是“不知道”。
+func (b *Balancer) CacheSavings(modelName string, cacheRead, cacheWrite int64) (float64, bool) {
+	p, ok := b.pricesFor(modelName)
+	if !ok || (cacheRead == 0 && cacheWrite == 0) {
+		return 0, ok
 	}
-	return float64(pt)/1e6*p[0] + float64(ct)/1e6*p[1] + float64(images)*p[2]
+	paid := float64(cacheRead)/1e6*p.cacheReadRate() + float64(cacheWrite)/1e6*p.cacheWriteRate()
+	hypothetical := float64(cacheRead+cacheWrite) / 1e6 * p.inRate()
+	return paid - hypothetical, true
+}
+
+func (b *Balancer) computeCost(modelName string, pt, ct, images int64) float64 {
+	in, out, cache, _ := b.splitCostOf(modelName, &model.UsageLog{
+		PromptTokens: pt, CompletionTokens: ct, ImageCount: images,
+	})
+	return in + out + cache
 }
 
 // splitCost 把一次请求的成本拆成输入/输出/缓存三部分（供用量分析按成本构成下钻）。
 //
-// 与 computeCost 的关系统一为：input + output + cache == Cost。图像费用归入 output
+// 关系：**Cost = in + out + cache**（Record 里就是三者相加得到 Cost）。
+// 其中 in 仅覆盖**非缓存**输入，cache 覆盖缓存读+写；图像费用归入 out
 // （目前图像无独立拆分列，混入输出更贴近「非输入侧费用」的直觉）。
-// 缓存 token 不额外计价（上游对缓存读通常给折扣，但网关未建模该折扣），因此
-// cache 只会是 0；保留该列是为了下一步接上游真实账单时不用再改 schema。
+//
+// 为什么输入要拆出缓存：prompt_tokens 是含缓存命中的总量，若整块按输入单价算，
+// 命中部分会被多收（缓存读通常更便宜），而缓存写入又会被漏收（它通常更贵）。
+// 拆分后三项之和仍等于正确总额，且缓存成本可单独展示。
 func (b *Balancer) splitCost(modelName string, l *model.UsageLog) (in, out, cache float64) {
-	b.mu.RLock()
-	p, ok := b.prices[modelName]
-	b.mu.RUnlock()
-	if !ok {
-		return 0, 0, 0
-	}
-	in = float64(l.PromptTokens) / 1e6 * p[0]
-	out = float64(l.CompletionTokens)/1e6*p[1] + float64(l.ImageCount)*p[2]
+	in, out, cache, _ = b.splitCostOf(modelName, l)
 	return in, out, cache
+}
+
+// splitCostOf 是 splitCost 的完整版，额外返回是否命中定价表。
+func (b *Balancer) splitCostOf(modelName string, l *model.UsageLog) (in, out, cache float64, priced bool) {
+	p, ok := b.pricesFor(modelName)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	plain, read, write := billablePrompt(l.PromptTokens, l.CacheReadTokens, l.CacheCreationTokens)
+	in = float64(plain) / 1e6 * p.inRate()
+	cache = float64(read)/1e6*p.cacheReadRate() + float64(write)/1e6*p.cacheWriteRate()
+	out = float64(l.CompletionTokens)/1e6*p.out + float64(l.ImageCount)*p.image
+	return in, out, cache, true
 }
 
 func nowPlusCooldown(fails int32) int64 {

@@ -8,7 +8,7 @@ import (
 	"arkgate/internal/model"
 )
 
-// 审计：v12 → v13 升级路径。这是**紧邻上一个版本**，此前没有任何测试覆盖
+// 审计：v12 → 当前版本 的升级路径。这是**紧邻的旧版本**，此前没有任何测试覆盖
 // （现有 TestMigrateFromLegacySchema 覆盖的是 v1 基线，跨度太大，无法发现
 // 「v13 新增列没写进 ALTER 列表」这类遗漏）。
 //
@@ -106,8 +106,9 @@ func TestAuditMigrateV12ToV13(t *testing.T) {
 	if !okv {
 		t.Fatal("读版本失败")
 	}
-	if v != "13" {
-		t.Fatalf("版本应升到 13, got %q", v)
+	// 不写死版本号：升级目标就是当前 schemaVersion，断言它避免每次加迁移都要改测试。
+	if v != schemaVersion {
+		t.Fatalf("版本应升到 %s, got %q", schemaVersion, v)
 	}
 
 	// ② 历史数据完整保留（一字不改）
@@ -168,5 +169,68 @@ func TestAuditMigrateV12ToV13(t *testing.T) {
 	if len(newLogs) == 0 || !newLogs[0].IsStream || newLogs[0].CacheReadTokens != 7 ||
 		newLogs[0].UserAgent != "audit/1.0" {
 		t.Fatalf("v13 列未生效: %+v", newLogs[0])
+	}
+}
+
+// AuditMigrateV13ToV14：v13 → v14（缓存单价列）升级路径。
+//
+// 与 v12→当前 的测试互补：那一个验证「缺 v13 列」的库，这一个验证「已有 v13、
+// 只缺 v14 列」的库。断言重点是**旧模型的价格一字不改**——v14 只往 models 表加
+// 两列，若迁移写成「重建表」就可能悄悄丢掉已有定价（那是直接的账单错误）。
+func TestAuditMigrateV13ToV14(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "arkgate.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// 构造 v13 models 表：有 price_input/output/image，缺 price_cache_*。
+	for _, st := range []string{
+		`CREATE TABLE models (name TEXT PRIMARY KEY, display TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+			fallback TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL DEFAULT 0,
+			type TEXT NOT NULL DEFAULT 'text', provider TEXT NOT NULL DEFAULT '',
+			price_input REAL NOT NULL DEFAULT 0, price_output REAL NOT NULL DEFAULT 0,
+			price_image REAL NOT NULL DEFAULT 0, context_tokens INTEGER NOT NULL DEFAULT 0,
+			max_output_tokens INTEGER NOT NULL DEFAULT 0, router TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO models(name,display,enabled,price_input,price_output,price_image,context_tokens)
+			VALUES('gpt-4o','GPT-4o',1,2.5,10,0,128000)`,
+	} {
+		if _, err := db.Exec(st); err != nil {
+			t.Fatalf("build v13: %v", err)
+		}
+	}
+	_ = db.Close()
+
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("v13 库升级失败: %v", err)
+	}
+	defer st.Close()
+
+	m, err := st.GetModel("gpt-4o")
+	if err != nil {
+		t.Fatalf("读回模型: %v", err)
+	}
+	// 已有定价必须原样保留（迁移绝不能动 models 的既有列）。
+	if m.PriceInput != 2.5 || m.PriceOutput != 10 || m.ContextTokens != 128000 {
+		t.Fatalf("旧模型定价被改动: %+v", m)
+	}
+	// 新列取零值 = 「未设置」，计费回落到输入单价（等价旧行为）。
+	if m.PriceCacheRead != 0 || m.PriceCacheWrite != 0 {
+		t.Fatalf("新增缓存单价列应为 0（未设置）, got read=%v write=%v",
+			m.PriceCacheRead, m.PriceCacheWrite)
+	}
+
+	// 升级后能正常写入并读回缓存单价。
+	m.PriceCacheRead, m.PriceCacheWrite = 0.25, 3.125
+	if err := st.UpsertModel(m); err != nil {
+		t.Fatalf("保存缓存单价: %v", err)
+	}
+	got, err := st.GetModel("gpt-4o")
+	if err != nil {
+		t.Fatalf("再读: %v", err)
+	}
+	if got.PriceCacheRead != 0.25 || got.PriceCacheWrite != 3.125 {
+		t.Fatalf("缓存单价未持久化: read=%v write=%v", got.PriceCacheRead, got.PriceCacheWrite)
 	}
 }

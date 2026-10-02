@@ -134,6 +134,17 @@ type Model struct {
 	PriceOutput float64 `json:"price_output"` // 输出 token 单价：$ / 1M tokens
 	PriceImage  float64 `json:"price_image"`  // 图像单价：$ / 张
 
+	// 缓存 token 单价（$ / 1M），0 = 未设置。
+	//
+	// 为什么必须单列：上游报告的 prompt_tokens 是**含缓存命中的总量**，
+	// 而各家对缓存的定价与原价不同（Anthropic 缓存读取约为输入价 10%、
+	// 写入约 125%；OpenAI 读取约 50%）。只用一个 PriceInput 会在两个方向同时算错：
+	// 命中部分按原价**多收**，而缓存写入实际**漏收**。
+	//
+	// 0 = 未设置：回落到 PriceInput，等价于旧行为，不改变历史账单口径。
+	PriceCacheRead  float64 `json:"price_cache_read"`
+	PriceCacheWrite float64 `json:"price_cache_write"`
+
 	// 能力上限（0 = 未设置：不校验，允许目录按模型名自动补全；人工填写的值优先）。
 	ContextTokens   int64 `json:"context_tokens"`    // 上下文窗口（tokens）
 	MaxOutputTokens int64 `json:"max_output_tokens"` // 单次最大输出（tokens），非 0 时网关裁剪 max_tokens

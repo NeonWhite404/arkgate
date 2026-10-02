@@ -1946,6 +1946,34 @@ const PortalPage = {
       const p = (this.d.today.images / this.d.daily_limit_images) * 100;
       return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
     },
+    // 缓存命中率（输入侧口径）= 缓存读取 /（缓存读取 + 非缓存输入）。
+    // 与用量分析页保持同一口径，避免门户与后台数字对不上引发质疑。
+    cacheHitRate() {
+      const w = this.d && this.d.week;
+      if (!w) return null;
+      const read = w.cache_read_tokens || 0;
+      const plain = Math.max(0, (w.tokens || 0) - read);
+      if (read + plain <= 0) return null;
+      return (read / (read + plain)) * 100;
+    },
+    // 缓存节省展示文案。三种「无数据」必须区分开，否则会被误读：
+    //   无缓存用量 → 没有可比较的对象；
+    //   有模型未定价 → 不知道省了多少（不是省了 $0）；
+    //   确有数据 → 显示金额（负值 = 省钱）。
+    cacheSavingsText() {
+      const d = this.d;
+      if (!d) return "—";
+      if (!d.cache_has_usage) return "—";
+      if (!d.cache_savings_priced) return "—（部分模型未定价）";
+      const v = d.cache_savings || 0;
+      if (v === 0) return "$0.0000";
+      // saved 为负 = 省钱；正 = 多付（缓存写入溢价超过读取折扣时可能发生）。
+      return (v < 0 ? "省 " : "多付 ") + fmtCost(Math.abs(v));
+    },
+    cacheSavingsClass() {
+      const v = (this.d && this.d.cache_savings) || 0;
+      return v < 0 ? "cost" : "";
+    },
   },
   mounted() { this.load(); },
   methods: {
@@ -1980,6 +2008,7 @@ const PortalPage = {
         <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">今日图像（张）</div></div></div>
         <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">今日成本</div></div></div>
         <div class="stat-card"><div class="ic ic-green">✅</div><div class="body"><div class="v">{{ fmtPct(d.success_rate_7d) }}</div><div class="l">7 天成功率</div></div></div>
+        <div class="stat-card"><div class="ic ic-teal">♻</div><div class="body"><div class="v">{{ cacheHitRate === null ? '—' : cacheHitRate.toFixed(1) + '%' }}</div><div class="l">7 天缓存命中占输入</div></div></div>
       </div>
 
       <div class="card" v-if="d.daily_limit_tokens || d.daily_limit_images">
@@ -1996,10 +2025,17 @@ const PortalPage = {
 
       <div class="card">
         <div class="card-head"><div class="card-title">累计（自开通以来）与最近 7 天</div></div>
-        <div class="table-wrap"><table><thead><tr><th>范围</th><th>请求</th><th>成功</th><th>Tokens</th><th>图像</th><th>成本</th></tr></thead><tbody>
-          <tr><td>最近 7 天</td><td>{{ d.week.requests }}</td><td>{{ d.week.success }}</td><td>{{ fmtTokens(d.week.tokens) }}</td><td>{{ d.week.images }}</td><td class="cost">{{ fmtCost(d.week.cost) }}</td></tr>
-          <tr><td>累计</td><td>{{ d.total.requests }}</td><td>{{ d.total.success }}</td><td>{{ fmtTokens(d.total.tokens) }}</td><td>{{ d.total.images }}</td><td class="cost">{{ fmtCost(d.total.cost) }}</td></tr>
+        <div class="table-wrap"><table><thead><tr><th>范围</th><th>请求</th><th>成功</th><th>Tokens</th><th>缓存读取</th><th>缓存写入</th><th>图像</th><th>成本</th></tr></thead><tbody>
+          <tr><td>最近 7 天</td><td>{{ d.week.requests }}</td><td>{{ d.week.success }}</td><td>{{ fmtTokens(d.week.tokens) }}</td><td>{{ fmtTokens(d.week.cache_read_tokens || 0) }}</td><td>{{ fmtTokens(d.week.cache_creation_tokens || 0) }}</td><td>{{ d.week.images }}</td><td class="cost">{{ fmtCost(d.week.cost) }}</td></tr>
+          <tr><td>累计</td><td>{{ d.total.requests }}</td><td>{{ d.total.success }}</td><td>{{ fmtTokens(d.total.tokens) }}</td><td>{{ fmtTokens(d.total.cache_read_tokens || 0) }}</td><td>{{ fmtTokens(d.total.cache_creation_tokens || 0) }}</td><td>{{ d.total.images }}</td><td class="cost">{{ fmtCost(d.total.cost) }}</td></tr>
         </tbody></table></div>
+        <!-- 缓存节省：缓存读通常远低于输入价，命中率直接影响用户实际花费。
+             展示节省额让用户知道「把稳定前缀放在请求开头」是有回报的。
+             无数据/未定价显示 —，绝不显示 $0（会被读成「没有节省」）。 -->
+        <div class="kv" style="padding:0 16px 14px">
+          <span class="k">缓存节省（最近 7 天，相对全部未命中）</span>
+          <span class="v" :class="cacheSavingsClass">{{ cacheSavingsText }}</span>
+        </div>
       </div>
 
       <div class="card">
