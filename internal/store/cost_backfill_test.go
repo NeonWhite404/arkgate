@@ -320,3 +320,100 @@ func TestRepairDailyCosts(t *testing.T) {
 		t.Fatalf("幂等：二次预演应为 0, got %d", n)
 	}
 }
+
+// TestBackfillPaginationNoSkipNoDup 锁定回填的分页正确性。
+//
+// 审计时的推理：查询 `ORDER BY id LIMIT ? OFFSET ?`，而批内会 UPDATE 命中行。
+// 因 UPDATE **不修改 id、不修改 WHERE 条件（ts 区间）、更不修改排序键**，
+// 后续批次的 OFFSET 仍精确跳过已处理行 → 不漏行、不重复行。
+//
+// 但「推理正确」不等于「有回归保护」：若将来有人把排序键改成 ts
+// （ts 有重复值且可能被改动），或把 UPDATE 改成同时写 ts，分页立刻出错。
+// 本测试用**刻意跨批边界**的数据量 + 严格校验每次 id 只被处理一次来锁定。
+//
+// 做法：用一个记录「每条 id 被扫描次数」的计价函数（CostFunc 每行调用一次），
+// 断言每个 id 恰好被调用一次。
+func TestBackfillPaginationNoSkipNoDup(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	// 5200 条 > 批大小 5000，必然触发第二次分页。
+	//
+	// **ts 必须有重复值**：生产中 TS 取 nowUnix()，同秒并发请求会拿到相同 ts。
+	// 初版测试给每行唯一递增 ts，结果「把排序键换成 ts」的反向验证竟然通过——
+	// 数据没制造出会破坏分页的条件，测试等于没锁住任何东西。
+	// 这里刻意让每 7 行共用同一个 ts（模拟同秒批量写入）。
+	// **cost 必须各不相同**：反向验证时发现，若所有行 cost 相同（初版就是全
+	// 0.003），「按 cost 排序」也是稳定的，模拟不出任何分页问题——测试等于
+	// 只验证了「不会崩」，没验证「不重不漏」。
+	// 这里让 cost 随 i 变化，使「排序键被 UPDATE 修改」这类改法必然暴露。
+	const n = 5200
+	for i := 0; i < n; i++ {
+		if err := st.AddUsageLog(&model.UsageLog{
+			TS: int64(1000 + i/7), Model: "paged", Status: "ok",
+			PromptTokens: int64(1000 + i), TotalTokens: 1000,
+			CacheReadTokens: 600,
+			// 旧值刻意各不相同（排序敏感）；新值也各不相同但单调性改变，
+			// 使「按 cost 排序 + 改写 cost」会在批次间重排 → OFFSET 漏行。
+			Cost: 0.003 + float64(i%97)*1e-6,
+		}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	// 计价函数被调用一次 = 该行被扫描一次。用 map 统计调用次数。
+	// 注意 CostFunc 签名没有行 id，所以用「文本区间」间接验证不现实——
+	// 改为在函数里按调用次数计数，并单独校验最终每行只被更新一次。
+	var calls int64
+	counting := func(modelName string, prompt, completion, images, cacheRead, cacheWrite int64) (float64, float64, float64, bool) {
+		calls++
+		return float64(prompt-cacheRead) / 1e6 * 3, 0, float64(cacheRead) / 1e6 * 0.3, true
+	}
+
+	res, err := st.BackfillCosts(0, 999999, counting, false)
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	// 每个 id 恰好扫描一次：既无漏行（< n）也无重复行（> n）。
+	if calls != n {
+		t.Fatalf("每行应恰好被扫描一次：期望 %d, got %d（漏行或重复行）", n, calls)
+	}
+	if res.Scanned != n {
+		t.Fatalf("Scanned 应为 %d, got %d", n, res.Scanned)
+	}
+	if res.Updated != n {
+		t.Fatalf("Updated 应为 %d, got %d（有行被跳过或重复更新）", n, res.Updated)
+	}
+
+	// 全量核对：统计仍是旧值 0.003 的行数——必须为 0（漏行的直接表现）。
+	//
+	// 用直接 SQL 而非 QueryUsageLogs：后者上限 200 行，抽样无法发现漏行。
+	st.mu.RLock()
+	// 新口径 = (prompt-cacheRead)/1e6*3 + cacheRead/1e6*0.3 = (1000+i-600)/1e6*3 + 0.00018
+	// 未回填的行 = 旧值（0.003 + (i%97)*1e-6）。用「不等于新口径」来判定残留。
+	var stale int64
+	if err := st.db.QueryRow(
+		`SELECT COUNT(*) FROM usage_logs
+		 WHERE model='paged'
+		   AND ABS(cost - (CAST(prompt_tokens AS REAL)-600)/1e6*3 - 600/1e6*0.3) > 1e-9`,
+	).Scan(&stale); err != nil {
+		st.mu.RUnlock()
+		t.Fatalf("count stale: %v", err)
+	}
+	var total int64
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM usage_logs WHERE model='paged'`).Scan(&total); err != nil {
+		st.mu.RUnlock()
+		t.Fatalf("count total: %v", err)
+	}
+	st.mu.RUnlock()
+	if total != n {
+		t.Fatalf("数据量应为 %d, got %d", n, total)
+	}
+	if stale != 0 {
+		t.Fatalf("有 %d 行仍是旧值 0.003（分页漏行）；期望全部被回填", stale)
+	}
+}

@@ -116,8 +116,17 @@ func costEqual(a, b float64) bool {
 func (s *Store) queryCostBackfillBatch(from, to int64, limit int, offset int64) ([]costBackfillRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// 用 id 排序分页（offset 按已扫描条数推进）而不是按 ts：ts 有重复值，
-	// 用它分页会漏行或重复行。
+	// 分页用 OFFSET，按 id 排序。
+	//
+	// 为什么这样是安全的（曾误写成「必须用 id，用 ts 会漏行」，那是错的）：
+	// UPDATE 只改 input_cost/output_cost/cache_cost/cost 列，**不碰排序键与
+	// WHERE 条件（ts 区间）**，所以后续批次的排序结果与首批完全一致，
+	// OFFSET 能精确跳过已处理行。只要这个前提成立，任何稳定排序都安全；
+	// id 只是最自然的选择（唯一、不可变）。
+	//
+	// 反面情形：若将来改成按 cost 排序并同时改写 cost，排序会在批次间
+	// 重排，OFFSET 就会漏行/重复行。已用 TestBackfillPaginationNoSkipNoDup
+	// 锁定「每行恰好被处理一次」。
 	rows, err := s.db.Query(`SELECT id, model, prompt_tokens, completion_tokens, image_count,
 			cache_read_tokens, cache_creation_tokens, input_cost, output_cost, cache_cost, cost
 		FROM usage_logs
