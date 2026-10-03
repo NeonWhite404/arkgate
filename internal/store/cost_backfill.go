@@ -172,3 +172,95 @@ func (s *Store) applyCostUpdates(updates []costUpdate) error {
 var _ CostFunc = func(string, int64, int64, int64, int64, int64) (float64, float64, float64, bool) {
 	return 0, 0, 0, false
 }
+
+// RepairDailyCosts 按 usage_logs 重算 usage_daily 的成本列。
+//
+// 为什么需要单独修：usage_daily.cost 与 usage_logs.cost 是两个独立写入路径。
+// 某次重构漏了把成本填进统计投递结构体，于是 usage_daily.cost 恒为 0，
+// 而 usage_logs.cost 完全正常——门户「今日成本」卡片直接显示 $0，
+// 但用户的周/总费用（取自日志聚合）是对的，同一页面自相矛盾。
+// 修复代码只保证**今后**写对，已落库的 0 不会自己变，所以要能重算。
+//
+// 为什么与 BackfillCosts 分开：本函数不依赖模型定价（直接把日志里的 cost 加总），
+// 因此即使模型已被删除也能修正——而 BackfillCosts 对未定价模型会置 0。
+//
+// 时区：day 是**本地时区**自然日（与 today() 写入口径一致），所以按本地时区
+// 分组，不能用 UTC（跨时区会把凌晨的请求算到前一天）。
+func (s *Store) RepairDailyCosts(from, to int64, dryRun bool) (int64, error) {
+	if from >= to {
+		return 0, fmt.Errorf("区间非法: from=%d to=%d", from, to)
+	}
+	// 先按本地时区的自然日聚合日志成本。
+	//
+	// 单连接约束：必须在遍历 rows 之前把结果读完再执行 UPDATE——
+	// 在 rows 未关闭时发起新的查询会因拿不到连接而永久阻塞。
+	type dayAgg struct {
+		day  string
+		cost float64
+	}
+	var aggs []dayAgg
+	func() {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		rows, err := s.db.Query(`SELECT
+				strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+				COALESCE(SUM(cost),0)
+			FROM usage_logs
+			WHERE ts >= ? AND ts < ? AND subkey_id <> ''
+			GROUP BY day`, from, to)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a dayAgg
+			if err := rows.Scan(&a.day, &a.cost); err != nil {
+				return
+			}
+			aggs = append(aggs, a)
+		}
+	}()
+	if len(aggs) == 0 {
+		return 0, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 逐日对齐 usage_daily.cost（只改成本，不动 tokens/images/requests）。
+	//
+	// 「不动其它列」是刻意的：tokens/images 一直是对的，重算它们反而有风险
+	// （例如日志被清理后会把计数改小）。成本这一列才是本次要修的对象。
+	var fixed int64
+	for _, a := range aggs {
+		if dryRun {
+			// 预演：只统计差异，不写。
+			var cur float64
+			if err := tx.QueryRow(`SELECT COALESCE(SUM(cost),0) FROM usage_daily WHERE day=?`, a.day).Scan(&cur); err == nil {
+				if !costEqual(cur, a.cost) {
+					fixed++
+				}
+			}
+			continue
+		}
+		res, err := tx.Exec(`UPDATE usage_daily SET cost=? WHERE day=?`, a.cost, a.day)
+		if err != nil {
+			return fixed, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			fixed += n
+		}
+	}
+	if dryRun {
+		return fixed, tx.Rollback()
+	}
+	if err := tx.Commit(); err != nil {
+		return fixed, err
+	}
+	return fixed, nil
+}

@@ -245,6 +245,17 @@ func (a *Admin) handleCostBackfill(w http.ResponseWriter, r *http.Request) {
 			rollupRows = n
 		}
 	}
+	// 顺带修复日用量表的成本列。
+	//
+	// 为什么放在同一个端点而不是新开一个：usage_daily.cost 与 usage_logs.cost
+	// 是两条独立写入路径，历史上出现过「重构漏填统计字段 → 日成本恒 0，
+	// 而日志成本正常」的缺陷（门户「今日成本」显示 $0 但周/总正常）。
+	// 运维不需要记住跑两个地方——修成本就该一次修干净。
+	//
+	// 与主回填的区别：本步**不依赖模型定价**（直接加总日志里的 cost），
+	// 因此模型已被删除时也能修；且只改成本列，不动 tokens/images/requests
+	// （那些一直是对的，重算反而可能在日志被清理后把数字改小）。
+	dailyFixed, dailyErr := a.store.RepairDailyCosts(from, to, dryRun)
 	out := map[string]any{
 		"success":     rollupErr == "",
 		"from":        from,
@@ -257,9 +268,14 @@ func (a *Admin) handleCostBackfill(w http.ResponseWriter, r *http.Request) {
 		"delta":       res.NewTotal - res.OldTotal,
 		"dry_run":     res.DryRun,
 		"rollup_rows": rollupRows,
+		// daily_fixed：被修正的（日 × 子Key）行数。修成本历史时用得上。
+		"daily_fixed": dailyFixed,
 	}
 	if rollupErr != "" {
 		out["rollup_error"] = rollupErr
+	}
+	if dailyErr != nil {
+		out["daily_error"] = dailyErr.Error()
 	}
 	writeJSON(w, 200, out)
 }

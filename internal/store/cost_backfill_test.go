@@ -2,6 +2,7 @@ package store
 
 import (
 	"testing"
+	"time"
 
 	"arkgate/internal/model"
 )
@@ -250,5 +251,72 @@ func TestBackfillCostsLargeSet(t *testing.T) {
 	}
 	if again.Updated != 0 {
 		t.Fatalf("二次回填应为 0 变更, got %d", again.Updated)
+	}
+}
+
+// TestRepairDailyCosts 修复 usage_daily.cost 恒 0 的历史数据。
+//
+// 复现真实缺陷：某次重构漏填 statOp.cost，导致日用量表成本恒为 0，
+// 而 usage_logs.cost 正常。门户「今日成本」直接显示 $0（用户可见），
+// 周/总费用却正确——同一页面自相矛盾。
+func TestRepairDailyCosts(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.UpsertSubKey(&model.SubKey{ID: "sk1", Name: "k", KeyHash: "h", Enabled: true}); err != nil {
+		t.Fatalf("subkey: %v", err)
+	}
+	// 造「坏行」：日用量 cost=0（模拟缺陷期间的写入），日志 cost 正常。
+	now := time.Now().Unix()
+	for i := 0; i < 3; i++ {
+		if err := st.AddUsageLog(&model.UsageLog{
+			TS: now, SubKeyID: "sk1", Model: "m", Status: "ok",
+			PromptTokens: 100, TotalTokens: 100, Cost: 0.002955,
+		}); err != nil {
+			t.Fatalf("log: %v", err)
+		}
+	}
+	if err := st.AddDailyUsage("sk1", 300, 0, 3, 0); err != nil { // cost=0：坏值
+		t.Fatalf("daily: %v", err)
+	}
+
+	// 预演：应报告需要修复，但不写。
+	n, err := st.RepairDailyCosts(now-3600, now+3600, true)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("预演应报告 1 天待修复, got %d", n)
+	}
+	du, _ := st.GetDailyUsage("sk1")
+	if du.Cost != 0 {
+		t.Fatalf("预演不应写库, got %v", du.Cost)
+	}
+
+	// 真跑。
+	if _, err := st.RepairDailyCosts(now-3600, now+3600, false); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	du, _ = st.GetDailyUsage("sk1")
+	want := 3 * 0.002955
+	if !approxEq(du.Cost, want) {
+		t.Fatalf("修复后日成本应为 %v, got %v", want, du.Cost)
+	}
+	// 关键：tokens/images/requests 必须**原样保留**——只修成本列，
+	// 重算计数在日志被清理的场景下反而会把数字改小。
+	if du.Tokens != 300 || du.Requests != 3 {
+		t.Fatalf("修复成本时不应改动其它列: tokens=%d requests=%d", du.Tokens, du.Requests)
+	}
+	// 再次执行应无变化（幂等）。
+	n, err = st.RepairDailyCosts(now-3600, now+3600, true)
+	if err != nil {
+		t.Fatalf("dry-run2: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("幂等：二次预演应为 0, got %d", n)
 	}
 }
