@@ -1580,8 +1580,15 @@ func TestQueryUsageErrorKindAndCostSplit(t *testing.T) {
 }
 
 // TestSubKeyWhitelistExcludesV13Columns 锁定门户越权红线：
-// v13 新增列（错误分类、UA、上游成本、成本拆分、缓存 token）都不得进入
-// 门户列白名单。UA 可指纹化下游客户端、错误分类可推断上游拓扑，属管理端信息。
+// 管理端属性不得进入门户**日志明细**列白名单。UA 可指纹化下游客户端、
+// 错误分类/错误文本可推断上游拓扑，账号/provider/ep 属运维侧信息。
+//
+// 注意区分（缓存 token 的取舍在此说明，避免后来者误判）：
+//   - **明细列**不含 cache_* —— 避免逐条日志暴露上游成本结构；
+//   - 但 week/total **汇总**与「缓存节省」确实返回缓存 token：它是该子 Key
+//     自己流量的计费细分（prompt_tokens 的子集），不涉他人也不含上游标识，
+//     且用户需要它才能判断「开缓存到底省没省钱」。
+//   两者不矛盾：一个是「逐条明细」，一个是「自己的聚合账单」。
 func TestSubKeyWhitelistExcludesV13Columns(t *testing.T) {
 	forbidden := []string{
 		"error_kind", "user_agent", "upstream_cost", "input_cost", "output_cost",

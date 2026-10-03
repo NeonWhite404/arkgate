@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -122,7 +123,11 @@ func (a *Admin) verifyToken(tok string) bool {
 	if !ok {
 		return false
 	}
-	return isTokenHash(tok) == stored
+	// 必须用**定时安全**比较：普通 == 会在首个不同字节处提前返回，理论上可
+	// 通过响应时间差逐字节猜出 sha256 值。这里泄露哈希等价于泄露令牌——
+	// 服务端只比对哈希，拿到哈希即可直接当 Bearer 令牌用（无需原像）。
+	// 注意：不能因为「它是哈希所以无所谓」而跳过这层防护。
+	return subtle.ConstantTimeCompare([]byte(isTokenHash(tok)), []byte(stored)) == 1
 }
 
 // EnsureAdminToken 首次运行时若无令牌则生成一个并打印到控制台。

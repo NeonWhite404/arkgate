@@ -1014,6 +1014,9 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr b
 	// 而不是两条独立公式碰巧相等（旧实现分两路算，缓存单价改动后必然发散）。
 	l.InputCost, l.OutputCost, l.CacheCost = b.splitCost(l.Model, l)
 	l.Cost = l.InputCost + l.OutputCost + l.CacheCost
+	// 必须在构造 op 之后再回填 cost：applyStat 会把它写进 usage_daily.cost。
+	// 写在构造字面量里是不行的——那时 l.Cost 还没算出来。
+	op.cost = l.Cost
 	b.enqueueStat(op, l)
 }
 

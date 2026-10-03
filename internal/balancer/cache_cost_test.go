@@ -3,6 +3,9 @@ package balancer
 import (
 	"math"
 	"testing"
+	"time"
+
+	"arkgate/internal/store"
 
 	"arkgate/internal/model"
 )
@@ -178,5 +181,69 @@ func TestCacheBillingViaRecord(t *testing.T) {
 	}
 	if !approx(l.Cost, wantIn+wantCache+wantOut) {
 		t.Fatalf("Cost 应等于三者之和 $%.4f, got $%.4f", wantIn+wantCache+wantOut, l.Cost)
+	}
+}
+
+// TestDailyCostRecorded 日用量表必须记录当次成本。
+//
+// 回归锁定（真实缺陷）：v14 重构 Record 时把 op 的构造提前了，但 op.cost 只在
+// 旧实现里通过 `op.cost = b.computeCost(...)` 赋值；改成「先拆分再汇总」后
+// 忘记回填 op.cost，于是 usage_daily.cost 恒为 0——而 usage_logs.cost 正常。
+// 表现是门户「今日费用」为 0 而「7 天费用」正常（今日取自日用量表，
+// 7 天取自日志聚合）。字段当时未被前端消费，所以界面没暴露。
+func TestDailyCostRecorded(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.UpsertModel(&model.Model{
+		Name: "m", Enabled: true, Type: model.ModelTypeText,
+		PriceInput: 3, PriceOutput: 15, PriceCacheRead: 0.3, PriceCacheWrite: 3.75,
+	}); err != nil {
+		t.Fatalf("model: %v", err)
+	}
+	sk := &model.SubKey{ID: "sk_daily", Name: "k", KeyHash: "h", Enabled: true}
+	if err := st.UpsertSubKey(sk); err != nil {
+		t.Fatalf("subkey: %v", err)
+	}
+
+	b := New(st, 0)
+	defer b.Close()
+	b.Refresh()
+
+	// 1000 prompt（600 读 + 100 写 + 300 普通）+ 100 输出
+	// = 0.0009 + 0.000555 + 0.0015 = 0.002955
+	l := &model.UsageLog{
+		Model: "m", SubKeyID: sk.ID, Status: "ok",
+		PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100,
+		CacheReadTokens: 600, CacheCreationTokens: 100,
+	}
+	b.Record(l, nil, true, false)
+	// 统计是异步落库的，等一下再读（通道 → consumer）。
+	deadline := time.Now().Add(3 * time.Second)
+	var du *store.DailyUsage
+	for time.Now().Before(deadline) {
+		d, err := st.GetDailyUsage(sk.ID)
+		if err == nil && d.Cost > 0 {
+			du = d
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if du == nil {
+		t.Fatal("usage_daily.cost 始终为 0——Record 未把成本写入 statOp（见本测试注释）")
+	}
+	if !approx(du.Cost, 0.002955) {
+		t.Fatalf("日成本应为 0.002955, got %v", du.Cost)
+	}
+	// 与日志表口径必须一致（两表都被界面展示，不一致会被当成 bug）。
+	if !approx(du.Cost, l.Cost) {
+		t.Fatalf("日成本 %v != 日志成本 %v", du.Cost, l.Cost)
+	}
+	if du.Tokens != 1100 {
+		t.Fatalf("日 token 应为 1100, got %d", du.Tokens)
 	}
 }
