@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"arkgate/internal/balancer"
+	"arkgate/internal/config"
 	"arkgate/internal/model"
 	"arkgate/internal/store"
 )
@@ -28,12 +29,13 @@ import (
 type Portal struct {
 	store   *store.Store
 	bal     *balancer.Balancer
+	cfg     *config.Config
 	handler http.Handler
 }
 
-// New 构造门户。
-func New(st *store.Store, bal *balancer.Balancer) *Portal {
-	p := &Portal{store: st, bal: bal}
+// New 构造门户。cfg 用于下发展示币种（单价与成本仍是美元存储，只做展示换算）。
+func New(st *store.Store, bal *balancer.Balancer, cfg *config.Config) *Portal {
+	p := &Portal{store: st, bal: bal, cfg: cfg}
 	p.handler = p.routes()
 	return p
 }
@@ -212,7 +214,23 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"cache_savings":        cacheSavings,
 		"cache_has_usage":      anyCache,
 		"cache_savings_priced": allPriced,
+		// 展示币种：子 Key 用户看的是自己的账单，必须和管理端同一口径，
+		// 否则「管理员看到 ￥21、用户看到 $3」会被当成计费错误。金额本身
+		// 仍是美元数值，换算由前端按汇率做。
+		"currency": p.currency(),
 	})
+}
+
+// currency 下发展示币种设置。非敏感信息（汇率与符号），可安全给子 Key 用户。
+func (p *Portal) currency() map[string]any {
+	if p.cfg == nil || p.cfg.Currency == nil {
+		return map[string]any{"rate": 0, "symbol": "$", "code": "USD"}
+	}
+	return map[string]any{
+		"rate":   p.cfg.Currency.Rate(),
+		"symbol": p.cfg.Currency.Symbol(),
+		"code":   p.cfg.Currency.Code(),
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -75,7 +75,7 @@ func main() {
 
 	gw := gateway.New(cfg, st, box, bal)
 	adm := admin.New(st, box, bal, cfg)
-	pt := portal.New(st, bal)
+	pt := portal.New(st, bal, cfg)
 
 	// 首次运行自动生成管理令牌。
 	if tok, created := adm.EnsureAdminToken(); created {

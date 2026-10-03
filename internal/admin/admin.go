@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 	"time"
 
 	"arkgate/internal/balancer"
@@ -43,9 +44,17 @@ type Admin struct {
 const tokenHashKey = "admin_token_hash"
 
 // 运行时设置的持久化键（settings 表，值为秒；"0" = 关闭该超时）。
+// maxCurrencyRate 汇率上限。不做精确的经济学约束，只是挡住明显的手滑
+// （例如把 7.2 打成 7200000）与负值。
+const maxCurrencyRate = 1e6
+
 const (
 	keyTimeoutRequest    = "timeout_request_sec"
 	keyTimeoutFirstToken = "timeout_first_token_sec"
+	// 计价币种：单价与成本始终以美元存储，这里只存「展示用」的汇率与符号。
+	keyCurrencyRate   = "currency_rate"
+	keyCurrencySymbol = "currency_symbol"
+	keyCurrencyCode   = "currency_code"
 )
 
 // New 构造管理后端，并把已持久化的运行时设置应用到 cfg
@@ -54,6 +63,7 @@ func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.C
 	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New(),
 		mgr: provider.NewManager(), usageCache: store.NewUsageCache(store.UsageCacheTTL)}
 	a.loadPersistedTimeouts()
+	a.loadPersistedCurrency()
 	a.handler = a.routes()
 	return a
 }
@@ -70,6 +80,28 @@ func (a *Admin) loadPersistedTimeouts() {
 			a.cfg.Timeouts.SetFirstToken(time.Duration(f * float64(time.Second)))
 		}
 	}
+}
+
+// loadPersistedCurrency 启动时把 DB 里的币种设置覆盖到 cfg（未设置过则保留环境变量/默认值）。
+//
+// 只覆盖显式设置过的键：若用户只填了汇率没填符号，符号应保持环境变量/默认值，
+// 而不是被清空成 ""。
+func (a *Admin) loadPersistedCurrency() {
+	rate := a.cfg.Currency.Rate()
+	symbol := a.cfg.Currency.Symbol()
+	code := a.cfg.Currency.Code()
+	if v, ok := a.store.GetSetting(keyCurrencyRate); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			rate = f
+		}
+	}
+	if v, ok := a.store.GetSetting(keyCurrencySymbol); ok && v != "" {
+		symbol = v
+	}
+	if v, ok := a.store.GetSetting(keyCurrencyCode); ok && v != "" {
+		code = v
+	}
+	a.cfg.Currency.Set(rate, symbol, code)
 }
 
 // Handler 返回 http.Handler。
@@ -1063,6 +1095,47 @@ func (a *Admin) handleRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		// 计价币种（展示层）。刻意允许很大的汇率上限——兑换率本身没有天然上界
+		// （历史上出现过 1:10000+ 的币种），卡得太死只会妨碍使用；但要挡住负值
+		// 与非数字，否则界面会显示莫名其妙的金额。
+		if raw, ok := probe["currency_rate"]; ok {
+			rate := floatField(raw)
+			if rate < 0 || rate > maxCurrencyRate {
+				writeJSON(w, 400, map[string]any{"detail": fmt.Sprintf("汇率需在 0~%g 之间（0 = 不换算）", maxCurrencyRate)})
+				return
+			}
+			if err := a.store.SetSetting(keyCurrencyRate, strconv.FormatFloat(rate, 'f', -1, 64)); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			a.cfg.Currency.Set(rate, a.cfg.Currency.Symbol(), a.cfg.Currency.Code())
+		}
+		if raw, ok := probe["currency_symbol"]; ok {
+			sym := strings.TrimSpace(stringField(raw))
+			// 必须按**字符数**而非字节数校验：¥ € £ ₹ ₽ 这些符号在 UTF-8 里都是
+			// 2~3 字节，用 len() 会把它们全部误拒——而人民币符号正是本功能的目标场景。
+			if utf8.RuneCountInString(sym) > 4 {
+				writeJSON(w, 400, map[string]any{"detail": "货币符号最多 4 个字符"})
+				return
+			}
+			if err := a.store.SetSetting(keyCurrencySymbol, sym); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			a.cfg.Currency.Set(a.cfg.Currency.Rate(), sym, a.cfg.Currency.Code())
+		}
+		if raw, ok := probe["currency_code"]; ok {
+			code := strings.ToUpper(strings.TrimSpace(stringField(raw)))
+			if utf8.RuneCountInString(code) > 8 {
+				writeJSON(w, 400, map[string]any{"detail": "货币代码最多 8 个字符"})
+				return
+			}
+			if err := a.store.SetSetting(keyCurrencyCode, code); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			a.cfg.Currency.Set(a.cfg.Currency.Rate(), a.cfg.Currency.Symbol(), code)
+		}
 		writeJSON(w, 200, a.runtimeSettingsBody())
 	default:
 		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
@@ -1076,6 +1149,11 @@ func (a *Admin) runtimeSettingsBody() map[string]any {
 		"session_ttl_sec":         a.cfg.SessionTTL.Seconds(),
 		"max_retries":             a.cfg.MaxRetriesAvailable,
 		"max_timeout_sec":         maxTimeoutSec,
+	"max_currency_rate":       maxCurrencyRate,
+		// 计价币种：单价与成本以美元存储，这两个值只影响展示换算。
+		"currency_rate":   a.cfg.Currency.Rate(),
+		"currency_symbol": a.cfg.Currency.Symbol(),
+		"currency_code":   a.cfg.Currency.Code(),
 		"defaults": map[string]any{
 			"request_timeout_sec":     config.DefaultRequestTimeout.Seconds(),
 			"first_token_timeout_sec": config.DefaultFirstTokenTimeout.Seconds(),
@@ -1915,6 +1993,14 @@ func floatField(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+// stringField 取字符串字段（非字符串类型返回空串，由调用方决定是否视为非法）。
+func stringField(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // stringSlice 把 JSON 解码得到的 []any 安全转成 []string，跳过非字符串与空串。

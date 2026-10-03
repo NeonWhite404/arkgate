@@ -409,7 +409,7 @@ const ModelsPage = {
           <td class="cost">
             <template v-if="m.type==='image'">{{ fmtCost(m.price_image) }} / 张</template>
             <template v-else-if="m.type==='router'">—</template>
-            <template v-else-if="m.price_input || m.price_output">{{ fmtCost(m.price_input) }} / {{ fmtCost(m.price_output) }} per 1M</template>
+            <template v-else-if="m.price_input || m.price_output">{{ fmtUnitPrice(m.price_input) }} / {{ fmtUnitPrice(m.price_output) }} per 1M</template>
             <span v-else class="tag tag-gray">未定价</span>
           </td>
           <td class="mono">
@@ -469,22 +469,22 @@ const ModelsPage = {
         <div class="sec" v-if="mDrawer.form.type!=='router'">
           <div class="sec-title">价格与能力上限</div>
           <div class="form-row three" v-if="mDrawer.form.type==='image'">
-            <div class="form-item"><label>图像单价（$ / 张）</label><input v-model.number="mDrawer.form.price_image" type="number" step="0.0001"/></div>
+            <div class="form-item"><label>图像单价（{{ currencyLabel }} / 张）</label><input v-model.number="mDrawer.form.price_image" type="number" step="0.0001"/></div>
           </div>
           <div class="form-row" v-else>
-            <div class="form-item"><label>输入单价（$ / 1M tokens）</label><input v-model.number="mDrawer.form.price_input" type="number" step="0.0001"/></div>
-            <div class="form-item"><label>输出单价（$ / 1M tokens）</label><input v-model.number="mDrawer.form.price_output" type="number" step="0.0001"/></div>
+            <div class="form-item"><label>输入单价（{{ currencyLabel }} / 1M tokens）</label><input v-model.number="mDrawer.form.price_input" type="number" step="0.0001"/></div>
+            <div class="form-item"><label>输出单价（{{ currencyLabel }} / 1M tokens）</label><input v-model.number="mDrawer.form.price_output" type="number" step="0.0001"/></div>
           </div>
           <!-- 缓存单价：0 = 未设置，计费回落到输入单价。上游报告的 prompt_tokens
                是含缓存命中的总量，缓存读/写单价若与输入价不同（Anthropic 读约
                10%、写约 125%），不填会导致多收（命中按原价）与漏收（写入未计价）。 -->
           <div class="form-row" v-if="mDrawer.form.type==='text'">
             <div class="form-item">
-              <label>缓存读取单价（$ / 1M，0 = 按输入价）</label>
+              <label>缓存读取单价（{{ currencyLabel }} / 1M，0 = 按输入价）</label>
               <input v-model.number="mDrawer.form.price_cache_read" type="number" step="0.000001"/>
             </div>
             <div class="form-item">
-              <label>缓存写入单价（$ / 1M，0 = 按输入价）</label>
+              <label>缓存写入单价（{{ currencyLabel }} / 1M，0 = 按输入价）</label>
               <input v-model.number="mDrawer.form.price_cache_write" type="number" step="0.000001"/>
             </div>
           </div>

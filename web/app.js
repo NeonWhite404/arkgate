@@ -31,11 +31,41 @@ function fmtTime(unix) {
   const p = (n) => (n < 10 ? "0" : "") + n;
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
 }
+// ── 计价币种（展示层）──
+// 存储里的单价与成本**始终是美元**（与 LiteLLM 目录一致），这里只负责换算展示。
+// 汇率由管理端设置页填写，启动时由 /api/settings/runtime 拉取。
+// rate = 0 表示不换算（按美元展示）。
+const currency = reactive({ rate: 0, symbol: "$", code: "USD" });
+
+// applyCurrency 把服务端返回的币种设置写入本地展示状态。
+function applyCurrency(s) {
+  if (!s) return;
+  currency.rate = Number(s.currency_rate || 0);
+  currency.symbol = s.currency_symbol || "$";
+  currency.code = s.currency_code || "USD";
+}
+// currencySuffix 在符号不足以区分币种时补上代码，避免看到 “$” 却以为是美元。
+function currencySuffix() {
+  if (currency.rate <= 0) return "";
+  return currency.symbol === "$" ? " " + currency.code : "";
+}
+// toDisplay 把存储的美元金额换算为展示币种金额。
+function toDisplay(usd) {
+  const v = Number(usd || 0);
+  return currency.rate > 0 ? v * currency.rate : v;
+}
 function fmtCost(c) {
-  c = Number(c || 0);
-  if (c === 0) return "$0";
-  if (c >= 1) return "$" + c.toFixed(2);
-  return "$" + c.toFixed(4);
+  const v = toDisplay(c);
+  const sym = currency.symbol;
+  const suf = currencySuffix();
+  if (v === 0) return sym + "0";
+  if (Math.abs(v) >= 1) return sym + v.toFixed(2) + suf;
+  return sym + v.toFixed(4) + suf;
+}
+// fmtUnitPrice 单价专用：单价数量级小（$/1M），固定 4 位避免 0.30 与 0.3000 跳动。
+function fmtUnitPrice(c) {
+  const v = toDisplay(c);
+  return currency.symbol + v.toFixed(4) + currencySuffix();
 }
 function fmtInt(v) {
   v = Number(v || 0);
@@ -1884,7 +1914,12 @@ const SettingsPage = {
           this.rtForm = {
             request_timeout_sec: d.request_timeout_sec,
             first_token_timeout_sec: d.first_token_timeout_sec,
+            currency_rate: d.currency_rate || 0,
+            currency_symbol: d.currency_symbol || "$",
+            currency_code: d.currency_code || "USD",
           };
+          // 币种是全局展示参数，拉到即应用（金额格式化统一走 fmtCost）。
+          applyCurrency(d);
         })
         .catch((e) => toast(e.message, false));
     },
@@ -1894,9 +1929,13 @@ const SettingsPage = {
       req("PUT", "/api/settings/runtime", {
         request_timeout_sec: Number(this.rtForm.request_timeout_sec) || 0,
         first_token_timeout_sec: Number(this.rtForm.first_token_timeout_sec) || 0,
+        currency_rate: Number(this.rtForm.currency_rate) || 0,
+        currency_symbol: this.rtForm.currency_symbol,
+        currency_code: this.rtForm.currency_code,
       })
         .then((d) => {
           this.rt = d;
+          applyCurrency(d);
           toast("已保存，对后续请求立即生效");
         })
         .catch((e) => toast(e.message, false))
@@ -1931,6 +1970,28 @@ const SettingsPage = {
       <div class="kv" v-if="rt" style="margin-top:12px">
         <span class="k">会话粘性 TTL</span><span class="v mono">{{ rt.session_ttl_sec }}s（ARKGATE_SESSION_TTL）</span></div>
       <div class="kv" v-if="rt"><span class="k">跨接入点重试上限</span><span class="v mono">{{ rt.max_retries }} 次</span></div>
+    </div>
+    <div class="card"><div class="card-head"><div class="card-title">计价币种（展示层，热生效）</div></div>
+      <div class="form-row">
+        <div class="form-item"><label>汇率（1 美元 = ? 本币；0 = 不换算，按美元展示）</label>
+          <input v-model.number="rtForm.currency_rate" type="number" min="0" :max="rt && rt.max_currency_rate || 1000000" step="0.01"/>
+          <div class="form-tip">仅影响界面展示的金额。</div></div>
+        <div class="form-item"><label>货币符号</label>
+          <input v-model="rtForm.currency_symbol" maxlength="4" placeholder="¥"/>
+          <div class="form-tip">留空则回落 <span class="mono">$</span>。</div></div>
+        <div class="form-item"><label>货币代码（ISO，可选）</label>
+          <input v-model="rtForm.currency_code" maxlength="8" placeholder="CNY"/>
+          <div class="form-tip">当符号是 <span class="mono">$</span> 时会附在金额后以区分美元。</div></div>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" :disabled="savingRt" @click="saveRuntime">{{ savingRt ? '保存中…' : '保存' }}</button>
+      </div>
+      <div class="hint" style="margin-top:12px">
+        <b>模型单价与历史成本始终以美元存储</b>（与上游目录一致），这里只做展示换算。
+        因此调整汇率不会改写任何已落库的数据，也不需要重算历史成本；
+        目录自动补全写入的仍是美元单价。
+        <br/>当前展示：{{ fmtCost(1) }} = 1 美元。
+      </div>
     </div>
     <div class="card"><div class="card-head"><div class="card-title">外观（仅本浏览器）</div></div>
       <div class="form-item"><label>背景图地址（留空关闭；可填随机图床或固定图片 URL）</label>
@@ -2064,7 +2125,7 @@ const PortalPage = {
       if (!d.cache_has_usage) return "—";
       if (!d.cache_savings_priced) return "—（部分模型未定价）";
       const v = d.cache_savings || 0;
-      if (v === 0) return "$0.0000";
+      if (v === 0) return fmtCost(0);
       // saved 为负 = 省钱；正 = 多付（缓存写入溢价超过读取折扣时可能发生）。
       return (v < 0 ? "省 " : "多付 ") + fmtCost(Math.abs(v));
     },
@@ -2078,7 +2139,15 @@ const PortalPage = {
     load() {
       this.busy = true;
       req("GET", "/api/portal/overview", null, { key: state.subKey })
-        .then((d) => { this.d = d; })
+        .then((d) => {
+          this.d = d;
+          // 门户的展示币种跟管理端一致，否则管理员与用户看到的金额对不上。
+          if (d.currency) {
+            currency.rate = Number(d.currency.rate || 0);
+            currency.symbol = d.currency.symbol || "$";
+            currency.code = d.currency.code || "USD";
+          }
+        })
         .catch((e) => toast(e.message, false))
         .finally(() => { this.busy = false; });
     },
@@ -2222,6 +2291,14 @@ const App = {
       this.mode = "login";
     });
   },
+  beforeMount() {
+    // 计价币种必须在任何页面渲染前拉到：否则先打开「用量分析」再进「设置」的话，
+    // 第一屏会按美元显示，进设置页才变成人民币——看起来像数据被改了。
+    // 只对管理会话拉（该接口需管理鉴权）；失败静默，保持美元展示。
+    if (state.adminToken) {
+      req("GET", "/api/settings/runtime").then(applyCurrency).catch(() => {});
+    }
+  },
   template: `
     <div v-if="prefs.bgUrl" class="app-bg" :style="bgStyle"></div>
     <div v-if="prefs.bgUrl" class="app-bg-shade"></div>
@@ -2242,6 +2319,11 @@ const app = createApp(App);
 app.config.globalProperties.fmtTokens = fmtTokens;
 app.config.globalProperties.fmtTime = fmtTime;
 app.config.globalProperties.fmtCost = fmtCost;
+app.config.globalProperties.fmtUnitPrice = fmtUnitPrice;
+// currencyLabel：表单里「单价（¥ / 1M）」这类标签用；不换算时显示 $。
+app.config.globalProperties.currencyLabel = () => currency.symbol + currencySuffix();
+// currency 本体挂进 globalProperties，设置页需要读写它。
+app.config.globalProperties.currency = currency;
 app.config.globalProperties.fmtPct = fmtPct;
 app.config.globalProperties.fmtMs = fmtMs;
 app.config.globalProperties.fmtInt = fmtInt;
