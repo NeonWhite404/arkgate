@@ -129,7 +129,7 @@ func TestEndpointBodyParamsUpdateAndClear(t *testing.T) {
 // TestEndpointBodyParamsSurvivesSiblings 同账号同模型的多接入点各自独立。
 //
 // 叶节点级配置的核心不变量：一个接入点的默认参数不能串到兄弟接入点
-//（否则会给不支持的版本注入参数，把本来好的请求打坏）。
+// （否则会给不支持的版本注入参数，把本来好的请求打坏）。
 func TestEndpointBodyParamsSurvivesSiblings(t *testing.T) {
 	s := newTestStore(t)
 	mk := func(id, ep string, params map[string]json.RawMessage) *model.Endpoint {

@@ -43,7 +43,7 @@ func TestRawFieldOfKeepsBigInt(t *testing.T) {
 }
 
 // TestReadAllBodyThenUnmarshalTwice 同一个请求体要能解两次
-//（① any 做部分更新、② RawMessage 保精度）。
+// （① any 做部分更新、② RawMessage 保精度）。
 //
 // 这条锁的是顺序陷阱：先 decode（读干 r.Body）再读原始字节会拿到空的，
 // 表现为「保存时报非法 JSON / 配置被静默清空」。修复前实测就是这个症状。

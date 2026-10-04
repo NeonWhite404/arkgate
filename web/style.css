@@ -604,3 +604,6 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
 /* 深色主题：徽标底色在深色下用半透明亮色，否则对比度不足。 */
 [data-theme="dark"] .src-badge.ic-green { background: rgba(60, 199, 94, .16); color: #6ee08a; }
 [data-theme="dark"] .src-badge.ic-blue { background: rgba(74, 139, 255, .16); color: #7fb0ff; }
+
+/* 表头副标题：用于区分同名但口径不同的列（如「Tokens 上游原始」vs 加权额度）。 */
+th .th-sub { display:block; font-weight:400; font-size:11px; opacity:.62; margin-top:2px; }

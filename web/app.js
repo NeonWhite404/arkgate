@@ -1471,7 +1471,7 @@ const UsagePage = {
     <div class="card" v-if="dim">
       <div class="card-head"><div class="card-title">{{ dimLabel }}拆分（点击行下钻，再点取消）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th>Tokens</th><th>缓存读取</th><th>图像</th><th>成本</th><th>上游失败</th>
+        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th title="上游报告的总 token（prompt+completion，含缓存命中）。计费与展示口径，不是子 Key 额度消耗">Tokens<span class="th-sub">上游原始</span></th><th>缓存读取</th><th>图像</th><th>成本</th><th>上游失败</th>
       </tr></thead><tbody>
         <tr class="clickable" :class="{selected: entity===''}" @click="pick('')">
           <td>全部</td><td>{{ summary.requests || 0 }}</td><td>{{ successRate }}</td>
@@ -2197,6 +2197,26 @@ const PortalPage = {
       const p = (this.d.today.requests / lim) * 100;
       return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
     },
+    // quotaVsRaw 把加权后的额度消耗换算回「上游原始 token」的量级，
+    // 用于向用户解释「为什么表格里的 Tokens 比额度大」。
+    //
+    // 注意这是**估算**：加权计数是 plain + output + read×kr + write×kw，
+    // 反推需要知道各段的原始构成，而中间那张卡只有 week 的聚合值。
+    // 因此这里只在「有缓存用量」时按最简单可靠的关系给出量级：
+    // 加权 ≈ 原始 - 缓存读×(1-kr) - 缓存写×(1-kw)。取负则不出示。
+    quotaVsRaw() {
+      if (!this.d || !this.d.today || !this.d.quota) return null;
+      const q = this.d.quota;
+      const kr = q.cache_read_permille ? q.cache_read_permille / 1000 : 1;
+      const kw = q.cache_write_permille ? q.cache_write_permille / 1000 : 1;
+      if (kr === 1 && kw === 1) return null; // 未启用加权，两个数本来就一样
+      const w = this.d.week || {};
+      // 用本周期加权值 + 7 天缓存量做量级换算（缓存倍率是折扣的来源）。
+      const saved = (w.cache_read_tokens || 0) * (1 - kr) + (w.cache_creation_tokens || 0) * (1 - kw);
+      if (saved <= 0) return null;
+      const approx = this.d.today.tokens + saved;
+      return approx > this.d.today.tokens ? approx : null;
+    },
     tokenProgress() {
       if (!this.d || !this.d.daily_limit_tokens) return null;
       const p = (this.d.today.tokens / this.d.daily_limit_tokens) * 100;
@@ -2298,14 +2318,21 @@ const PortalPage = {
           <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="imageProgress.cls" :style="{width: imageProgress.pct + '%'}"></div></div>
         </template>
         <p class="hint" v-if="d.daily_limit_tokens">
-          Token 按「加权配额」计量：缓存读取与写入各乘自己的倍率，
-          因此开了缓存的实际消耗远低于上游报告的总 token。
+          <strong>额度按「加权配额」计量，与上方表格的 Tokens 列不是同一个数。</strong>
+          上方 Tokens 是上游报告的总量（prompt + completion，含缓存命中）；
+          额度消耗把缓存读取与写入各乘自己的倍率后再累加
+          <template v-if="d.quota && (d.quota.cache_read_permille || d.quota.cache_write_permille)">
+            （当前：读 ×{{ ((d.quota.cache_read_permille || 1000) / 1000) }}、写 ×{{ ((d.quota.cache_write_permille || 1000) / 1000) }}）
+          </template>。
+          <template v-if="quotaVsRaw">{{ periodLabel }}已用额度 {{ fmtTokens(d.today.tokens) }}，
+          对应上游原始 {{ fmtTokens(quotaVsRaw) }} —— 两者相差 {{ (quotaVsRaw / Math.max(1, d.today.tokens)).toFixed(1) }} 倍，
+          这是缓存命中带来的折扣，不是统计错误。</template>
         </p>
       </div>
 
       <div class="card">
         <div class="card-head"><div class="card-title">累计（自开通以来）与最近 7 天</div></div>
-        <div class="table-wrap"><table><thead><tr><th>范围</th><th>请求</th><th>成功</th><th>Tokens</th><th>缓存读取</th><th>缓存写入</th><th>图像</th><th>成本</th></tr></thead><tbody>
+        <div class="table-wrap"><table><thead><tr><th>范围</th><th>请求</th><th>成功</th><th title="上游报告的总 token（prompt+completion），其中缓存命中已计入；不等于额度消耗——额度按缓存倍率加权计量">Tokens<span class="th-sub">上游原始</span></th><th>缓存读取</th><th>缓存写入</th><th>图像</th><th>成本</th></tr></thead><tbody>
           <tr><td>最近 7 天</td><td>{{ d.week.requests }}</td><td>{{ d.week.success }}</td><td>{{ fmtTokens(d.week.tokens) }}</td><td>{{ fmtTokens(d.week.cache_read_tokens || 0) }}</td><td>{{ fmtTokens(d.week.cache_creation_tokens || 0) }}</td><td>{{ d.week.images }}</td><td class="cost">{{ fmtCost(d.week.cost) }}</td></tr>
           <tr><td>累计</td><td>{{ d.total.requests }}</td><td>{{ d.total.success }}</td><td>{{ fmtTokens(d.total.tokens) }}</td><td>{{ fmtTokens(d.total.cache_read_tokens || 0) }}</td><td>{{ fmtTokens(d.total.cache_creation_tokens || 0) }}</td><td>{{ d.total.images }}</td><td class="cost">{{ fmtCost(d.total.cost) }}</td></tr>
         </tbody></table></div>
