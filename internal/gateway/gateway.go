@@ -271,7 +271,11 @@ func (g *Gateway) resolveRoute(leaf *model.Endpoint) (routeInfo, error) {
 		return routeInfo{}, errors.New("账号密钥解密失败")
 	}
 	return routeInfo{
-		rt:          provider.Route{Def: def, BaseURL: baseURL, Key: key, Headers: leaf.RequestHeaders},
+		rt: provider.Route{
+			Def: def, BaseURL: baseURL, Key: key,
+			Headers:      leaf.RequestHeaders,
+			BodyDefaults: leaf.DefaultBodyParams,
+		},
 		accountID:   acc.ID,
 		accountName: acc.Name,
 	}, nil

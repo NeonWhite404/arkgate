@@ -97,7 +97,7 @@ func (m *Manager) post(ctx context.Context, rt Route, path string, body []byte, 
 // Chat 转发非流式 chat/completions，返回上游原始响应与用量。
 // timeout 为本次调用的整体超时（0 = 不限）。
 func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *TextUsage, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -128,7 +128,7 @@ func (m *Manager) Chat(ctx context.Context, rt Route, down []byte, upstreamModel
 // Responses 转发非流式 responses，返回上游原始响应与用量（input/output → prompt/completion）。
 // timeout 为本次调用的整体超时（0 = 不限）。
 func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *TextUsage, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -144,7 +144,7 @@ func (m *Manager) Responses(ctx context.Context, rt Route, down []byte, upstream
 // Images 转发非流式 images/generations，返回原始响应与张数计量。
 // timeout 为本次调用的整体超时（0 = 不限）。
 func (m *Manager) Images(ctx context.Context, rt Route, down []byte, upstreamModel string, timeout time.Duration) ([]byte, *ImageUsage, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -452,7 +452,7 @@ func (m *Manager) openStream(ctx context.Context, rt Route, path string, body []
 // OpenChatStream 打开 chat/completions 流（强制 stream + include_usage）。
 // 返回成功即已收到首字节；失败时未向客户端写过任何字节，可换叶子重试。
 func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
-	body, err := prepareStreamBody(down, upstreamModel)
+	body, err := prepareStreamBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +475,7 @@ func (m *Manager) OpenChatStream(ctx context.Context, rt Route, down []byte, ups
 
 // OpenResponsesStream 打开 responses 流（从终止事件提取用量；终止即收尾，不傻等 EOF）。
 func (m *Manager) OpenResponsesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +489,7 @@ func (m *Manager) OpenResponsesStream(ctx context.Context, rt Route, down []byte
 
 // OpenImagesStream 打开 images/generations 流（partial images）。无 usage 事件。
 func (m *Manager) OpenImagesStream(ctx context.Context, rt Route, down []byte, upstreamModel string, firstTokenTimeout time.Duration) (*Stream, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, err
 	}

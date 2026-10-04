@@ -62,7 +62,10 @@ func (s *Store) Close() error { return s.db.Close() }
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
 // v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
 // v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
-const schemaVersion = "15"
+// v13-v15：见 usage_logs 错误分类/缓存列、模型缓存单价、子 Key 配额周期列。
+// v16：接入点级默认请求体参数列（endpoints.default_body_params；与 v10 的
+//      request_headers 同构——下游不会发、由网关按需补上的上游方言参数）。
+const schemaVersion = "16"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -285,6 +288,7 @@ func (s *Store) migrate() error {
 		`ALTER TABLE models ADD COLUMN type TEXT NOT NULL DEFAULT 'text'`,
 		`ALTER TABLE endpoints ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE endpoints ADD COLUMN request_headers TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE endpoints ADD COLUMN default_body_params TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE subkeys ADD COLUMN daily_limit_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE subkeys ADD COLUMN total_images INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_logs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
@@ -426,6 +430,7 @@ func (s *Store) relaxEndpointUnique() error {
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			total_images INTEGER NOT NULL DEFAULT 0,
 			request_headers TEXT NOT NULL DEFAULT '{}',
+			default_body_params TEXT NOT NULL DEFAULT '{}',
 			upstream_deleted INTEGER NOT NULL DEFAULT 0,
 			skip_upstream_check INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(account_id, model, ep)
@@ -846,7 +851,7 @@ func (s *Store) DeleteModel(name string) (disabledSubKeys []string, err error) {
 
 const endpointCols = `id,account_id,model,ep,enabled,created_at,weight,max_concurrency,rpm_limit,tpm_limit,
 	last_used_at,total_requests,success_requests,fail_requests,prompt_tokens,completion_tokens,total_tokens,
-	total_images,request_headers,upstream_deleted,skip_upstream_check`
+	total_images,request_headers,upstream_deleted,skip_upstream_check,default_body_params`
 
 // endpointColsV5Relax 是 v5 重建 endpoints 表搬数据用的旧列清单（v11 之前）。
 // 旧库没有 upstream_deleted / skip_upstream_check 列，新表这两列 DEFAULT 0，
@@ -857,17 +862,24 @@ const endpointColsV5Relax = `id,account_id,model,ep,enabled,created_at,weight,ma
 
 func scanEndpoint(sc scanner) (*model.Endpoint, error) {
 	e := &model.Endpoint{}
-	var requestHeaders string
+	var requestHeaders, bodyParams string
 	if err := sc.Scan(&e.ID, &e.AccountID, &e.Model, &e.EP, &e.Enabled, &e.CreatedAt,
 		&e.Weight, &e.MaxConcurrency, &e.RPMLimit, &e.TPMLimit, &e.LastUsedAt,
 		&e.TotalRequests, &e.SuccessRequests, &e.FailRequests, &e.PromptTokens,
 		&e.CompletionTokens, &e.TotalTokens, &e.TotalImages, &requestHeaders,
-		&e.UpstreamDeleted, &e.SkipUpstreamCheck); err != nil {
+		&e.UpstreamDeleted, &e.SkipUpstreamCheck, &bodyParams); err != nil {
 		return nil, err
 	}
 	if requestHeaders != "" {
 		if err := json.Unmarshal([]byte(requestHeaders), &e.RequestHeaders); err != nil {
 			return nil, fmt.Errorf("decode endpoint request_headers: %w", err)
+		}
+	}
+	if bodyParams != "" {
+		// RawMessage 直接反序列化：保持值的原始 JSON 字节，避免经 any 往返
+		// 改变数字表示（大整数变浮点）。
+		if err := json.Unmarshal([]byte(bodyParams), &e.DefaultBodyParams); err != nil {
+			return nil, fmt.Errorf("decode endpoint default_body_params: %w", err)
 		}
 	}
 	return e, nil
@@ -920,21 +932,26 @@ func (s *Store) UpsertEndpoint(e *model.Endpoint) error {
 	if err != nil {
 		return fmt.Errorf("encode endpoint request_headers: %w", err)
 	}
+	bodyParams, err := marshalEndpointBodyParams(e.DefaultBodyParams)
+	if err != nil {
+		return fmt.Errorf("encode endpoint default_body_params: %w", err)
+	}
 	_, err = s.db.Exec(`INSERT INTO endpoints (id,account_id,model,ep,enabled,created_at,weight,
 			max_concurrency,rpm_limit,tpm_limit,last_used_at,total_requests,success_requests,
 			fail_requests,prompt_tokens,completion_tokens,total_tokens,total_images,request_headers,
-			upstream_deleted,skip_upstream_check)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			upstream_deleted,skip_upstream_check,default_body_params)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(account_id,model,ep) DO UPDATE SET enabled=excluded.enabled,
 			weight=excluded.weight, max_concurrency=excluded.max_concurrency,
 			rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit,
 			request_headers=excluded.request_headers, upstream_deleted=excluded.upstream_deleted,
-			skip_upstream_check=excluded.skip_upstream_check`,
+			skip_upstream_check=excluded.skip_upstream_check,
+			default_body_params=excluded.default_body_params`,
 		e.ID, e.AccountID, e.Model, e.EP, boolInt(e.Enabled), nonzero(e.CreatedAt, nowUnix()),
 		e.Weight, e.MaxConcurrency, e.RPMLimit, e.TPMLimit, e.LastUsedAt,
 		e.TotalRequests, e.SuccessRequests, e.FailRequests, e.PromptTokens, e.CompletionTokens,
 		e.TotalTokens, e.TotalImages, string(requestHeaders), boolInt(e.UpstreamDeleted),
-		boolInt(e.SkipUpstreamCheck))
+		boolInt(e.SkipUpstreamCheck), string(bodyParams))
 	return err
 }
 
@@ -947,11 +964,27 @@ func (s *Store) updateEndpointByID(e *model.Endpoint, id string) error {
 	if err != nil {
 		return fmt.Errorf("encode endpoint request_headers: %w", err)
 	}
+	bodyParams, err := marshalEndpointBodyParams(e.DefaultBodyParams)
+	if err != nil {
+		return fmt.Errorf("encode endpoint default_body_params: %w", err)
+	}
 	_, err = s.db.Exec(`UPDATE endpoints SET account_id=?, model=?, ep=?, enabled=?, weight=?,
-			max_concurrency=?, rpm_limit=?, tpm_limit=?, request_headers=?, skip_upstream_check=? WHERE id=?`,
+			max_concurrency=?, rpm_limit=?, tpm_limit=?, request_headers=?, skip_upstream_check=?,
+			default_body_params=? WHERE id=?`,
 		e.AccountID, e.Model, e.EP, boolInt(e.Enabled), e.Weight, e.MaxConcurrency,
-		e.RPMLimit, e.TPMLimit, string(requestHeaders), boolInt(e.SkipUpstreamCheck), id)
+		e.RPMLimit, e.TPMLimit, string(requestHeaders), boolInt(e.SkipUpstreamCheck),
+		string(bodyParams), id)
 	return err
+}
+
+// marshalEndpointBodyParams 把默认请求体参数序列化为 JSON 文本。
+// 与 marshalEndpointHeaders 同样的空值约定：nil 与空 map 都落库为 "{}"，
+// 避免 "null" 与 "{}" 两种空表示并存。
+func marshalEndpointBodyParams(params map[string]json.RawMessage) ([]byte, error) {
+	if len(params) == 0 {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(params)
 }
 
 // marshalEndpointHeaders 把映射级请求头序列化为 JSON 文本。nil 与空 map 统一

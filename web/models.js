@@ -17,8 +17,21 @@ function epFormOf(e) {
     weight: e.weight || 0, max_concurrency: e.max_concurrency || 0,
     rpm_limit: e.rpm_limit || 0, tpm_limit: e.tpm_limit || 0,
     request_headers_text: JSON.stringify(e.request_headers || {}, null, 2),
+    // 默认请求体参数：下游不会发、由网关按需补上的上游方言参数。
+    // 与请求头分开两块编辑 —— 一个进 body、一个进 header，混在一起容易填错位置。
+    body_params_text: JSON.stringify(e.default_body_params || {}, null, 2),
+    paramsOpen: false,
   };
 }
+
+// 默认请求体参数预置（按已知上游方言）。
+// 说明：这些是「下游客户端发不出来、但上游要求」的参数，用于让现成的
+// 机器人框架/CLI 能直接对接。仅填必需项，不猜测可选参数。
+const BODY_PARAM_PRESETS = {
+  blank: {},
+  // echo 类模型：必须指定 persona 才会回答。
+  persona: { persona: "You are a helpful assistant." },
+};
 
 // 请求头预置值来源（勿凭印象改动）：
 //   claude  — cc-switch forwarder.rs：CLAUDE_CODE_USER_AGENT / CLAUDE_CODE_BETA / x-app
@@ -131,6 +144,13 @@ const ModelsPage = {
       try { return Object.keys(JSON.parse(row.form.request_headers_text || "{}") || {}).length; }
       catch (_) { return 0; }
     },
+    bodyParamCount(row) {
+      try { return Object.keys(JSON.parse(row.form.body_params_text || "{}") || {}).length; }
+      catch (_) { return 0; }
+    },
+    applyBodyPreset(name, row) {
+      row.form.body_params_text = JSON.stringify(BODY_PARAM_PRESETS[name] || {}, null, 2);
+    },
     sibEps(row) {
       if (!this.mDrawer || !this.mDrawer.name) return [];
       return this.eps.filter((e) => e.account_id === row.form.account_id &&
@@ -185,8 +205,20 @@ const ModelsPage = {
         Object.values(requestHeaders).some((v) => typeof v !== "string")) {
         toast("请求头必须是字符串到字符串的 JSON 对象", false); return;
       }
+      let bodyParams;
+      try { bodyParams = JSON.parse(f.body_params_text || "{}"); }
+      catch (_) { toast("默认请求体参数必须是合法 JSON 对象", false); return; }
+      if (!bodyParams || Array.isArray(bodyParams) || typeof bodyParams !== "object") {
+        toast("默认请求体参数必须是 JSON 对象", false); return;
+      }
+      // 保留键由网关独占：在界面上先拦一次，给出可理解的提示
+      //（后端也会拦，但用户看到的是 API 错误，不如这里直观）。
+      const RESERVED = ["model", "stream", "stream_options"];
+      const bad = Object.keys(bodyParams).find((k) => RESERVED.indexOf(k) >= 0);
+      if (bad) { toast("字段 " + bad + " 由网关独占，不能作为默认参数", false); return; }
       const payload = { account_id: f.account_id, model: this.mDrawer.name, ep: f.ep.trim(),
         enabled: f.enabled, request_headers: requestHeaders,
+        default_body_params: bodyParams,
         skip_upstream_check: !!f.skip_upstream_check,
         weight: Number(f.weight) || 0, max_concurrency: Number(f.max_concurrency) || 0,
         rpm_limit: Number(f.rpm_limit) || 0, tpm_limit: Number(f.tpm_limit) || 0 };
@@ -543,6 +575,25 @@ const ModelsPage = {
                   </div>
                   <textarea v-model="row.form.request_headers_text" rows="5" spellcheck="false" placeholder='{"User-Agent":"Hermes/1.0"}'></textarea>
                   <div class="form-tip">使上游认为特定客户端在调用；认证、传输级与协议相关敏感头不可覆盖。</div>
+                </div>
+              </div>
+              <div class="ep-headers">
+                <span class="ep-headers-toggle" @click="row.form.paramsOpen = !row.form.paramsOpen">
+                  默认请求体参数
+                  <span v-if="bodyParamCount(row)" class="headers-badge">{{ bodyParamCount(row) }} 项</span>
+                  <span class="arr">{{ row.form.paramsOpen ? '▾' : '▸' }}</span>
+                </span>
+                <div v-show="row.form.paramsOpen" style="margin-top:8px">
+                  <div class="row-actions" style="margin-bottom:6px">
+                    <button class="btn btn-outline btn-sm" type="button" @click="applyBodyPreset('blank', row)">白板</button>
+                    <button class="btn btn-outline btn-sm" type="button" @click="applyBodyPreset('persona', row)">persona 示例</button>
+                  </div>
+                  <textarea v-model="row.form.body_params_text" rows="5" spellcheck="false" placeholder='{"persona":"Virginia Woolf"}'></textarea>
+                  <div class="form-tip">
+                    上游要求但下游客户端发不出来的参数（如 <code>persona</code>），由网关在请求体里补上，
+                    使机器人框架等无法自定义请求体的客户端也能直接对接。
+                    <strong>下游自己发了同名字段时以它为准</strong>，不会被覆盖；<code>model</code> / <code>stream</code> / <code>stream_options</code> 不可用。
+                  </div>
                 </div>
               </div>
               <div class="ep-card-foot">

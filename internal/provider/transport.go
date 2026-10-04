@@ -19,6 +19,10 @@ type Route struct {
 	BaseURL string
 	Key     string // 不透明字符串：不校验前缀/格式，原样进 Authorization
 	Headers map[string]string
+
+	// BodyDefaults 接入点级默认请求体参数：下游未提供时由 prepareBody 补上。
+	// 与 Headers 同构——都是「管理员为这条接入点补的下游不会发的字段」。
+	BodyDefaults map[string]json.RawMessage
 }
 
 // forbiddenRequestHeaders 是网关必须独占的头：认证、hop-by-hop、以及协议层
@@ -220,18 +224,77 @@ func truncate(b []byte, n int) string {
 	return s
 }
 
-// prepareBody 把下游原始请求体改装为上游请求体：整体透传，仅替换 model 为
-// 上游模型标识（不透明字符串：ep-xxx / gpt-4o / doubao-xxx 等）。
-// 其余字段（含各供应商私有参数）一律原样保留，避免猜测性改写误伤。
-func prepareBody(down []byte, upstreamModel string) ([]byte, error) {
+// prepareBody 把下游原始请求体改装为上游请求体：整体透传，替换 model 为
+// 上游模型标识（不透明字符串：ep-xxx / gpt-4o / doubao-xxx 等），并按需补上
+// 接入点配置的默认参数。其余字段（含各供应商私有参数）一律原样保留，
+// 避免猜测性改写误伤。
+//
+// defaults 的合并语义是「**下游优先**」：下游请求体里已经有该键就不动它。
+// 理由：默认参数是为了补上「下游不会发」的字段而存在（机器人框架发不出
+// extra_body），一旦下游自己发了值（例如用户在会话里指定了不同的 persona），
+// 再覆盖就把调用方的显式意图顶掉了——这比少一个默认值更难排查。
+//
+// model 永远是网关的唯一真源，即使 defaults 里带了这个键也不生效（
+// 由 ValidateBodyParams 在写入端拦住，这里是第二道防线）。
+func prepareBody(down []byte, upstreamModel string, defaults map[string]json.RawMessage) ([]byte, error) {
 	raw := map[string]any{}
 	dec := json.NewDecoder(bytes.NewReader(down))
 	dec.UseNumber()
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("invalid json: %w", err)
 	}
+	// 先补默认，再设 model：顺序反了会被下行代码的 model 赋值盖住，
+	// 但这单靠顺序保不对——下面显式跳过保留键才是真正的保证。
+	for k, v := range defaults {
+		if reservedBodyKeys[k] {
+			continue
+		}
+		if _, exists := raw[k]; exists {
+			continue // 下游优先
+		}
+		// 用 json.RawMessage 直接嵌（已是合法 JSON 字节），不经过 any 往返。
+		raw[k] = v
+	}
 	raw["model"] = upstreamModel
 	return json.Marshal(raw)
+}
+
+// reservedBodyKeys 是网关独占的请求体字段，任何默认参数注入都不得触碰。
+//
+// 与 forbiddenRequestHeaders 同一类红线：
+//   - model：路由唯一真源，被改就没法正确转发/计费/记录日志。
+//   - stream：决定下游拿到流式还是非流式；注入 true 会让下游解析不了响应。
+//   - stream_options：与 stream 配对（include_usage），网关自己会写。
+var reservedBodyKeys = map[string]bool{
+	"model":          true,
+	"stream":         true,
+	"stream_options": true,
+}
+
+// ValidateBodyParams 校验接入点默认请求体参数。写入端（管理 API）调用，
+// 让配置错误在保存时就要报出来，而不是等到转发时静默失效。
+//
+// 只做两项检查：不能用保留键；值必须是合法 JSON。值本身可以是任意结构
+// （对象/数组/字符串/数字/布尔/null），不做白名单——上游方言千奇百怪，
+// 限定形状等于把可用性锁死在网关的认知里。
+func ValidateBodyParams(params map[string]json.RawMessage) error {
+	for k, v := range params {
+		name := strings.TrimSpace(k)
+		if name == "" {
+			return fmt.Errorf("默认请求体参数的字段名不能为空")
+		}
+		if reservedBodyKeys[name] {
+			return fmt.Errorf("字段 %s 由网关独占（model/stream/stream_options），不能作为默认参数", name)
+		}
+		trimmed := bytes.TrimSpace(v)
+		if len(trimmed) == 0 {
+			return fmt.Errorf("字段 %s 的值不能为空", name)
+		}
+		if !json.Valid(trimmed) {
+			return fmt.Errorf("字段 %s 的值不是合法 JSON", name)
+		}
+	}
+	return nil
 }
 
 // isMaxTokensCompatibilityError 只识别上游明确要求用 max_completion_tokens
@@ -426,8 +489,8 @@ func normalizeStreamValue(v []byte) (json.RawMessage, bool) {
 
 // prepareStreamBody 在 prepareBody 基础上强制流式 + include_usage
 // （用量从 final chunk 提取；保留下游 stream_options 的其它字段）。
-func prepareStreamBody(down []byte, upstreamModel string) ([]byte, error) {
-	body, err := prepareBody(down, upstreamModel)
+func prepareStreamBody(down []byte, upstreamModel string, defaults map[string]json.RawMessage) ([]byte, error) {
+	body, err := prepareBody(down, upstreamModel, defaults)
 	if err != nil {
 		return nil, err
 	}

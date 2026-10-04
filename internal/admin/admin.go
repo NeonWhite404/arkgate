@@ -2,6 +2,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,8 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 	"time"
+	"unicode/utf8"
 
 	"arkgate/internal/balancer"
 	"arkgate/internal/catalog"
@@ -968,6 +969,7 @@ func (a *Admin) handleTestModel(w http.ResponseWriter, r *http.Request) {
 			for _, ep := range eps {
 				if ep.AccountID == acc.ID && ep.Model == p.Model && ep.EP == p.EP {
 					rt.Headers = ep.RequestHeaders
+					rt.BodyDefaults = ep.DefaultBodyParams
 					break
 				}
 			}
@@ -1048,8 +1050,11 @@ func (a *Admin) testRegisteredModel(ctx context.Context, name string) testModelR
 		result.Error = err.Error()
 		return result
 	}
-	// 测试要与该映射的真实调用环境一致：带上叶节点的请求头（UA / beta 等）。
+	// 测试要与该映射的真实调用环境一致：带上叶节点的请求头（UA / beta 等）
+	// 与默认请求体参数（上游方言要求的额外字段），否则会出现
+	// 「探测失败但实转成功」的误报。
 	rt.Headers = chosen.RequestHeaders
+	rt.BodyDefaults = chosen.DefaultBodyParams
 	a.finishModelProbe(ctx, &result, rt, chosen.EP, m.Provider)
 	return result
 }
@@ -1181,7 +1186,7 @@ func (a *Admin) runtimeSettingsBody() map[string]any {
 		"session_ttl_sec":         a.cfg.SessionTTL.Seconds(),
 		"max_retries":             a.cfg.MaxRetriesAvailable,
 		"max_timeout_sec":         maxTimeoutSec,
-	"max_currency_rate":       maxCurrencyRate,
+		"max_currency_rate":       maxCurrencyRate,
 		// 计价币种：单价与成本以美元存储，这两个值只影响展示换算。
 		"currency_rate":   a.cfg.Currency.Rate(),
 		"currency_symbol": a.cfg.Currency.Symbol(),
@@ -1556,6 +1561,10 @@ func (a *Admin) handleEndpointsCollection(w http.ResponseWriter, r *http.Request
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		if err := provider.ValidateBodyParams(e.DefaultBodyParams); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
 		// 同一账号 + 同一模型可挂多个不同 ep（同模型的不同发布版本），
 		// 但完全相同的三元组是重复配置：明确拒绝，避免静默改到既有行。
 		if _, dup := a.store.EndpointIDByTuple(e.AccountID, e.Model, e.EP); dup {
@@ -1585,12 +1594,23 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPut:
-		// 一次性解码到 map，兼顾「指针字段」与「字段覆盖」。
-		var probe map[string]any
-		if err := decode(r, &probe); err != nil {
+		// 请求体先整块读进内存：下面要用两种方式解它——
+		// ① map[string]any 做部分更新；② RawMessage 取 default_body_params 的原始字节。
+		// （顺序不能反：decode 会读干 r.Body，之后再读就是空的。）
+		bodyBytes, err := readAllBody(r)
+		if err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		var probe map[string]any
+		if err := json.Unmarshal(bodyBytes, &probe); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		// default_body_params 需要**原始 JSON 字节**：probe 是 map[string]any，
+		// 数字会被解成 float64，12345678901234567890 这种大整数在进入业务逻辑
+		// 之前就已经变成 1.2345678901234567e+19（实测确认，且会静默落库）。
+		rawBodyParams, hasRawBodyParams := rawFieldOf(bodyBytes, "default_body_params")
 		existing, err := a.store.GetEndpoint(id)
 		if err != nil {
 			writeJSON(w, 404, map[string]any{"detail": "映射不存在"})
@@ -1655,8 +1675,26 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if hasRawBodyParams {
+			if len(bytes.TrimSpace(rawBodyParams)) == 0 || string(bytes.TrimSpace(rawBodyParams)) == "null" {
+				existing.DefaultBodyParams = map[string]json.RawMessage{} // 显式 null 视作清空
+			} else {
+				// 直接从原始字节解到 map[string]json.RawMessage：值保持原始
+				// 字节，大整数不走 float64。用 probe 里的 any 会丢精度。
+				var parsed map[string]json.RawMessage
+				if err := json.Unmarshal(rawBodyParams, &parsed); err != nil || parsed == nil {
+					writeJSON(w, 400, map[string]any{"detail": "default_body_params 必须是 JSON 对象"})
+					return
+				}
+				existing.DefaultBodyParams = parsed
+			}
+		}
 		existing.EP = strings.TrimSpace(existing.EP)
 		if err := provider.ValidateRequestHeaders(existing.RequestHeaders); err != nil {
+			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		if err := provider.ValidateBodyParams(existing.DefaultBodyParams); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
@@ -1705,10 +1743,10 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			QuotaPeriod      string   `json:"quota_period"`
 			// 指针：0 是「未设置」（→ 默认周一），必须与「显式传 0」区分不了时
 			// 才不报错；但缺字段与传 0 在这里等价，都是「用默认」，故无需区分。
-			QuotaResetWeekday  int   `json:"quota_reset_weekday"`
-			QuotaResetHour     int   `json:"quota_reset_hour"`
-			CacheReadPermille  int64 `json:"cache_read_permille"`
-			CacheWritePermille int64 `json:"cache_write_permille"`
+			QuotaResetWeekday   int   `json:"quota_reset_weekday"`
+			QuotaResetHour      int   `json:"quota_reset_hour"`
+			CacheReadPermille   int64 `json:"cache_read_permille"`
+			CacheWritePermille  int64 `json:"cache_write_permille"`
 			WindowLimitRequests int64 `json:"window_limit_requests"`
 		}
 		if err := decode(r, &p); err != nil {
@@ -1726,22 +1764,22 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 		}
 		key = store.NormalizeKey(key)
 		sk := &model.SubKey{
-			ID:               "sk_" + randHex(6),
-			Name:             p.Name,
-			Key:              key,
-			KeyHash:          isTokenHash(key),
-			Enabled:          true,
-			AllowedModels:    p.AllowedModels,
-			AllowedAccounts:  p.AllowedAccounts,
-			DailyLimitTokens: p.DailyLimitTokens,
-			DailyLimitImages: p.DailyLimitImages,
-			QuotaPeriod:      model.NormalizeQuotaPeriod(p.QuotaPeriod),
-			QuotaResetWeekday: p.QuotaResetWeekday,
-			QuotaResetHour:    p.QuotaResetHour,
-			CacheReadPermille:  p.CacheReadPermille,
-			CacheWritePermille: p.CacheWritePermille,
+			ID:                  "sk_" + randHex(6),
+			Name:                p.Name,
+			Key:                 key,
+			KeyHash:             isTokenHash(key),
+			Enabled:             true,
+			AllowedModels:       p.AllowedModels,
+			AllowedAccounts:     p.AllowedAccounts,
+			DailyLimitTokens:    p.DailyLimitTokens,
+			DailyLimitImages:    p.DailyLimitImages,
+			QuotaPeriod:         model.NormalizeQuotaPeriod(p.QuotaPeriod),
+			QuotaResetWeekday:   p.QuotaResetWeekday,
+			QuotaResetHour:      p.QuotaResetHour,
+			CacheReadPermille:   p.CacheReadPermille,
+			CacheWritePermille:  p.CacheWritePermille,
 			WindowLimitRequests: p.WindowLimitRequests,
-			CreatedAt:        time.Now().Unix(),
+			CreatedAt:           time.Now().Unix(),
 		}
 		if err := a.store.UpsertSubKey(sk); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -1975,21 +2013,21 @@ func (a *Admin) handleOverview(w http.ResponseWriter, r *http.Request) {
 	// 成本核算（来自 usage_logs.cost 聚合）。
 	totalCost, cost24h, _ := a.store.SumCost()
 	writeJSON(w, 200, map[string]any{
-		"account_total":    len(accs),
-		"account_active":   active,
-		"account_disabled": disabled,
-		"endpoint_total":   len(eps),
-		"endpoint_enabled": epEnabled,
-		"endpoint_circuit": epCircuit,
+		"account_total":     len(accs),
+		"account_active":    active,
+		"account_disabled":  disabled,
+		"endpoint_total":    len(eps),
+		"endpoint_enabled":  epEnabled,
+		"endpoint_circuit":  epCircuit,
 		"endpoint_halfopen": epHalfOpen,
-		"model_count":      modelCount,
-		"subkey_count":     subkeyCount,
-		"total_requests":   totalReq,
-		"total_tokens":     totalTokens,
-		"total_cost":       totalCost,
-		"cost_24h":         cost24h,
-		"accounts":         accs,
-		"endpoints":        eps,
+		"model_count":       modelCount,
+		"subkey_count":      subkeyCount,
+		"total_requests":    totalReq,
+		"total_tokens":      totalTokens,
+		"total_cost":        totalCost,
+		"cost_24h":          cost24h,
+		"accounts":          accs,
+		"endpoints":         eps,
 	})
 }
 
@@ -2017,6 +2055,34 @@ func (a *Admin) handleUsageSeries(w http.ResponseWriter, r *http.Request) {
 
 func decode(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// rawFieldOf 读取请求体里某个字段的**原始 JSON 字节**（第三个返回值表示字段是否存在）。
+//
+// 为什么需要它：handler 为了做「部分更新」把请求体解成 map[string]any，
+// 而 any 里的数字是 float64——大整数（如 12345678901234567890）会被舍入，
+// 且这种丢失发生在进入业务逻辑之前，业务层再用 RawMessage 也救不回来。
+// 对「值必须保真」的字段（默认请求体参数）要单独按原始字节取一次。
+//
+// 代价：请求体被读一遍到内存（管理端请求体很小，可接受）。
+func rawFieldOf(body []byte, field string) (json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, false
+	}
+	raw, ok := m[field]
+	return raw, ok
+}
+
+// readAllBody 把请求体读进内存（受 MaxBytesReader 保护的上游已限制大小）。
+//
+// 存在的理由：同一个请求体要用两种方式解（any 做部分更新、RawMessage 保精度），
+// 而 r.Body 只能读一次。
+func readAllBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	return io.ReadAll(r.Body)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

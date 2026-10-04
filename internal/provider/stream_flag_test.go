@@ -258,7 +258,7 @@ func TestNormalizeStreamFlagThenPrepareBody(t *testing.T) {
 	if !changed {
 		t.Fatal("expected rewrite")
 	}
-	out, err := prepareBody(body, "ep-1")
+	out, err := prepareBody(body, "ep-1", nil)
 	if err != nil {
 		t.Fatalf("prepareBody: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestNormalizeStreamFlagThenPrepareBody(t *testing.T) {
 // （含未知私有参数）仍须原样透传——不得变成白名单式重建。
 func TestPrepareBodyStillPassesThroughUnknownFields(t *testing.T) {
 	body, _ := NormalizeStreamFlag([]byte(`{"model":"m","stream":"true","vendor_flag":{"a":1},"thinking":{"type":"enabled"}}`))
-	out, err := prepareBody(body, "ep-2")
+	out, err := prepareBody(body, "ep-2", nil)
 	if err != nil {
 		t.Fatalf("prepareBody: %v", err)
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -364,5 +365,120 @@ func TestAuditMigrateV14ToV15(t *testing.T) {
 	// 旧字段仍保留（部分更新不得互相清零）。
 	if got.DailyLimitTokens != 1000000 || got.DailyLimitImages != 50 {
 		t.Fatalf("保存新字段后旧限额被清零: %+v", got)
+	}
+}
+
+// TestAuditMigrateV15ToV16 v15 → v16：新增 endpoints.default_body_params 列。
+//
+// 升级安全要求（与历次迁移一致）：
+//   - 旧行的配置一个字都不变（尤其 request_headers / 流控字段不能被清零）；
+//   - 新列取零值（空对象），语义等价「未配置默认参数」= 升级前行为；
+//   - 升级后能正常读写新列。
+func TestAuditMigrateV15ToV16(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "arkgate.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// v15 的 endpoints：有 request_headers，缺 default_body_params。
+	for _, st := range []string{
+		`CREATE TABLE endpoints (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, model TEXT NOT NULL,
+			ep TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL DEFAULT 0,
+			weight INTEGER NOT NULL DEFAULT 0, max_concurrency INTEGER NOT NULL DEFAULT 0,
+			rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0,
+			last_used_at INTEGER NOT NULL DEFAULT 0, total_requests INTEGER NOT NULL DEFAULT 0,
+			success_requests INTEGER NOT NULL DEFAULT 0, fail_requests INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0, total_images INTEGER NOT NULL DEFAULT 0,
+			request_headers TEXT NOT NULL DEFAULT '{}', upstream_deleted INTEGER NOT NULL DEFAULT 0,
+			skip_upstream_check INTEGER NOT NULL DEFAULT 0, UNIQUE(account_id, model, ep))`,
+		// 一行「配得很满」的旧接入点：升级后这些值必须一字不变。
+		`INSERT INTO endpoints(id,account_id,model,ep,enabled,weight,max_concurrency,rpm_limit,
+			tpm_limit,request_headers,total_requests,total_tokens)
+			VALUES('ep_old','acc_1','m','ep-upstream',1,7,11,120,90000,
+			'{"User-Agent":"claude-cli/1.0.119"}',42,12345)`,
+	} {
+		if _, err := db.Exec(st); err != nil {
+			t.Fatalf("build v15: %v", err)
+		}
+	}
+	_ = db.Close()
+
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("v15 库升级失败: %v", err)
+	}
+	defer st.Close()
+
+	ep, err := st.GetEndpoint("ep_old")
+	if err != nil {
+		t.Fatalf("读回接入点: %v", err)
+	}
+	// ① 既有配置逐项不变。
+	if ep.Weight != 7 || ep.MaxConcurrency != 11 || ep.RPMLimit != 120 || ep.TPMLimit != 90000 {
+		t.Fatalf("流控字段被迁移改动: %+v", ep)
+	}
+	if ep.RequestHeaders["User-Agent"] != "claude-cli/1.0.119" {
+		t.Fatalf("request_headers 被改动: %+v", ep.RequestHeaders)
+	}
+	if ep.TotalRequests != 42 || ep.TotalTokens != 12345 {
+		t.Fatalf("统计被改动: req=%d tok=%d", ep.TotalRequests, ep.TotalTokens)
+	}
+	// ② 新列取零值（= 未配置 → 不注入任何参数，行为与升级前一致）。
+	if len(ep.DefaultBodyParams) != 0 {
+		t.Fatalf("新列应为空（等价未配置）, got %+v", ep.DefaultBodyParams)
+	}
+	// ③ 升级后能写入并读回（保真）。
+	ep.DefaultBodyParams = map[string]json.RawMessage{
+		"persona": json.RawMessage(`"Virginia Woolf"`),
+		"big":     json.RawMessage(`12345678901234567890`),
+	}
+	if err := st.UpsertEndpoint(ep); err != nil {
+		t.Fatalf("保存新字段: %v", err)
+	}
+	got, err := st.GetEndpoint("ep_old")
+	if err != nil {
+		t.Fatalf("再读: %v", err)
+	}
+	if string(got.DefaultBodyParams["persona"]) != `"Virginia Woolf"` {
+		t.Fatalf("新字段未持久化: %+v", got.DefaultBodyParams)
+	}
+	if string(got.DefaultBodyParams["big"]) != `12345678901234567890` {
+		t.Fatalf("大整数精度丢失: %s", got.DefaultBodyParams["big"])
+	}
+	// ④ 保存新字段不得连带改动既有配置（部分更新语义）。
+	if got.RequestHeaders["User-Agent"] != "claude-cli/1.0.119" || got.TPMLimit != 90000 {
+		t.Fatalf("保存新字段后既有配置被改动: %+v", got)
+	}
+}
+
+// TestAuditMigrateV16Idempotent 重复打开同一库不改变任何东西（幂等）。
+func TestAuditMigrateV16Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("首次打开: %v", err)
+	}
+	ep := &model.Endpoint{
+		ID: "e1", AccountID: "a", Model: "m", EP: "p", Enabled: true,
+		DefaultBodyParams: map[string]json.RawMessage{"persona": json.RawMessage(`"x"`)},
+	}
+	if err := st.UpsertEndpoint(ep); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	st.Close()
+
+	// 再次打开（迁移会重跑一遍判重逻辑）。
+	st2, err := New(dir)
+	if err != nil {
+		t.Fatalf("二次打开: %v", err)
+	}
+	defer st2.Close()
+	got, err := st2.GetEndpoint("e1")
+	if err != nil {
+		t.Fatalf("读取: %v", err)
+	}
+	if string(got.DefaultBodyParams["persona"]) != `"x"` {
+		t.Fatalf("幂等重跑把数据搞坏了: %+v", got.DefaultBodyParams)
 	}
 }

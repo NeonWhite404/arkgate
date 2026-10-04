@@ -15,7 +15,10 @@
 // 不校验前缀、不归一化、不推断类型（ep- 只是 Ark 平台的生成规则，网关不识别）。
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // 账号状态
 const (
@@ -185,6 +188,21 @@ type Endpoint struct {
 	RPMLimit       int               `json:"rpm_limit"`
 	TPMLimit       int64             `json:"tpm_limit"` // 文本=tokens/min；图像=张/min
 	RequestHeaders map[string]string `json:"request_headers,omitempty"`
+
+	// DefaultBodyParams 接入点级默认请求体参数：下游请求体里**没有**该字段时
+	// 补上，下游显式给了就以**下游为准**（不覆盖）。
+	//
+	// 用途：上游方言要求一些非标准参数（例如某个 echo 模型必须带 persona），
+	// 而下游是机器人框架/现成客户端——根本没法通过 extra_body 传自定义字段，
+	// 否则请求直接被上游拒。这与 RequestHeaders 是同一件事的两个通道：
+	// 头走 RequestHeaders，体里的字段走这里。
+	//
+	// 值用 json.RawMessage 而不是 any：参数可以是嵌套对象/数组，
+	// 经 any 往返会改变数字表示（大整数变浮点）。存储层也是原样存取字符串。
+	//
+	// 不允许包含 model / stream / stream_options（网关独占的协议字段，
+	// 见 provider.ValidateBodyParams）——注入它们会破坏路由或让下游解析不了响应。
+	DefaultBodyParams map[string]json.RawMessage `json:"default_body_params,omitempty"`
 
 	// 叶节点级累计统计
 	LastUsedAt       int64 `json:"last_used_at"`

@@ -431,7 +431,7 @@ func ExtractAnthropicUsage(raw []byte) *TextUsage {
 // 仅替换 model，响应原样返回，错误体保持 Anthropic 形状原样透传。
 func (m *Manager) AnthropicNativeChat(ctx context.Context, rt Route, down []byte,
 	upstreamModel string, timeout time.Duration) ([]byte, *TextUsage, error) {
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -485,7 +485,7 @@ func (m *Manager) AnthropicNativeChat(ctx context.Context, rt Route, down []byte
 func (m *Manager) OpenAnthropicNativeStream(ctx context.Context, rt Route, down []byte,
 	upstreamModel string, firstTokenTimeout time.Duration) (_ *Stream, err error) {
 
-	body, err := prepareBody(down, upstreamModel)
+	body, err := prepareBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, err
 	}
@@ -968,7 +968,7 @@ func writeSSE(sink io.Writer, frame []byte) error {
 // （prepareStreamBody 会强制 stream + include_usage）。
 func (m *Manager) OpenChatStreamAsAnthropic(ctx context.Context, rt Route, down []byte,
 	upstreamModel string, firstTokenTimeout time.Duration) (*anthropicFromOpenAIStream, error) {
-	body, err := prepareStreamBody(down, upstreamModel)
+	body, err := prepareStreamBody(down, upstreamModel, rt.BodyDefaults)
 	if err != nil {
 		return nil, err
 	}
