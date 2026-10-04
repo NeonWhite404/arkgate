@@ -856,6 +856,31 @@ const SubKeysPage = {
   },
   mounted() { this.load(); },
   methods: {
+    // quotaPct 计算额度进度百分比（上限 100 以免进度条溢出）。
+    quotaPct(q, kind) {
+      if (!q) return 0;
+      if (kind === "tokens") {
+        if (!q.limit_tokens) return 0;
+        return Math.min(100, Math.round((q.used_tokens / q.limit_tokens) * 100));
+      }
+      if (!q.limit_requests) return 0;
+      return Math.min(100, Math.round((q.requests / q.limit_requests) * 100));
+    },
+    // quotaCls 返回进度条/数字的配色：≥90% 危险，≥70% 警告。
+    //
+    // 阈值与门户页保持一致：同一个 Key 在管理端和用户端看到的颜色必须同义，
+    // 否则「管理员看到绿的、用户看到红的」会被当成两边数据不一致。
+    quotaCls(q, kind) {
+      const p = this.quotaPct(q, kind);
+      return p >= 90 ? "danger" : p >= 70 ? "warn" : "";
+    },
+    // periodShort 周期简称 + 窗口起始日，让管理员知道进度何时归零。
+    periodShort(q) {
+      if (!q) return "";
+      const label = q.period === "week" ? "本周" : q.period === "month" ? "本月" : "今日";
+      return label + "（自 " + q.window_day + " 起）";
+    },
+
     load() {
       Promise.all([req("GET", "/api/subkeys"), req("GET", "/api/models"), req("GET", "/api/accounts")])
         .then((rs) => { this.subs = rs[0] || []; this.models = rs[1] || []; this.accounts = rs[2] || []; })
@@ -931,15 +956,39 @@ const SubKeysPage = {
     <div class="page-title">子 API Key</div>
     <div class="toolbar"><button class="btn btn-primary" @click="openModal(null)">+ 新建子 Key</button><div class="spacer"></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token</th><th>图像</th><th>操作</th>
+      <th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token<span class="th-sub">累计·上游原始</span></th><th>本周期配额<span class="th-sub">加权，与限额同口径</span></th><th>图像</th><th>操作</th>
     </tr></thead><tbody>
-      <tr v-if="!subs.length"><td colspan="8" class="empty">暂无子 Key</td></tr>
+      <tr v-if="!subs.length"><td colspan="9" class="empty">暂无子 Key</td></tr>
       <tr v-for="s in subs" :key="s.id">
         <td><strong>{{ s.name || s.id }}</strong></td>
         <td class="mono"><span class="code-copy" title="点击复制" @click="copy(s.key)">{{ s.key }}</span></td>
         <td><span :class="s.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ s.enabled ? '启用' : '禁用' }}</span></td>
         <td>{{ (s.allowed_models && s.allowed_models.length) ? s.allowed_models.join(', ') : '全部' }}</td>
-        <td>{{ s.total_requests }}</td><td>{{ fmtTokens(s.total_tokens) }}</td><td>{{ s.total_images || 0 }}</td>
+        <td>{{ s.total_requests }}</td><td>{{ fmtTokens(s.total_tokens) }}</td>
+        <td class="quota-cell">
+          <template v-if="s.quota && (s.quota.limit_tokens || s.quota.limit_requests)">
+            <div class="quota-line" v-if="s.quota.limit_tokens">
+              <span class="mono" :class="quotaCls(s.quota, 'tokens')">{{ fmtTokens(s.quota.used_tokens) }}</span>
+              <span class="muted"> / {{ fmtTokens(s.quota.limit_tokens) }}</span>
+              <span class="pct" :class="quotaCls(s.quota, 'tokens')">{{ quotaPct(s.quota, 'tokens') }}%</span>
+            </div>
+            <div class="progress progress-sm" v-if="s.quota.limit_tokens">
+              <div class="bar" :class="quotaCls(s.quota, 'tokens')" :style="{width: quotaPct(s.quota, 'tokens') + '%'}"></div>
+            </div>
+            <div class="quota-line" v-if="s.quota.limit_requests">
+              <span class="mono" :class="quotaCls(s.quota, 'requests')">{{ s.quota.requests }}</span>
+              <span class="muted"> / {{ s.quota.limit_requests }} 次</span>
+              <span class="pct" :class="quotaCls(s.quota, 'requests')">{{ quotaPct(s.quota, 'requests') }}%</span>
+            </div>
+            <div class="quota-meta">
+              {{ periodShort(s.quota) }}
+              <template v-if="s.quota.weighted"> · 缓存加权 读×{{ (s.quota.cache_read_permille || 1000) / 1000 }} 写×{{ (s.quota.cache_write_permille || 1000) / 1000 }}</template>
+              <template v-else> · 未加权（= 上游原始）</template>
+            </div>
+          </template>
+          <span v-else class="muted">不限</span>
+        </td>
+        <td>{{ s.total_images || 0 }}</td>
         <td><div class="row-actions">
           <button class="btn btn-outline btn-sm" @click="openModal(s.id)">编辑</button>
           <button class="btn btn-danger btn-sm" @click="del(s)">删除</button>

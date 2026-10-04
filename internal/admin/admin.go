@@ -1723,6 +1723,94 @@ func (a *Admin) handleEndpointItem(w http.ResponseWriter, r *http.Request) {
 
 // ─────────────────────────── subkeys ───────────────────────────
 
+// subKeyWithUsage 子 Key 记录 + 当前周期的配额用量。
+//
+// 为什么管理员需要它：额度消耗是**加权配额**（缓存读/写各乘倍率），
+// 而用量分析页显示的 total_tokens 是**上游原始量**——两者在缓存命中多时
+// 能差一个数量级。管理员在子 Key 列表里若不直接看到加权后的已用量，
+// 就无法判断「这个 Key 还剩多少额度」，只能切到门户猜。
+type subKeyWithUsage struct {
+	*model.SubKey
+	// quota 是当前周期的用量与限额快照。
+	Quota *subKeyQuota `json:"quota,omitempty"`
+}
+
+// subKeyQuota 当前周期的配额快照（全部为加权口径或配置值）。
+type subKeyQuota struct {
+	// Period/WindowDay 让界面能显示「本周」「本月」以及窗口归属。
+	Period    string `json:"period"`
+	WindowDay string `json:"window_day"`
+	// UsedTokens 是**加权后**的已用额度（与限额同一口径，可直接相比）。
+	UsedTokens int64 `json:"used_tokens"`
+	// RawTokens 是同一周期的**上游原始** token 合计，仅供对照解释差额；
+	// 取自 usage_logs 聚合会比 usage_daily 更贵，故这里不做——真实原始量
+	// 已在用量分析页提供，这里只给加权值与额度判定所需字段。
+	LimitTokens   int64 `json:"limit_tokens"`
+	Requests      int64 `json:"requests"`
+	LimitRequests int64 `json:"limit_requests"`
+	Images        int64 `json:"images"`
+	LimitImages   int64 `json:"limit_images"`
+	// Weighted 表示该子 Key 是否启用了缓存倍率加权。
+	//
+	// 界面必须据此决定文案：未加权时 used_tokens 就是原始量，显示
+	// 「加权」会让管理员以为系统在算折扣，从而误判额度剩余。
+	Weighted      bool  `json:"weighted"`
+	ReadPermille  int64 `json:"cache_read_permille"`
+	WritePermille int64 `json:"cache_write_permille"`
+}
+
+// withQuotaUsage 批量补上每个子 Key 的当前周期配额用量。
+//
+// 设计约束：
+//   - **不因统计不可用而让列表整体失败**：用量只是附加信息，读取失败时
+//     该行不带 quota 字段（界面显示「—」），而不是 500 让管理员看不到列表。
+//   - 每个子 Key 的窗口起始日**各自算**（周期可不同），不能共用一个 day。
+func (a *Admin) withQuotaUsage(keys []*model.SubKey) []*subKeyWithUsage {
+	out := make([]*subKeyWithUsage, 0, len(keys))
+	if len(keys) == 0 {
+		return out
+	}
+	now := time.Now()
+	days := make(map[string]string, len(keys))
+	for _, sk := range keys {
+		if sk.ID == "" {
+			continue
+		}
+		days[sk.ID] = model.WindowDay(model.QuotaRuleOf(sk), now)
+	}
+	usage, err := a.store.GetWindowUsageBatch(days)
+	if err != nil {
+		// 留痕后降级：不阻断列表。
+		log.Printf("admin: 读取子 Key 周期用量失败，列表将不含配额进度: %v", err)
+		usage = nil
+	}
+	for _, sk := range keys {
+		item := &subKeyWithUsage{SubKey: sk}
+		if usage != nil {
+			rule := model.QuotaRuleOf(sk)
+			du := usage[sk.ID]
+			if du == nil {
+				du = &store.DailyUsage{}
+			}
+			item.Quota = &subKeyQuota{
+				Period:        rule.Period,
+				WindowDay:     days[sk.ID],
+				UsedTokens:    du.Tokens,
+				LimitTokens:   sk.DailyLimitTokens,
+				Requests:      du.Requests,
+				LimitRequests: sk.WindowLimitRequests,
+				Images:        du.Images,
+				LimitImages:   sk.DailyLimitImages,
+				Weighted:      rule.Weight,
+				ReadPermille:  rule.ReadPermille,
+				WritePermille: rule.WritePermille,
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1731,7 +1819,7 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
 			return
 		}
-		writeJSON(w, 200, all)
+		writeJSON(w, 200, a.withQuotaUsage(all))
 	case http.MethodPost:
 		var p struct {
 			Name             string   `json:"name"`

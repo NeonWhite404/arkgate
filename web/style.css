@@ -607,3 +607,18 @@ html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
 
 /* 表头副标题：用于区分同名但口径不同的列（如「Tokens 上游原始」vs 加权额度）。 */
 th .th-sub { display:block; font-weight:400; font-size:11px; opacity:.62; margin-top:2px; }
+
+/* ── 子 Key 列表的「本周期配额」列 ──
+   额度是加权口径（与限额同源），与旁边的累计 Token（上游原始）不同量纲，
+   因此数字用等宽字体并按占用率着色，避免与左边的累计值混淆。 */
+.quota-cell { min-width: 190px; }
+.quota-line { display:flex; align-items:baseline; gap:2px; font-size:12px; }
+.quota-line .mono { font-variant-numeric: tabular-nums; }
+.quota-line .pct { margin-left:auto; font-size:11px; opacity:.75; font-variant-numeric: tabular-nums; }
+.quota-line .danger { color:#dc2626; font-weight:600; }
+.quota-line .warn { color:#d97706; font-weight:600; }
+.quota-line .danger.pct, .quota-line .warn.pct { opacity:1; }
+.quota-meta { font-size:11px; opacity:.6; margin-top:3px; }
+.progress-sm { height:5px; margin:3px 0 6px; }
+.progress .bar.warn { background:#f59e0b; }
+.progress .bar.danger { background:#dc2626; }

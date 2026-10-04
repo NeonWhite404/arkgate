@@ -64,7 +64,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
 // v13-v15：见 usage_logs 错误分类/缓存列、模型缓存单价、子 Key 配额周期列。
 // v16：接入点级默认请求体参数列（endpoints.default_body_params；与 v10 的
-//      request_headers 同构——下游不会发、由网关按需补上的上游方言参数）。
+//
+//	request_headers 同构——下游不会发、由网关按需补上的上游方言参数）。
 const schemaVersion = "16"
 
 func (s *Store) migrate() error {
@@ -1565,6 +1566,39 @@ func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64, c
 	return err
 }
 
+// GetWindowUsageBatch 批量读取多个子 Key 的窗口用量，键 = subkey_id。
+//
+// 为什么需要批量版：子 Key 列表要给每一行显示「已用 / 限额」，逐个调用
+// GetWindowUsage 会变成 N+1 次查询（N 个子 Key → N 次 PK 查找），
+// 在列表页是可观测的拖慢。这里一次查完。
+//
+// daysByKey 里每个子 Key 自带窗口起始日（各自周期不同，不能统一用一个 day）。
+func (s *Store) GetWindowUsageBatch(daysByKey map[string]string) (map[string]*DailyUsage, error) {
+	out := make(map[string]*DailyUsage, len(daysByKey))
+	if len(daysByKey) == 0 {
+		return out, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// 逐行查但复用同一个只读事务/连接：SQLite 单连接下这样仍是一次往返
+	// 的开销量级，且避免了 SQL 里拼接可变长度的 OR 条件。
+	for id, day := range daysByKey {
+		d := &DailyUsage{}
+		err := s.db.QueryRow(`SELECT tokens,images,requests,cost FROM usage_daily
+			WHERE day=? AND subkey_id=?`, day, id).
+			Scan(&d.Tokens, &d.Images, &d.Requests, &d.Cost)
+		if err == sql.ErrNoRows {
+			out[id] = &DailyUsage{} // 无行 = 零用量，不是错误
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[id] = d
+	}
+	return out, nil
+}
+
 // GetDailyUsage 读取子 Key 当日用量（无行返回零值）。
 // GetWindowUsage 读取子 Key 当前窗口的用量（无行返回零值）。
 //
@@ -1620,8 +1654,8 @@ type SubKeyStats struct {
 	//
 	// 安全性：这是**区间聚合**，不泄露账号/ep/上游错误等运维信息，
 	// 与行级明细的脱敏红线（subKeyLogCols 不含 error）不冲突。
-	CacheReadTokens     int64   `json:"cache_read_tokens"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
 	// CostNoCache 是「假设全部缓存未命中」的对照成本，用于展示缓存节省量。
 	// 由 Cost 与缓存 token 折算，不单独落库——避免两处口径发散。
 	CostNoCache float64 `json:"cost_no_cache"`
@@ -1760,9 +1794,9 @@ type UsageTotals struct {
 	UpstreamErrors int64 `json:"upstream_errors"`
 	ClientErrors   int64 `json:"client_errors"`
 	// 流式请求数与首字耗时之和（仅流式成功计入，非流式首字为 0 不参与均值）。
-	StreamRequests   int64 `json:"stream_requests"`
-	FirstTokenMsSum  int64 `json:"first_token_ms_sum"`
-	LatencyMsSum     int64 `json:"latency_ms_sum"`
+	StreamRequests  int64 `json:"stream_requests"`
+	FirstTokenMsSum int64 `json:"first_token_ms_sum"`
+	LatencyMsSum    int64 `json:"latency_ms_sum"`
 }
 
 // UsageBucket 单个时间桶的聚合。
