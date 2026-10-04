@@ -1,6 +1,9 @@
 package store
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // 历史成本回填（billing backfill）。
 //
@@ -193,44 +196,82 @@ var _ CostFunc = func(string, int64, int64, int64, int64, int64) (float64, float
 // 为什么与 BackfillCosts 分开：本函数不依赖模型定价（直接把日志里的 cost 加总），
 // 因此即使模型已被删除也能修正——而 BackfillCosts 对未定价模型会置 0。
 //
-// 时区：day 是**本地时区**自然日（与 today() 写入口径一致），所以按本地时区
-// 分组，不能用 UTC（跨时区会把凌晨的请求算到前一天）。
+// 时区：窗口起点是**本地时区**的自然日（与 model.WindowDay 写入口径一致），
+// 所以按本地时区分组，不能用 UTC（跨时区会把凌晨的请求算到前一天）。
+//
+// v15 后 usage_daily.day 存的是**窗口起始日**（可能是本周一/本月 1 号），
+// 因此必须先按「行自身的窗口」聚合日志，不能用日志的自然日去对齐——
+// 否则周周期下要么匹配不到行（WHERE day='周三的日期'），要么把整周成本
+// 写成单日成本（当窗口起点恰好等于某个自然日时）。
+//
+// 窗口长度取**行上记录的 window_secs** 而不是子 Key 当前配置：
+// 周期可以随时改，历史行的 day 对应的是当时配置下的窗口；
+// 用当前配置反推会算错改过周期的那些历史行。
+// window_secs=0 的历史行（v15 之前）按自然日 86400 处理（等价旧行为）。
 func (s *Store) RepairDailyCosts(from, to int64, dryRun bool) (int64, error) {
 	if from >= to {
 		return 0, fmt.Errorf("区间非法: from=%d to=%d", from, to)
 	}
-	// 先按本地时区的自然日聚合日志成本。
+	// 第一步：读出待修的行（day + window_secs），并算出每个窗口的时间区间。
 	//
-	// 单连接约束：必须在遍历 rows 之前把结果读完再执行 UPDATE——
+	// 单连接约束：必须在遍历 rows 之前把结果读完再执行后续查询——
 	// 在 rows 未关闭时发起新的查询会因拿不到连接而永久阻塞。
-	type dayAgg struct {
-		day  string
-		cost float64
+	type winRow struct {
+		day        string
+		subkeyID   string
+		windowSecs int64
 	}
-	var aggs []dayAgg
+	var wins []winRow
 	func() {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		rows, err := s.db.Query(`SELECT
-				strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
-				COALESCE(SUM(cost),0)
-			FROM usage_logs
-			WHERE ts >= ? AND ts < ? AND subkey_id <> ''
-			GROUP BY day`, from, to)
+		rows, err := s.db.Query(`SELECT day, subkey_id, window_secs FROM usage_daily
+			WHERE day >= ? AND day <= ?`, dayOf(from), dayOf(to))
 		if err != nil {
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var a dayAgg
-			if err := rows.Scan(&a.day, &a.cost); err != nil {
+			var w winRow
+			if err := rows.Scan(&w.day, &w.subkeyID, &w.windowSecs); err != nil {
 				return
 			}
-			aggs = append(aggs, a)
+			wins = append(wins, w)
 		}
 	}()
-	if len(aggs) == 0 {
+	if len(wins) == 0 {
 		return 0, nil
+	}
+
+	// 第二步：逐个窗口聚合日志成本。
+	//
+	// 按 (day, subkey) 单独聚合，而不是一次 GROUP BY day——因为每个子 Key 的
+	// 窗口长度可能不同（有的按周、有的按日），不能用同一个分桶表达式。
+	type winCost struct {
+		day      string
+		subkeyID string
+		cost     float64
+	}
+	costs := make([]winCost, 0, len(wins))
+	for _, w := range wins {
+		secs := w.windowSecs
+		if secs <= 0 {
+			secs = 86400 // 历史行：等价自然日
+		}
+		start, err := time.ParseInLocation("2006-01-02", w.day, time.Local)
+		if err != nil {
+			continue // 脏 day 值：跳过而不是中断整次修复
+		}
+		end := start.Add(time.Duration(secs) * time.Second)
+		var sum float64
+		func() {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			_ = s.db.QueryRow(`SELECT COALESCE(SUM(cost),0) FROM usage_logs
+				WHERE subkey_id=? AND ts >= ? AND ts < ?`,
+				w.subkeyID, start.Unix(), end.Unix()).Scan(&sum)
+		}()
+		costs = append(costs, winCost{day: w.day, subkeyID: w.subkeyID, cost: sum})
 	}
 
 	s.mu.Lock()
@@ -241,23 +282,28 @@ func (s *Store) RepairDailyCosts(from, to int64, dryRun bool) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 逐日对齐 usage_daily.cost（只改成本，不动 tokens/images/requests）。
+	// 第三步：逐行对齐成本（只改成本，不动 tokens/images/requests）。
 	//
 	// 「不动其它列」是刻意的：tokens/images 一直是对的，重算它们反而有风险
 	// （例如日志被清理后会把计数改小）。成本这一列才是本次要修的对象。
+	//
+	// 注意 v15 后 tokens 列存的是**加权配额计数**（不是真实 token），
+	// 更不能拿日志重算。
 	var fixed int64
-	for _, a := range aggs {
+	for _, c := range costs {
 		if dryRun {
 			// 预演：只统计差异，不写。
 			var cur float64
-			if err := tx.QueryRow(`SELECT COALESCE(SUM(cost),0) FROM usage_daily WHERE day=?`, a.day).Scan(&cur); err == nil {
-				if !costEqual(cur, a.cost) {
+			if err := tx.QueryRow(`SELECT COALESCE(cost,0) FROM usage_daily WHERE day=? AND subkey_id=?`,
+				c.day, c.subkeyID).Scan(&cur); err == nil {
+				if !costEqual(cur, c.cost) {
 					fixed++
 				}
 			}
 			continue
 		}
-		res, err := tx.Exec(`UPDATE usage_daily SET cost=? WHERE day=?`, a.cost, a.day)
+		res, err := tx.Exec(`UPDATE usage_daily SET cost=? WHERE day=? AND subkey_id=?`,
+			c.cost, c.day, c.subkeyID)
 		if err != nil {
 			return fixed, err
 		}
@@ -272,4 +318,9 @@ func (s *Store) RepairDailyCosts(from, to int64, dryRun bool) (int64, error) {
 		return fixed, err
 	}
 	return fixed, nil
+}
+
+// dayOf 把 unix 秒转成本地时区的日期字符串，与 model.WindowDay 同一格式。
+func dayOf(ts int64) string {
+	return time.Unix(ts, 0).In(time.Local).Format("2006-01-02")
 }

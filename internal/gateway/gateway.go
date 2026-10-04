@@ -48,6 +48,7 @@ type Store interface {
 	GetSubKeyByHash(hash string) (*model.SubKey, error)
 	GetAccount(id string) (*model.Account, error)
 	GetDailyUsage(subkeyID string) (*store.DailyUsage, error)
+	GetWindowUsage(subkeyID, day string) (*store.DailyUsage, error)
 }
 
 // New 构造网关。
@@ -81,6 +82,22 @@ func hashKey(k string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// ErrQuotaExceeded 表示凭据本身有效，但已达到配额上限。
+//
+// 为什么要区分于鉴权失败：两者都从 authSubKey 返回，但 HTTP 语义完全不同——
+// 401 的语义是「凭据不对，去换一个」，429 是「凭据没问题，但先别发」。
+// 历史上两者都返回 401（升级前的既有行为），会让客户端在额度耗尽时去刷新凭据，
+// 而不是退避重试——把可恢复的限流错障成不可恢复的鉴权失败。
+var ErrQuotaExceeded = errors.New("quota exceeded")
+
+// quotaError 带用户可读文案的配额超限错误（errors.Is 可识别为 ErrQuotaExceeded）。
+type quotaError struct{ msg string }
+
+func (e *quotaError) Error() string { return e.msg }
+func (e *quotaError) Is(target error) bool {
+	return target == ErrQuotaExceeded
+}
+
 func (g *Gateway) authSubKey(r *http.Request, modality string) (*model.SubKey, error) {
 	// Anthropic 客户端（Claude Code）用 x-api-key 头携带 Key，与 Bearer 同权。
 	token := bearerToken(r)
@@ -100,20 +117,29 @@ func (g *Gateway) authSubKey(r *http.Request, modality string) (*model.SubKey, e
 	if sk.ExpiresAt > 0 && sk.ExpiresAt < time.Now().Unix() {
 		return nil, errors.New("该 API Key 已过期")
 	}
-	// 日限额按「当日真实用量」判定（usage_daily 由异步统计落库时累计；
+	// 配额按「当前窗口的真实用量」判定（usage_daily 由异步统计落库时累计；
 	// 在途请求可能带来短暂超量，属可接受误差）。
+	//
+	// 窗口起点按该子 Key 的周期规则算出（日/周/月 + 自定义重置时刻），
+	// 而不是直接用今天——否则周/月周期永远读不到行，限额会静默失效。
 	// token 限额约束全部模态；图像张数限额只约束图像请求。
-	if sk.DailyLimitTokens > 0 || (sk.DailyLimitImages > 0 && modality == model.ModelTypeImage) {
-		du, err := g.store.GetDailyUsage(sk.ID)
+	if sk.DailyLimitTokens > 0 || sk.WindowLimitRequests > 0 ||
+		(sk.DailyLimitImages > 0 && modality == model.ModelTypeImage) {
+		rule := model.QuotaRuleOf(sk)
+		winDay := model.WindowDay(rule, time.Now())
+		du, err := g.store.GetWindowUsage(sk.ID, winDay)
 		if err != nil {
-			// 日用量读取失败时放行（可用性优先），但必须留痕——否则限额会被静默绕过。
-			log.Printf("gateway: 读取子 Key %s 日用量失败，本次跳过日限额检查: %v", sk.ID, err)
+			// 用量读取失败时放行（可用性优先），但必须留痕——否则限额会被静默绕过。
+			log.Printf("gateway: 读取子 Key %s 周期用量失败，本次跳过配额检查: %v", sk.ID, err)
 		} else {
 			if sk.DailyLimitTokens > 0 && du.Tokens >= sk.DailyLimitTokens {
-				return nil, errors.New("该 API Key 已达到当日 token 用量上限")
+				return nil, &quotaError{"该 API Key 已达到当前周期 token 用量上限"}
+			}
+			if sk.WindowLimitRequests > 0 && du.Requests >= sk.WindowLimitRequests {
+				return nil, &quotaError{"该 API Key 已达到当前周期请求数上限"}
 			}
 			if sk.DailyLimitImages > 0 && modality == model.ModelTypeImage && du.Images >= sk.DailyLimitImages {
-				return nil, errors.New("该 API Key 已达到当日图像张数上限")
+				return nil, &quotaError{"该 API Key 已达到当前周期图像张数上限"}
 			}
 		}
 	}
@@ -464,7 +490,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	sk, err := g.authSubKey(r, model.ModelTypeText)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
+		writeAuthErr(w, err)
 		return
 	}
 	body, ok := readBodyOrFail(w, r)
@@ -611,7 +637,7 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	sk, err := g.authSubKey(r, model.ModelTypeText)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
+		writeAuthErr(w, err)
 		return
 	}
 	body, ok := readBodyOrFail(w, r)
@@ -730,7 +756,7 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	sk, err := g.authSubKey(r, model.ModelTypeImage)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
+		writeAuthErr(w, err)
 		return
 	}
 	body, ok := readBodyOrFail(w, r)
@@ -1008,7 +1034,7 @@ func modalityOf(api balancer.API) string {
 func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 	sk, err := g.authSubKey(r, model.ModelTypeText)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
+		writeAuthErr(w, err)
 		return
 	}
 	type modelObj struct {
@@ -1166,4 +1192,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("gateway: write json: %v", err)
 	}
+}
+
+// writeAuthErr 把 authSubKey 的错误写成响应。
+//
+// 配额超限 → 429（可恢复，客户端应退避重试）；
+// 其余（缺 Key / 无效 Key / 已禁用 / 已过期）→ 401。
+//
+// 响应体里的 code 用 quota_exceeded，便于客户端程序化区分而不用去匹配中文文案。
+func writeAuthErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrQuotaExceeded) {
+		w.Header().Set("Retry-After", "60")
+		writeJSON(w, http.StatusTooManyRequests,
+			map[string]any{"error": map[string]any{
+				"code":    "quota_exceeded",
+				"message": err.Error(),
+				"type":    "rate_limit_error",
+			}})
+		return
+	}
+	writeJSON(w, http.StatusUnauthorized, errBody("invalid_request_error", err.Error()))
 }

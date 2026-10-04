@@ -265,7 +265,33 @@ type SubKey struct {
 	AllowedAccounts  []string `json:"allowed_accounts"`   // 空 = 全部
 	DailyLimitTokens int64    `json:"daily_limit_tokens"` // 0 = 不限
 	DailyLimitImages int64    `json:"daily_limit_images"` // 0 = 不限
-	ExpiresAt        int64    `json:"expires_at"`
+	// ── 配额周期（v15）──
+	// QuotaPeriod: ""|"day" = 自然日（与旧行为等价）；"week"；"month"。
+	// 窗口起点永远落在自然日上（自然日是最小单位，不做小时/滚动窗口），
+	// 因此仍复用 usage_daily.day 存窗口起始日，无需新表。
+	QuotaPeriod string `json:"quota_period"`
+	// QuotaResetWeekday 仅 week 生效，用 ISO 8601 编号：1=周一 .. 7=周日。
+	// **0 = 未设置**（等价周一）——刻意不用 time.Weekday 的 0=周日，
+	// 否则「未设置的零值」与「显式选周日」无法区分，会导致
+	// 零值构造的 SubKey 与从库读出的 SubKey 语义不一致。
+	QuotaResetWeekday int `json:"quota_reset_weekday"`
+	// QuotaResetHour 每日切分点（0-23，本地时区）。
+	// 用途：跨时区部署时统一重置时刻（例如设 8 表示每天早上 8 点开始新周期）。
+	QuotaResetHour int `json:"quota_reset_hour"`
+	// ── 缓存倍率（v15，千分比；0 = 未设置用默认）──
+	//
+	// 为什么需要：prompt_tokens 含缓存命中量，而缓存读单价通常只有输入的 10%
+	// （OpenAI 系为 50%）。按原价计入额度会让「缓存用得多」反而更快撞限额——
+	// 与 v14 的计费口径（已按缓存价拆分）自相矛盾。
+	//
+	// 用千分比整数而非浮点：与「0 = 未设置」惯例一致（零值安全）、
+	// 无浮点相等比较与 JSON 精度问题。1000 = 1.0x。
+	CacheReadPermille  int64 `json:"cache_read_permille"`
+	CacheWritePermille int64 `json:"cache_write_permille"`
+	// WindowLimitRequests 窗口内请求数上限（0 = 不限）。
+	// 高频小请求是比 token 更常见的滥用形态，token 限额抓不住。
+	WindowLimitRequests int64 `json:"window_limit_requests"`
+	ExpiresAt           int64 `json:"expires_at"`
 	CreatedAt        int64    `json:"created_at"`
 	LastUsedAt       int64    `json:"last_used_at"`
 	TotalRequests    int64    `json:"total_requests"`

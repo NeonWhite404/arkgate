@@ -62,7 +62,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // v10：接入点级请求头列（endpoints.request_headers，每映射可选自定义请求头）。
 // v11：接入点上游删除状态列（endpoints.upstream_deleted，模型状态检查器维护）。
 // v12：接入点级跳过检查豁免列（endpoints.skip_upstream_check；豁免的接入点不参与检查）。
-const schemaVersion = "14"
+const schemaVersion = "15"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -329,6 +329,30 @@ func (s *Store) migrate() error {
 		// 多收、把缓存写入漏收。单列缓存读/写单价后才能正确拆分。
 		`ALTER TABLE models ADD COLUMN price_cache_read REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE models ADD COLUMN price_cache_write REAL NOT NULL DEFAULT 0`,
+		// ────── v15：子 Key 配额细化（周期 + 缓存倍率） ──────
+		// 背景：原限额写死「自然日」且把缓存 token 按原价计入——缓存读单价通常只有
+		// 输入的 10%，重度用缓存的 Key 反而更快撞额度，与计费口径（v14 已拆分）矛盾。
+		//
+		// 周期：'day'（空值等价，保持旧行为）| 'week' | 'month'。
+		// **同时只存在一个周期**（不做多周期叠加），且窗口起点永远落在自然日上，
+		// 因此仍复用 usage_daily.day 存「窗口起始日」——无需新表。
+		//
+		// 倍率用**千分比整数**（1000 = 1.0x，0 = 未设置用默认），不用浮点：
+		// 与「0 = 未设置」惯例一致（零值安全）、无浮点相等比较与 JSON 精度问题。
+		`ALTER TABLE subkeys ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE subkeys ADD COLUMN quota_reset_weekday INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subkeys ADD COLUMN quota_reset_hour INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subkeys ADD COLUMN cache_read_permille INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE subkeys ADD COLUMN cache_write_permille INTEGER NOT NULL DEFAULT 0`,
+		// 窗口内请求数上限（0 = 不限）。高频小请求是比 token 更常见的滥用形态。
+		`ALTER TABLE subkeys ADD COLUMN window_limit_requests INTEGER NOT NULL DEFAULT 0`,
+		// usage_daily 增加「窗口长度（秒）」列。
+		//
+		// 为什么不靠子 Key 当前配置反推：周期可以随时改，而历史行的 day 对应的是
+		// **当时**配置下的窗口起点。把窗口长度随行落库，行才自解释——
+		// 否则清理/回填/审计都无法判断某一行到底是日、周还是月。
+		// 0 = 历史行（等价「日」，与旧行为一致）。
+		`ALTER TABLE usage_daily ADD COLUMN window_secs INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -1083,14 +1107,18 @@ func (s *Store) AccumulateImages(accountID, endpointID, subkeyID string, n int64
 
 const subkeyCols = `id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,
 	daily_limit_tokens,daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,
-	total_images`
+	total_images,quota_period,quota_reset_weekday,quota_reset_hour,cache_read_permille,
+	cache_write_permille,window_limit_requests`
 
 func scanSubKey(sc scanner) (*model.SubKey, error) {
 	sk := &model.SubKey{}
 	var am, aa string
 	if err := sc.Scan(&sk.ID, &sk.Name, &sk.Key, &sk.KeyHash, &sk.Enabled, &am, &aa,
 		&sk.DailyLimitTokens, &sk.DailyLimitImages, &sk.ExpiresAt, &sk.CreatedAt,
-		&sk.LastUsedAt, &sk.TotalRequests, &sk.TotalTokens, &sk.TotalImages); err != nil {
+		&sk.LastUsedAt, &sk.TotalRequests, &sk.TotalTokens, &sk.TotalImages,
+		&sk.QuotaPeriod, &sk.QuotaResetWeekday, &sk.QuotaResetHour,
+		&sk.CacheReadPermille, &sk.CacheWritePermille,
+		&sk.WindowLimitRequests); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(am), &sk.AllowedModels)
@@ -1126,6 +1154,17 @@ func (s *Store) GetSubKeyByHash(hash string) (*model.SubKey, error) {
 	return scanSubKey(s.db.QueryRow(`SELECT `+subkeyCols+` FROM subkeys WHERE key_hash=?`, hash))
 }
 
+// GetSubKeyByID 按 id 直查子 Key（主键查询）。
+//
+// 用途：统计路径需要子 Key 的配额规则（周期 + 缓存倍率）来加权计数。
+// 与 GetSubKeyByHash 同样走索引单行查询，不做全表加载——
+// 这条路径在 Record 热路径上（虽有短期缓存，回源时仍要便宜）。
+func (s *Store) GetSubKeyByID(id string) (*model.SubKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanSubKey(s.db.QueryRow(`SELECT `+subkeyCols+` FROM subkeys WHERE id=?`, id))
+}
+
 func (s *Store) UpsertSubKey(sk *model.SubKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1133,15 +1172,25 @@ func (s *Store) UpsertSubKey(sk *model.SubKey) error {
 	aa, _ := json.Marshal(sk.AllowedAccounts)
 	_, err := s.db.Exec(`INSERT INTO subkeys
 		(id,name,key_text,key_hash,enabled,allowed_models,allowed_accounts,daily_limit_tokens,
-		 daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,total_images)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 daily_limit_images,expires_at,created_at,last_used_at,total_requests,total_tokens,total_images,
+		 quota_period,quota_reset_weekday,quota_reset_hour,cache_read_permille,
+		 cache_write_permille,window_limit_requests)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_text=excluded.key_text,
 			key_hash=excluded.key_hash, enabled=excluded.enabled, allowed_models=excluded.allowed_models,
 			allowed_accounts=excluded.allowed_accounts, daily_limit_tokens=excluded.daily_limit_tokens,
-			daily_limit_images=excluded.daily_limit_images, expires_at=excluded.expires_at`,
+			daily_limit_images=excluded.daily_limit_images, expires_at=excluded.expires_at,
+			quota_period=excluded.quota_period,
+			quota_reset_weekday=excluded.quota_reset_weekday,
+			quota_reset_hour=excluded.quota_reset_hour,
+			cache_read_permille=excluded.cache_read_permille,
+			cache_write_permille=excluded.cache_write_permille,
+			window_limit_requests=excluded.window_limit_requests`,
 		sk.ID, sk.Name, sk.Key, sk.KeyHash, boolInt(sk.Enabled), string(am), string(aa),
 		sk.DailyLimitTokens, sk.DailyLimitImages, sk.ExpiresAt, nonzero(sk.CreatedAt, nowUnix()),
-		sk.LastUsedAt, sk.TotalRequests, sk.TotalTokens, sk.TotalImages)
+		sk.LastUsedAt, sk.TotalRequests, sk.TotalTokens, sk.TotalImages,
+		sk.QuotaPeriod, sk.QuotaResetWeekday, sk.QuotaResetHour,
+		sk.CacheReadPermille, sk.CacheWritePermille, sk.WindowLimitRequests)
 	return err
 }
 
@@ -1425,6 +1474,49 @@ type DailyUsage struct {
 func today() string { return time.Now().Format("2006-01-02") }
 
 // AddDailyUsage 异步 consumer 落库时同步累计当日用量行。
+// WindowUsage 是一次窗口用量写入（供 balancer 统计路径使用）。
+//
+// 字段含义需与 balancer.windowUsage 保持一致；分开定义是为了不把 store
+// 反向依赖到 balancer 的私有类型上。
+type WindowUsage struct {
+	SubKeyID   string
+	Day        string // 窗口起始日（usage_daily.day）
+	WindowSecs int64  // 窗口长度，随行落库供审计
+	Tokens     int64  // **加权配额计数**，不是真实 token
+	Images     int64
+	Cost       float64
+}
+
+// AddWindowUsage 累计一次用量到子 Key 的当前窗口行。
+//
+// 命名从 AddDailyUsage 改过来：day 列现在存的是「窗口起始日」（可能是本周一/
+// 本月 1 号），不再总是自然日。名字不改会误导后来者。
+//
+// window_secs 随行落库而不是靠子 Key 当前配置反推：周期可以随时改，
+// 历史行的 day 对应的是**当时**配置下的窗口起点；把长度随行存，行才自解释。
+func (s *Store) AddWindowUsage(u WindowUsage) error {
+	if u.SubKeyID == "" {
+		return nil
+	}
+	if u.Day == "" {
+		u.Day = today()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO usage_daily(day,subkey_id,tokens,images,requests,cost,window_secs)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(day,subkey_id) DO UPDATE SET
+			tokens=tokens+excluded.tokens, images=images+excluded.images,
+			requests=requests+excluded.requests, cost=cost+excluded.cost,
+			window_secs=excluded.window_secs`,
+		u.Day, u.SubKeyID, u.Tokens, u.Images, 1, u.Cost, u.WindowSecs)
+	return err
+}
+
+// AddDailyUsage 保留旧签名（自然日 + 未加权计数），供测试与兼容路径使用。
+//
+// Deprecated：新代码用 AddWindowUsage。保留是因为它与旧行为字面等价，
+// 便于已有测试继续验证「无缓存时口径不变」。
 func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64, cost float64) error {
 	if subkeyID == "" {
 		return nil
@@ -1441,6 +1533,29 @@ func (s *Store) AddDailyUsage(subkeyID string, tokens, images, requests int64, c
 }
 
 // GetDailyUsage 读取子 Key 当日用量（无行返回零值）。
+// GetWindowUsage 读取子 Key 当前窗口的用量（无行返回零值）。
+//
+// day 是**窗口起始日**，由调用方按该子 Key 的周期规则算出（model.WindowDay），
+// 而不是直接取今天——否则周/月周期会永远读不到行，限额形同虚设。
+func (s *Store) GetWindowUsage(subkeyID, day string) (*DailyUsage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d := &DailyUsage{}
+	err := s.db.QueryRow(`SELECT tokens,images,requests,cost FROM usage_daily WHERE day=? AND subkey_id=?`,
+		day, subkeyID).Scan(&d.Tokens, &d.Images, &d.Requests, &d.Cost)
+	if err == sql.ErrNoRows {
+		return &DailyUsage{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// GetDailyUsage 读自然日用量（兼容旧签名）。
+//
+// 与 GetWindowUsage 的区别仅在于 day 固定取今天。day 周期下两者完全等价，
+// 因此旧调用点无需改动；周/月周期的新调用点必须用 GetWindowUsage。
 func (s *Store) GetDailyUsage(subkeyID string) (*DailyUsage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

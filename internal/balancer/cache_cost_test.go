@@ -223,10 +223,14 @@ func TestDailyCostRecorded(t *testing.T) {
 	}
 	b.Record(l, nil, true, false)
 	// 统计是异步落库的，等一下再读（通道 → consumer）。
+	// 用 GetWindowUsage + 当前窗口起点读：写入现在按周期窗口归位
+	//（day 周期下窗口起点就是今天，但用 WindowDay 表达才能在周期改变时仍正确）。
+	rule := model.QuotaRuleOf(sk)
+	day := model.WindowDay(rule, time.Now())
 	deadline := time.Now().Add(3 * time.Second)
 	var du *store.DailyUsage
 	for time.Now().Before(deadline) {
-		d, err := st.GetDailyUsage(sk.ID)
+		d, err := st.GetWindowUsage(sk.ID, day)
 		if err == nil && d.Cost > 0 {
 			du = d
 			break
@@ -243,7 +247,135 @@ func TestDailyCostRecorded(t *testing.T) {
 	if !approx(du.Cost, l.Cost) {
 		t.Fatalf("日成本 %v != 日志成本 %v", du.Cost, l.Cost)
 	}
-	if du.Tokens != 1100 {
-		t.Fatalf("日 token 应为 1100, got %d", du.Tokens)
+	// token 列现在是**加权配额计数**（v15）：600 读按 0.1x、100 写按 1.25x
+	// → 400 + 60 + 125 = 585。真实 token 1100 记在 usage_logs 里。
+	// 本测试关心的是 cost 落库（见上方注释），token 值交由
+	// TestQuotaWeightingEndToEnd 专测，这里只确认它不是 0。
+	if du.Tokens <= 0 {
+		t.Fatalf("日 token 不应为 0, got %d", du.Tokens)
 	}
+}
+
+// TestQuotaWeightingEndToEnd 加权配额计数必须真的落到窗口表里。
+//
+// 回归背景：本测试是在实现「缓存倍率」时写的，过程中发现两件事：
+//  1. `op.cost = l.Cost` 这行在上一轮重构里被我删掉过一次，导致日成本恒 0；
+//     本次加配额字段时又**重蹈覆辙**（把该行替换成了新代码）。
+//     所以这里同时断言 cost 与 quota 两个字段都真的落了库——
+//     只测其中一个的话，下一次改这段代码仍会漏。
+//  2. 配额的入参是 `l.CacheReadTokens` / `l.CacheCreationTokens` 而非
+//     `l.PromptTokens`，写错字段不会编译失败（都是 int64），只能靠断言数值抓。
+func TestQuotaWeightingEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.UpsertModel(&model.Model{
+		Name: "m", Enabled: true, Type: model.ModelTypeText,
+		PriceInput: 3, PriceOutput: 15, PriceCacheRead: 0.3, PriceCacheWrite: 3.75,
+	}); err != nil {
+		t.Fatalf("model: %v", err)
+	}
+	// 显式配倍率：读 0.1x、写 1.25x。
+	sk := &model.SubKey{
+		ID: "sk_q", Name: "k", KeyHash: "h", Enabled: true,
+		CacheReadPermille: 100, CacheWritePermille: 1250,
+		QuotaPeriod: model.QuotaPeriodDay,
+	}
+	if err := st.UpsertSubKey(sk); err != nil {
+		t.Fatalf("subkey: %v", err)
+	}
+
+	b := New(st, 0)
+	defer b.Close()
+	b.Refresh()
+
+	// 1000 prompt（600 读 + 100 写 + 300 普通）+ 100 输出
+	//   真实 token = 1100（usage_logs 记这个）
+	//   加权配额   = 300+100 + 600*0.1 + 100*1.25 = 400+60+125 = 585
+	l := &model.UsageLog{
+		Model: "m", SubKeyID: sk.ID, Status: "ok",
+		PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100,
+		CacheReadTokens: 600, CacheCreationTokens: 100,
+	}
+	b.Record(l, nil, true, false)
+
+	rule := model.QuotaRuleOf(sk)
+	day := model.WindowDay(rule, time.Now())
+	deadline := time.Now().Add(3 * time.Second)
+	var du *store.DailyUsage
+	for time.Now().Before(deadline) {
+		d, err := st.GetWindowUsage(sk.ID, day)
+		if err == nil && d.Tokens > 0 {
+			du = d
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if du == nil {
+		t.Fatal("窗口表无写入（配额与成本都未落库）")
+	}
+
+	// 1) 配额计数必须是**加权后**的值，不能是真实 token。
+	if du.Tokens != 585 {
+		t.Errorf("窗口 tokens 应为加权配额 585, got %d（1100 说明没加权）", du.Tokens)
+	}
+	// 2) 成本字段必须同时正确——它曾经因为漏赋值而恒 0。
+	if !approx(du.Cost, 0.002955) {
+		t.Errorf("窗口 cost 应为 0.002955, got %v（0 说明 op.cost 未赋值）", du.Cost)
+	}
+	// 3) 窗口长度随行落库（供审计判断这行是日/周/月）。
+	if du.Requests != 1 {
+		t.Errorf("requests 应为 1, got %d", du.Requests)
+	}
+}
+
+// TestQuotaNoCacheMatchesLegacy 无缓存时，窗口计数必须与旧口径**完全一致**。
+//
+// 这是升级安全性的核心保证：现有子 Key 都没配缓存倍率，若加权逻辑让
+// 无缓存请求的计数发生变化，等于静默改变了所有存量用户的额度。
+func TestQuotaNoCacheMatchesLegacy(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	if err := st.UpsertModel(&model.Model{
+		Name: "m", Enabled: true, Type: model.ModelTypeText, PriceInput: 1, PriceOutput: 1,
+	}); err != nil {
+		t.Fatalf("model: %v", err)
+	}
+	// 旧式子 Key：所有配额字段都是零值（模拟 v15 之前创建的行）。
+	sk := &model.SubKey{ID: "sk_old", Name: "k", KeyHash: "h", Enabled: true}
+	if err := st.UpsertSubKey(sk); err != nil {
+		t.Fatalf("subkey: %v", err)
+	}
+	b := New(st, 0)
+	defer b.Close()
+	b.Refresh()
+
+	l := &model.UsageLog{
+		Model: "m", SubKeyID: sk.ID, Status: "ok",
+		PromptTokens: 1000, CompletionTokens: 250, TotalTokens: 1250,
+	}
+	b.Record(l, nil, true, false)
+
+	rule := model.QuotaRuleOf(sk)
+	day := model.WindowDay(rule, time.Now())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		d, _ := st.GetWindowUsage(sk.ID, day)
+		if d != nil && d.Tokens > 0 {
+			if d.Tokens != 1250 {
+				t.Fatalf("旧子 Key 无缓存时应为 1250（=prompt+completion）, got %d", d.Tokens)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("窗口表无写入")
 }

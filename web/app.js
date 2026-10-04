@@ -865,7 +865,9 @@ const SubKeysPage = {
       this.modal = {
         id,
         form: { name: "", key: "", allowed_models: [], allowed_accounts: [],
-          daily_limit_tokens: 0, daily_limit_images: 0 },
+          daily_limit_tokens: 0, daily_limit_images: 0, window_limit_requests: 0,
+          quota_period: "day", quota_reset_weekday: 1, quota_reset_hour: 0,
+          cache_read_permille: 0, cache_write_permille: 0 },
       };
       if (id) {
         req("GET", "/api/subkeys").then((subs) => {
@@ -876,6 +878,15 @@ const SubKeysPage = {
             this.modal.form.allowed_accounts = s.allowed_accounts || [];
             this.modal.form.daily_limit_tokens = s.daily_limit_tokens;
             this.modal.form.daily_limit_images = s.daily_limit_images || 0;
+            this.modal.form.window_limit_requests = s.window_limit_requests || 0;
+            // 空周期在后端等价 day，这里显式归一化，避免下拉框显示空白。
+            this.modal.form.quota_period = s.quota_period || "day";
+            // 0 = 未设置（后端按周一解析），这里也归一化，否则下拉框选不中。
+            this.modal.form.quota_reset_weekday = s.quota_reset_weekday || 1;
+            this.modal.form.quota_reset_hour = s.quota_reset_hour || 0;
+            // 倍率 0 = 未设置（后端用默认）；表单里也显示 0，让用户看得见「未设置」。
+            this.modal.form.cache_read_permille = s.cache_read_permille || 0;
+            this.modal.form.cache_write_permille = s.cache_write_permille || 0;
           }
         });
       }
@@ -888,6 +899,12 @@ const SubKeysPage = {
         allowed_accounts: f.allowed_accounts,
         daily_limit_tokens: Number(f.daily_limit_tokens) || 0,
         daily_limit_images: Number(f.daily_limit_images) || 0,
+        window_limit_requests: Number(f.window_limit_requests) || 0,
+        quota_period: f.quota_period || "day",
+        quota_reset_weekday: Number(f.quota_reset_weekday) || 0,
+        quota_reset_hour: Number(f.quota_reset_hour) || 0,
+        cache_read_permille: Number(f.cache_read_permille) || 0,
+        cache_write_permille: Number(f.cache_write_permille) || 0,
       };
       let p;
       if (this.modal.id) {
@@ -945,11 +962,69 @@ const SubKeysPage = {
             <CheckGroup :options="accounts.map(a => ({v: a.id, l: a.name}))" v-model="modal.form.allowed_accounts"/></div>
         </div>
         <div class="sec">
-          <div class="sec-title">当日限额（自然日，本地时区）</div>
+          <div class="sec-title">限额周期</div>
           <div class="form-row">
-            <div class="form-item"><label>Token 限额（0 = 不限）</label><input v-model.number="modal.form.daily_limit_tokens" type="number"/></div>
-            <div class="form-item"><label>图像张数限额（0 = 不限）</label><input v-model.number="modal.form.daily_limit_images" type="number"/></div>
+            <div class="form-item">
+              <label>周期</label>
+              <select v-model="modal.form.quota_period">
+                <option value="day">每自然日</option>
+                <option value="week">每周</option>
+                <option value="month">每月</option>
+              </select>
+            </div>
+            <div class="form-item" v-if="modal.form.quota_period === 'week'">
+              <label>每周从周几开始</label>
+              <select v-model.number="modal.form.quota_reset_weekday">
+                <option :value="1">周一</option><option :value="2">周二</option>
+                <option :value="3">周三</option><option :value="4">周四</option>
+                <option :value="5">周五</option><option :value="6">周六</option>
+                <option :value="7">周日</option>
+              </select>
+            </div>
+            <div class="form-item">
+              <label>每日重置时刻（本地时区，小时）</label>
+              <input v-model.number="modal.form.quota_reset_hour" type="number" min="0" max="23"/>
+            </div>
           </div>
+          <p class="hint">
+            周期起点以自然日为单位，不设滚动窗口。重置时刻用于对齐时区：
+            例如填 8 表示每天早上 8 点开始新周期（8 点前的用量计入前一天）。
+          </p>
+        </div>
+
+        <div class="sec">
+          <div class="sec-title">周期限额（0 = 不限）</div>
+          <div class="form-row">
+            <div class="form-item"><label>Token 限额</label><input v-model.number="modal.form.daily_limit_tokens" type="number"/></div>
+            <div class="form-item"><label>请求数限额</label><input v-model.number="modal.form.window_limit_requests" type="number"/></div>
+            <div class="form-item"><label>图像张数限额</label><input v-model.number="modal.form.daily_limit_images" type="number"/></div>
+          </div>
+          <p class="hint">
+            Token 限额按「加权配额」计量：缓存读取与缓存写入各自乘下面的倍率。
+          </p>
+        </div>
+
+        <div class="sec">
+          <div class="sec-title">缓存计权倍率（千分比，留空 = 不启用）</div>
+          <div class="form-row">
+            <div class="form-item">
+              <label>缓存读取倍率（默认 100 = 0.1x）</label>
+              <input v-model.number="modal.form.cache_read_permille" type="number" min="0"/>
+            </div>
+            <div class="form-item">
+              <label>缓存写入倍率（默认 1250 = 1.25x）</label>
+              <input v-model.number="modal.form.cache_write_permille" type="number" min="0"/>
+            </div>
+          </div>
+          <p class="hint">
+            上游上报的 prompt_tokens 含缓存命中量。缓存读取单价通常只有输入的 10%
+            （OpenAI 系为 50%），按原价计入限额会让「缓存用得多」反而更快撞额度。
+          </p>
+          <p class="hint">
+            <strong>两个都留空 = 不启用加权</strong>（Token 上限仍按上游总数计，
+            与升级前一致）。启用后只填一个也可以，另一个按默认值
+            （读 0.1x / 写 1.25x）计算，不会当成免费。
+          </p>
         </div>
       </template>
       <template #foot>
@@ -2095,6 +2170,33 @@ const PortalPage = {
   emits: ["logout"],
   data() { return { d: null, busy: false }; },
   computed: {
+    // 周期文案：门户标题里的「今日/本周/本月」必须与限额周期一致，
+    // 否则用户会以为 100 万额度是「每天的」，而实际是每月的。
+    periodLabel() {
+      const p = this.d && this.d.quota && this.d.quota.period;
+      if (p === "week") return "本周";
+      if (p === "month") return "本月";
+      return "今日";
+    },
+    // 重置说明：让用户知道额度何时归零（跨时区部署时尤其重要）。
+    resetLabel() {
+      const q = (this.d && this.d.quota) || {};
+      const h = q.reset_hour || 0;
+      const wd = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+      if (q.period === "week") {
+        return "每" + (wd[q.reset_weekday] || "周一") + " " + h + " 点重置";
+      }
+      if (q.period === "month") {
+        return "每月 1 日 " + h + " 点重置";
+      }
+      return "每日 " + h + " 点重置";
+    },
+    requestProgress() {
+      const lim = this.d && this.d.quota && this.d.quota.limit_requests;
+      if (!lim) return null;
+      const p = (this.d.today.requests / lim) * 100;
+      return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
+    },
     tokenProgress() {
       if (!this.d || !this.d.daily_limit_tokens) return null;
       const p = (this.d.today.tokens / this.d.daily_limit_tokens) * 100;
@@ -2170,24 +2272,35 @@ const PortalPage = {
     </div>
     <div class="page" v-if="d">
       <div class="stat-row">
-        <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">今日 Tokens</div></div></div>
-        <div class="stat-card"><div class="ic ic-green">⚡</div><div class="body"><div class="v">{{ d.today.requests }}</div><div class="l">今日请求数</div></div></div>
-        <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">今日图像（张）</div></div></div>
-        <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">今日成本</div></div></div>
+        <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">{{ periodLabel }} Tokens</div></div></div>
+        <div class="stat-card"><div class="ic ic-green">⚡</div><div class="body"><div class="v">{{ d.today.requests }}</div><div class="l">{{ periodLabel }}请求数</div></div></div>
+        <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">{{ periodLabel }}图像（张）</div></div></div>
+        <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">{{ periodLabel }}成本（参考）</div></div></div>
         <div class="stat-card"><div class="ic ic-green">✅</div><div class="body"><div class="v">{{ fmtPct(d.success_rate_7d) }}</div><div class="l">7 天成功率</div></div></div>
         <div class="stat-card"><div class="ic ic-teal">♻</div><div class="body"><div class="v">{{ cacheHitRate === null ? '—' : cacheHitRate.toFixed(1) + '%' }}</div><div class="l">7 天缓存命中占输入</div></div></div>
       </div>
 
-      <div class="card" v-if="d.daily_limit_tokens || d.daily_limit_images">
-        <div class="card-head"><div class="card-title">今日限额</div></div>
+      <div class="card" v-if="d.daily_limit_tokens || d.daily_limit_images || (d.quota && d.quota.limit_requests)">
+        <div class="card-head">
+          <div class="card-title">{{ periodLabel }}限额</div>
+          <div class="card-sub">{{ resetLabel }}</div>
+        </div>
         <template v-if="d.daily_limit_tokens">
-          <div class="kv"><span class="k">Token 限额</span><span class="v">{{ d.today.tokens }} / {{ fmtTokens(d.daily_limit_tokens) }}</span></div>
+          <div class="kv"><span class="k">Token 限额（加权）</span><span class="v">{{ fmtTokens(d.today.tokens) }} / {{ fmtTokens(d.daily_limit_tokens) }}</span></div>
           <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="tokenProgress.cls" :style="{width: tokenProgress.pct + '%'}"></div></div>
+        </template>
+        <template v-if="d.quota && d.quota.limit_requests">
+          <div class="kv"><span class="k">请求数限额</span><span class="v">{{ d.today.requests }} / {{ d.quota.limit_requests }}</span></div>
+          <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="requestProgress.cls" :style="{width: requestProgress.pct + '%'}"></div></div>
         </template>
         <template v-if="d.daily_limit_images">
           <div class="kv"><span class="k">图像张数限额</span><span class="v">{{ d.today.images }} / {{ d.daily_limit_images }}</span></div>
           <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="imageProgress.cls" :style="{width: imageProgress.pct + '%'}"></div></div>
         </template>
+        <p class="hint" v-if="d.daily_limit_tokens">
+          Token 按「加权配额」计量：缓存读取与写入各乘自己的倍率，
+          因此开了缓存的实际消耗远低于上游报告的总 token。
+        </p>
       </div>
 
       <div class="card">

@@ -4,6 +4,8 @@ arkgate.exe
 arkgate-*.exe
 arkgate-*.exe~
 *.exe~
+# 临时编译产物（调试期用 -o q.exe 之类命名，不该进仓库）
+*.exe
 # 发布构建（交叉编译产物，如 arkgate-linux-amd64 / arkgate-linux-arm64）
 # 注意星号不能省：git 的匹配不是「前缀」语义，`arkgate-linux-`（无 *）
 # 只会匹配同名文件，加 * 才匹配整族产物。

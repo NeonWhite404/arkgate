@@ -69,6 +69,13 @@ type Balancer struct {
 	defs      map[string]provider.Def      // accountID -> 供应商定义（Refresh 时解析缓存）
 	prices    map[string]modelPrice         // 易读名 -> 单价（含停用模型，供成本核算）
 	limits    map[string][2]int64          // 易读名 -> [上下文,最大输出] 上限（含停用模型；0=不校验）
+	// subkeyID -> 配额规则（周期 + 缓存倍率）。供统计路径加权计数用。
+	//
+	// 与 prices/limits 不同，这份缓存**带 TTL 且会回源查库**：子 Key 的增删改
+	// 不触发 Refresh（代价太大），只靠快照会让新建/改配置的子 Key 在一段时间内
+	// 按旧规则计。详见 quotaRuleOf。
+	quotaMu    sync.Mutex
+	quotaCache map[string]quotaCacheEntry
 
 	wrrMu    sync.Mutex
 	wrrState map[string]*wrrState
@@ -122,6 +129,19 @@ type statOp struct {
 	completion int64
 	images     int64
 	cost       float64
+	// quota 是按子 Key 缓存倍率加权后的**配额计数**（见 model.QuotaCount）。
+	//
+	// 为什么与 prompt+completion 分开带：usage_logs 要存**真实 token**（计费/分析
+	// 需要原值），而限额要按加权值扣。同一个op 两个口径，不能混用。
+	// 未加权时（旧子 Key / 无缓存）它就等于 prompt+completion。
+	quota int64
+	// windowDay/windowSecs 是本次用量落入的窗口起点与长度。
+	//
+	// 为什么在 Record 时算好而不是 applyStat 里算：applyStat 跑在 consumer
+	// 协程，而 Record 在请求协程——周期配置可能在此期间被改，
+	// 在 Record 时取一次配置能让「计数」与「写入」用同一份规则。
+	windowDay  string
+	windowSecs int64
 }
 
 // New 构造 Balancer 并启动后台消费者。sessionTTL 为会话粘性时长（0 = 关闭）。
@@ -171,6 +191,26 @@ func (b *Balancer) consume() {
 	}
 }
 
+// windowUsageOf 把统计投递结构体转成窗口写入参数。
+//
+// 单独一个函数是为了让「哪几个字段进窗口表」只在一个地方决定——
+// 直接内联在 applyStat 里时，两个分支（有/无图像）容易漏掉同一个字段。
+func windowUsageOf(op statOp, images int64) store.WindowUsage {
+	day := op.windowDay
+	if day == "" {
+		// 兼底：windowDay 为空（旧构造路径/单测）时按自然日，保持旧语义。
+		day = time.Now().Format("2006-01-02")
+	}
+	return store.WindowUsage{
+		SubKeyID:   op.subkeyID,
+		Day:        day,
+		WindowSecs: op.windowSecs,
+		Tokens:     op.quota,
+		Images:     images,
+		Cost:       op.cost,
+	}
+}
+
 func (b *Balancer) applyStat(op statOp) {
 	if b.store == nil {
 		// 无 store（单测构造）：只同步内存副本，不碰数据库。
@@ -188,9 +228,9 @@ func (b *Balancer) applyStat(op statOp) {
 	}
 	if op.images > 0 {
 		_ = b.store.AccumulateImages(op.accountID, op.endpointID, op.subkeyID, op.images)
-		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, op.images, 1, op.cost)
+		_ = b.store.AddWindowUsage(windowUsageOf(op, op.images))
 	} else {
-		_ = b.store.AddDailyUsage(op.subkeyID, op.prompt+op.completion, 0, 1, op.cost)
+		_ = b.store.AddWindowUsage(windowUsageOf(op, 0))
 	}
 	// 落库的同时同步内存副本：Snapshot* 读的是 b.accounts / b.endpoints，
 	// 若只写 DB，管理 UI 会一直显示上次 Refresh 时的陈旧统计。
@@ -249,6 +289,7 @@ func (b *Balancer) Refresh() {
 	accounts, _ := b.store.ListAccounts()
 	modelsList, _ := b.store.ListModels()
 	endpoints, _ := b.store.ListEndpoints()
+	subkeys, _ := b.store.ListSubKeys()
 
 	accMap := map[string]*model.Account{}
 	modMap := map[string]*model.Model{}
@@ -257,7 +298,8 @@ func (b *Balancer) Refresh() {
 	defMap := map[string]provider.Def{}
 	priceMap := map[string]modelPrice{}
 	limitMap := map[string][2]int64{}
-
+	// 子 Key 的配额规则索引（仅统计路径用，鉴权仍走索引直查）。
+	quotaMap := map[string]model.QuotaRule{}
 	for _, a := range accounts {
 		accMap[a.ID] = a
 		defMap[a.ID] = resolveDef(a)
@@ -282,6 +324,9 @@ func (b *Balancer) Refresh() {
 			modelApps[e.Model] = append(modelApps[e.Model], e)
 		}
 	}
+	for _, sk := range subkeys {
+		quotaMap[sk.ID] = model.QuotaRuleOf(sk)
+	}
 
 	b.mu.Lock()
 	// 保留旧叶子的 Runtime；新叶子在锁内初始化。
@@ -301,6 +346,14 @@ func (b *Balancer) Refresh() {
 	b.prices = priceMap
 	b.limits = limitMap
 	b.mu.Unlock()
+	// 配额规则缓存与主索引分开锁：它在 Record 热路径上按子 Key 访问，
+	// 共用 b.mu 会让统计写入与路由选叶互相争锁。
+	b.quotaMu.Lock()
+	b.quotaCache = map[string]quotaCacheEntry{}
+	for id, r := range quotaMap {
+		b.quotaCache[id] = quotaCacheEntry{rule: r, at: time.Now()}
+	}
+	b.quotaMu.Unlock()
 
 	// 清理粘性会话：指向已不存在叶子的、以及超过 TTL 的过期项
 	// （读侧只清理被再次访问的键，这里兜底清剩余的，防止长期运行下缓慢膨胀）。
@@ -1017,6 +1070,22 @@ func (b *Balancer) Record(l *model.UsageLog, ep *model.Endpoint, ok, clientErr b
 	// 必须在构造 op 之后再回填 cost：applyStat 会把它写进 usage_daily.cost。
 	// 写在构造字面量里是不行的——那时 l.Cost 还没算出来。
 	op.cost = l.Cost
+	// 配额计数：按子 Key 的缓存倍率加权。
+	//
+	// 为什么不直接用 prompt+completion：prompt 含缓存命中量，而缓存读单价典型
+	// 只有输入的 10%——按原价计额度会让「缓存用得多」反而更快撞限额，
+	// 与 v14 的计费口径（已按缓存价拆分）自相矛盾。
+	//
+	// 取不到规则时（子 Key 已删、或 Refresh 尚未跑）回落未加权口径，
+	// 即保持旧行为——不因缓存一份索引而改变现有语义。
+	quotaRule := b.quotaRuleOf(l.SubKeyID)
+	op.quota = model.QuotaCount(quotaRule, l.PromptTokens, l.CompletionTokens,
+		l.CacheReadTokens, l.CacheCreationTokens)
+	// 窗口归位：在 Record（请求协程）里算，而不是在 applyStat（consumer 协程）里算。
+	// 两者可能相隔一段异步延迟，若在 consumer 里用 time.Now()，
+	// 跨窗口边界的请求会被记到下一个窗口。
+	op.windowDay = model.WindowDay(quotaRule, time.Now())
+	op.windowSecs = model.WindowSecs(quotaRule.Period)
 	b.enqueueStat(op, l)
 }
 
@@ -1118,24 +1187,52 @@ func (p modelPrice) cacheWriteRate() float64 {
 // 防御点：上游字段可能自相矛盾（缓存量之和大于 prompt_tokens，或单一缓存量
 // 就是超了）。此时不能让非缓存部分变成负数凭空减少费用，也不能让总额超出实际
 // 报告的 prompt_tokens——夹紧到 [0, prompt] 并把两个缓存量按比例收敛。
+// billablePrompt 拆分 prompt_tokens 为「非缓存输入」与「缓存读/写」三部分，
+// 保证三者之和 == prompt_tokens（不重不漏）。
+//
+// 防御点：上游字段可能自相矛盾（缓存量之和大于 prompt_tokens，或单一缓存量
+// 就是超了）。此时不能让非缓存部分变成负数凭空减少费用，也不能让总额超出实际
+// 报告的 prompt_tokens——夹紧到 [0, prompt] 并把两个缓存量按比例收敛。
+//
+// 实现直接委托 model.SplitPrompt：配额（model.QuotaCount）与计费必须共用
+// **同一套** 夹紧逻辑，否则同一份上游脏数据会让「费用」与「配额」给出不同判断。
 func billablePrompt(prompt, cacheRead, cacheWrite int64) (plain, read, write int64) {
-	if prompt < 0 {
-		prompt = 0
+	return model.SplitPrompt(prompt, cacheRead, cacheWrite)
+}
+
+// quotaRuleOf 读子 Key 的配额规则。
+//
+// **不能只靠 Refresh 时的快照**：子 Key 的增删改走的是 admin handler，
+// 而那些 handler **不调 Refresh**（Refresh 会做三次全表扫描并抢写锁，
+// 代价太大）。依赖快照会让「新建子 Key 后配额用默认值、直到下次 Refresh」——
+// 实测确认过这个 bug：新建周周期子 Key 后用量被写进自然日窗口。
+//
+// 方案：以 Refresh 快照为缓存，但**带短 TTL**，过期后回源查库。
+// 这样既不在热路径上每次都查库，又能让配置变更在一个 TTL 内生效。
+//
+// 取不到子 Key（已删）时回落零值规则——QuotaRuleOf 把零值解析为
+// 「自然日 + 默认倍率」，且 QuotaCount 在无缓存 token 时恰好等于
+// prompt+completion，因此旧子 Key 的计数口径与升级前完全一致。
+func (b *Balancer) quotaRuleOf(subkeyID string) model.QuotaRule {
+	if subkeyID == "" {
+		return model.QuotaRuleOf(&model.SubKey{})
 	}
-	if cacheRead < 0 {
-		cacheRead = 0
+	b.quotaMu.Lock()
+	if e, ok := b.quotaCache[subkeyID]; ok && time.Since(e.at) < quotaCacheTTL {
+		b.quotaMu.Unlock()
+		return e.rule
 	}
-	if cacheWrite < 0 {
-		cacheWrite = 0
+	b.quotaMu.Unlock()
+
+	// 回源：查库。失败（含子 Key 不存在）就用零值规则，不让统计路径失败。
+	rule := model.QuotaRuleOf(&model.SubKey{})
+	if sk, err := b.store.GetSubKeyByID(subkeyID); err == nil && sk != nil {
+		rule = model.QuotaRuleOf(sk)
 	}
-	read, write = cacheRead, cacheWrite
-	if read+write > prompt {
-		// 缓存量超报：按比例缩到恰好等于 prompt_tokens，避免负数输入或总额膨胀。
-		total := read + write
-		read = read * prompt / total
-		write = prompt - read
-	}
-	return prompt - read - write, read, write
+	b.quotaMu.Lock()
+	b.quotaCache[subkeyID] = quotaCacheEntry{rule: rule, at: time.Now()}
+	b.quotaMu.Unlock()
+	return rule
 }
 
 // pricesFor 读价格表（持读锁）。
@@ -1332,4 +1429,16 @@ func (b *Balancer) AccountActive(id string) bool {
 	defer b.mu.RUnlock()
 	a, ok := b.accounts[id]
 	return ok && a.Status == model.AccountActive
+}
+
+// quotaCacheTTL 配额规则的缓存时长。
+//
+// 取舍：太短则热路径频繁查库（Record 每请求两次：鉴权一次、统计一次）；
+// 太长则管理员改了配额要等一会儿才生效。5 秒是「人感知不到延迟、
+// 又不至于每次请求都查库」的折中——配额本来就不是秒级精确的东西。
+const quotaCacheTTL = 5 * time.Second
+
+type quotaCacheEntry struct {
+	rule model.QuotaRule
+	at   time.Time
 }

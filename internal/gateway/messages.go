@@ -82,6 +82,15 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	sk, err := g.authSubKey(r, model.ModelTypeText)
 	if err != nil {
+		// 配额超限在 Anthropic 信封里用 rate_limit_error + 429，其余保持
+		// authentication_error + 401。Anthropic 官方错误类型里确有
+		// rate_limit_error，因此这样回是客户端能正确处理的形状。
+		if errors.Is(err, ErrQuotaExceeded) {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusTooManyRequests,
+				errBodyAnthropic("rate_limit_error", err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, errBodyAnthropic("authentication_error", err.Error()))
 		return
 	}
@@ -323,6 +332,15 @@ func (g *Gateway) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reque
 	}
 	sk, err := g.authSubKey(r, model.ModelTypeText)
 	if err != nil {
+		// 配额超限在 Anthropic 信封里用 rate_limit_error + 429，其余保持
+		// authentication_error + 401。Anthropic 官方错误类型里确有
+		// rate_limit_error，因此这样回是客户端能正确处理的形状。
+		if errors.Is(err, ErrQuotaExceeded) {
+			w.Header().Set("Retry-After", "60")
+			writeJSON(w, http.StatusTooManyRequests,
+				errBodyAnthropic("rate_limit_error", err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, errBodyAnthropic("authentication_error", err.Error()))
 		return
 	}

@@ -141,8 +141,14 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		models = append(models, m.Name)
 	}
 
-	// 当日用量（含成本）、最近 7 天概况、累计概况。
-	today, err := p.store.GetDailyUsage(sk.ID)
+	// 当前**配额周期**用量。
+	//
+	// 为什么不再用 GetDailyUsage：周期可为周/月，day 列存的是窗口起始日，
+	// 直接取「今天」在周/月周期下永远读不到行 → 限额进度条永远是 0。
+	// 门户必须与限额判定同一口径，否则用户看到的进度与实际拦截不一致。
+	quotaRule := model.QuotaRuleOf(sk)
+	winDay := model.WindowDay(quotaRule, time.Now())
+	today, err := p.store.GetWindowUsage(sk.ID, winDay)
 	if err != nil {
 		today = &store.DailyUsage{}
 	}
@@ -203,7 +209,18 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"expires_at":         sk.ExpiresAt,
 		"daily_limit_tokens": sk.DailyLimitTokens,
 		"daily_limit_images": sk.DailyLimitImages,
-		"models":             models,
+		// 配额周期信息：界面据此把「今日」文案改成「本周/本月」，
+		// 并展示重置时间与缓存倍率（让用户看得懂自己的额度怎么扣的）。
+		"quota": map[string]any{
+			"period":                  quotaRule.Period,
+			"window_day":              winDay,
+			"reset_hour":              quotaRule.ResetHour,
+			"reset_weekday":           quotaRule.ResetWeekday,
+			"limit_requests":          sk.WindowLimitRequests,
+			"cache_read_permille":     quotaRule.ReadPermille,
+			"cache_write_permille":    quotaRule.WritePermille,
+		},
+		"models":          models,
 		"today":              today,
 		"week":               week,
 		"total":              total,

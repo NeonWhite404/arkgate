@@ -49,6 +49,10 @@ const tokenHashKey = "admin_token_hash"
 // （例如把 7.2 打成 7200000）与负值。
 const maxCurrencyRate = 1e6
 
+// maxQuotaPermille 缓存倍率上限（千分比）。100000 = 100x，纯属防手滑，
+// 不是经济学约束——真实缓存倍率在 0.004~4.0 之间（见目录快照实测）。
+const maxQuotaPermille = 100000
+
 const (
 	keyTimeoutRequest    = "timeout_request_sec"
 	keyTimeoutFirstToken = "timeout_first_token_sec"
@@ -1698,9 +1702,22 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			AllowedAccounts  []string `json:"allowed_accounts"`
 			DailyLimitTokens int64    `json:"daily_limit_tokens"`
 			DailyLimitImages int64    `json:"daily_limit_images"`
+			QuotaPeriod      string   `json:"quota_period"`
+			// 指针：0 是「未设置」（→ 默认周一），必须与「显式传 0」区分不了时
+			// 才不报错；但缺字段与传 0 在这里等价，都是「用默认」，故无需区分。
+			QuotaResetWeekday  int   `json:"quota_reset_weekday"`
+			QuotaResetHour     int   `json:"quota_reset_hour"`
+			CacheReadPermille  int64 `json:"cache_read_permille"`
+			CacheWritePermille int64 `json:"cache_write_permille"`
+			WindowLimitRequests int64 `json:"window_limit_requests"`
 		}
 		if err := decode(r, &p); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
+			return
+		}
+		if msg := validateQuotaFields(p.QuotaPeriod, p.QuotaResetWeekday, p.QuotaResetHour,
+			p.CacheReadPermille, p.CacheWritePermille); msg != "" {
+			writeJSON(w, 400, map[string]any{"detail": msg})
 			return
 		}
 		key := strings.TrimSpace(p.Key)
@@ -1718,6 +1735,12 @@ func (a *Admin) handleSubkeysCollection(w http.ResponseWriter, r *http.Request) 
 			AllowedAccounts:  p.AllowedAccounts,
 			DailyLimitTokens: p.DailyLimitTokens,
 			DailyLimitImages: p.DailyLimitImages,
+			QuotaPeriod:      model.NormalizeQuotaPeriod(p.QuotaPeriod),
+			QuotaResetWeekday: p.QuotaResetWeekday,
+			QuotaResetHour:    p.QuotaResetHour,
+			CacheReadPermille:  p.CacheReadPermille,
+			CacheWritePermille: p.CacheWritePermille,
+			WindowLimitRequests: p.WindowLimitRequests,
 			CreatedAt:        time.Now().Unix(),
 		}
 		if err := a.store.UpsertSubKey(sk); err != nil {
@@ -1745,6 +1768,14 @@ func (a *Admin) handleSubkeyItem(w http.ResponseWriter, r *http.Request) {
 			AllowedAccounts  []string `json:"allowed_accounts"`
 			DailyLimitTokens *int64   `json:"daily_limit_tokens"`
 			DailyLimitImages *int64   `json:"daily_limit_images"`
+			// 配额字段全部用指针：部分更新语义，只发一个字段不得清零其余字段
+			// （与 24 号不变量同源的配置）。
+			QuotaPeriod         *string `json:"quota_period"`
+			QuotaResetWeekday   *int    `json:"quota_reset_weekday"`
+			QuotaResetHour      *int    `json:"quota_reset_hour"`
+			CacheReadPermille   *int64  `json:"cache_read_permille"`
+			CacheWritePermille  *int64  `json:"cache_write_permille"`
+			WindowLimitRequests *int64  `json:"window_limit_requests"`
 		}
 		if err := decode(r, &p); err != nil {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
@@ -1783,6 +1814,49 @@ func (a *Admin) handleSubkeyItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.DailyLimitImages != nil {
 			sk.DailyLimitImages = *p.DailyLimitImages
+		}
+		// 配额字段的校验要在赋值前做，让非法值整体拒绝而不是写一半。
+		{
+			period := sk.QuotaPeriod
+			if p.QuotaPeriod != nil {
+				period = *p.QuotaPeriod
+			}
+			wd, rh := sk.QuotaResetWeekday, sk.QuotaResetHour
+			if p.QuotaResetWeekday != nil {
+				wd = *p.QuotaResetWeekday
+			}
+			if p.QuotaResetHour != nil {
+				rh = *p.QuotaResetHour
+			}
+			rd, rw := sk.CacheReadPermille, sk.CacheWritePermille
+			if p.CacheReadPermille != nil {
+				rd = *p.CacheReadPermille
+			}
+			if p.CacheWritePermille != nil {
+				rw = *p.CacheWritePermille
+			}
+			if msg := validateQuotaFields(period, wd, rh, rd, rw); msg != "" {
+				writeJSON(w, 400, map[string]any{"detail": msg})
+				return
+			}
+		}
+		if p.QuotaPeriod != nil {
+			sk.QuotaPeriod = model.NormalizeQuotaPeriod(*p.QuotaPeriod)
+		}
+		if p.QuotaResetWeekday != nil {
+			sk.QuotaResetWeekday = *p.QuotaResetWeekday
+		}
+		if p.QuotaResetHour != nil {
+			sk.QuotaResetHour = *p.QuotaResetHour
+		}
+		if p.CacheReadPermille != nil {
+			sk.CacheReadPermille = *p.CacheReadPermille
+		}
+		if p.CacheWritePermille != nil {
+			sk.CacheWritePermille = *p.CacheWritePermille
+		}
+		if p.WindowLimitRequests != nil {
+			sk.WindowLimitRequests = *p.WindowLimitRequests
 		}
 		if err := a.store.UpsertSubKey(sk); err != nil {
 			writeJSON(w, 500, map[string]any{"detail": err.Error()})
@@ -2057,4 +2131,35 @@ func validErrorKind(k string) bool {
 		return true
 	}
 	return false
+}
+
+// validateQuotaFields 校验配额字段，返回错误文案（空串 = 通过）。
+//
+// 为什么要在写库前整体校验而不是逐字段静默夹紧：配额的三个部分
+// （周期 / 重置时刻 / 缓存倍率）互相影响——若只写一半（例如接受了非法周期
+// 但拒绝了倍率），子 Key 会处于管理员没预期的组合状态，且限额会立刻按这个
+// 组合生效。整体拒绝让「保存失败 = 什么都没变」成立。
+func validateQuotaFields(period string, weekday, hour int, readPM, writePM int64) string {
+	// 周期：空串等价 day（旧行不带该字段），只拒绝真正未知的值。
+	switch period {
+	case "", model.QuotaPeriodDay, model.QuotaPeriodWeek, model.QuotaPeriodMonth:
+	default:
+		return "配额周期只支持 day / week / month"
+	}
+	// ISO 8601：1=周一 .. 7=周日；0 = 未设置（等价周一）。
+	if weekday < 0 || weekday > 7 {
+		return "重置星期需在 0~7 之间（1=周一 .. 7=周日，0=默认周一）"
+	}
+	if hour < 0 || hour > 23 {
+		return "重置时刻需在 0~23 之间"
+	}
+	// 倍率上限 100x：不设经济学约束，只挡住明显的手滑（例如把 1000 当成 1.0x
+	// 却多打了一个 0）。下限允许 0（= 未设置 → 用默认）。
+	if readPM < 0 || readPM > maxQuotaPermille {
+		return "缓存读取倍率需在 0~100000 之间（千分比，1000 = 1.0x；0 = 用默认 0.1x）"
+	}
+	if writePM < 0 || writePM > maxQuotaPermille {
+		return "缓存写入倍率需在 0~100000 之间（千分比，1000 = 1.0x；0 = 用默认 1.25x）"
+	}
+	return ""
 }
