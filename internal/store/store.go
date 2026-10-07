@@ -1599,6 +1599,36 @@ func (s *Store) GetWindowUsageBatch(daysByKey map[string]string) (map[string]*Da
 	return out, nil
 }
 
+// SubKeyRawTokensSince 批量读取多个子 Key自**各自**起点起的**上游原始 token** 合计。
+//
+// 存在的理由：usage_daily.tokens 存的是加权配额计数，与真实 token 不同量纲。
+// 管理员要判断「加权折扣到底扣掉了多少」，就必须把**同一周期**的原始量摆在加权值旁边。
+// 数据源必须是 usage_logs（total_tokens），不能用 usage_daily 反推：
+//   - usage_daily 只有加权值，反推需要当时的倍率，而历史行没有倍率记录；
+//   - v15 之前的 usage_daily 行存的是未加权值，反推会得到错误结果。
+//
+// sinceByKey 里每个 Key 自带起点（周期/重置时刻不同，不能统一用一个时间）。
+// 与 GetWindowUsageBatch 同样采用「逐行查、复用同一个只读锁」而不是拼接可变长度的
+// OR 条件：子 Key 数量可变，拼 SQL 既难读又会随数量增长而变慢。
+// 查询走 idx_usage_subkey(subkey_id, id) 的前缀索引。
+func (s *Store) SubKeyRawTokensSince(sinceByKey map[string]int64) (map[string]int64, error) {
+	out := make(map[string]int64, len(sinceByKey))
+	if len(sinceByKey) == 0 {
+		return out, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for id, since := range sinceByKey {
+		var v int64
+		if err := s.db.QueryRow(`SELECT COALESCE(SUM(total_tokens),0) FROM usage_logs
+			WHERE subkey_id=? AND ts>=?`, id, since).Scan(&v); err != nil {
+			return nil, err
+		}
+		out[id] = v
+	}
+	return out, nil
+}
+
 // GetDailyUsage 读取子 Key 当日用量（无行返回零值）。
 // GetWindowUsage 读取子 Key 当前窗口的用量（无行返回零值）。
 //

@@ -59,6 +59,53 @@ func TestWindowStartDay(t *testing.T) {
 
 // TestWindowStartWeek 周窗口。
 //
+// TestWindowStartTime 锁定「真实窗口起点」（含 ResetHour 偏移）。
+//
+// 为什么不能直接用 WindowStart：WindowStart 给的是「业务日的 00:00」，那是
+// usage_daily.day 的行归属键；真实切分发生在 ResetHour。用 00:00 去聚合
+// usage_logs 会把业务日 00:00~ResetHour 之间的请求算进来，而那些请求在
+// usage_daily 里归属的是**上一个窗口**——「同周期加权 vs 原始」的对比就错位了。
+//
+// 另一条不变式：ResetHour=0（默认）时与 WindowStart 完全相等，
+// 保证绝大多数部署的行为不变。
+func TestWindowStartTime(t *testing.T) {
+	sh := mustLoad(t, "Asia/Shanghai")
+
+	// ResetHour=0：与 WindowStart 等价（只在日边界上）。
+	rule0 := QuotaRule{Period: QuotaPeriodDay, ResetHour: 0}
+	for _, in := range []string{"2026-10-04 00:00", "2026-10-04 13:37", "2026-10-04 23:59"} {
+		atT := at(t, sh, in)
+		if got, want := WindowStartTime(rule0, atT), WindowStart(rule0, atT); !got.Equal(want) {
+			t.Errorf("ResetHour=0 %s: %s != WindowStart %s", in, got, want)
+		}
+	}
+
+	// ResetHour=8：窗口在业务日的 08:00 开启。
+	rule8 := QuotaRule{Period: QuotaPeriodDay, ResetHour: 8}
+	cases := []struct{ in, want string }{
+		// 09:00 属于「今天 08:00 起」的窗口。
+		{"2026-10-04 09:00", "2026-10-04 08:00"},
+		// 07:00 属于「昨天 08:00 起」的窗口。
+		{"2026-10-04 07:00", "2026-10-03 08:00"},
+		// 边界正点：08:00 是新窗口的第一刻。
+		{"2026-10-04 08:00", "2026-10-04 08:00"},
+		// 跨月：11/1 03:00 的业务日是 10/31，窗口起点 10/31 08:00。
+		{"2026-11-01 03:00", "2026-10-31 08:00"},
+	}
+	for _, c := range cases {
+		if got := WindowStartTime(rule8, at(t, sh, c.in)).Format("2006-01-02 15:04"); got != c.want {
+			t.Errorf("ResetHour=8 %s → %s, want %s", c.in, got, c.want)
+		}
+	}
+
+	// 周周期 + ResetHour=8：周一 07:00 的业务日是周日 → 回退到上周一 08:00。
+	ruleW := QuotaRule{Period: QuotaPeriodWeek, ResetWeekday: 1, ResetHour: 8}
+	if got := WindowStartTime(ruleW, at(t, sh, "2026-10-07 07:00")).Format("2006-01-02 15:04");
+		got != "2026-10-05 08:00" {
+		t.Errorf("week+ResetHour=8 周三 07:00 → %s, want 2026-10-05 08:00", got)
+	}
+}
+
 // 关键用例是「先应用 ResetHour 再回退 weekday」——顺序反了会在
 // ResetHour>0 时把周一早晨错误地算到上一周（见 WindowStart 注释第 1 条）。
 func TestWindowStartWeek(t *testing.T) {

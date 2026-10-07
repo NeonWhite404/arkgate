@@ -151,6 +151,22 @@ func WindowDay(rule QuotaRule, at time.Time) string {
 	return WindowStart(rule, at).Format("2006-01-02")
 }
 
+// WindowStartTime 返回窗口的**精确起始时刻**（本地时区，含 ResetHour 偏移）。
+//
+// 与 WindowStart 的区别：WindowStart 返回的是「业务日的 00:00」，那是 usage_daily.day
+// 的键值（行归属标记）；而真实窗口是在该业务日的 ResetHour 才切分的。
+// 例如 ResetHour=8 时，周三 09:00 与周三 07:00 分别属于「周三 00:00」与「周二 00:00」
+// 两个 day 键，但真实窗口起点分别是周三 08:00 与周二 08:00。
+//
+// 为什么需要它：要把同一周期的**上游原始用量**（按 usage_logs.ts 聚合）与
+// usage_daily 的加权值放在一起对比，聚合下界必须是真实窗口起点。
+// 直接用 WindowStart 会把业务日 00:00~ResetHour 之间的请求算进来，
+// 而那些请求在 usage_daily 里归属的是**上一个窗口**——两边口径就错位了。
+// ResetHour=0（默认）时两者完全相等。
+func WindowStartTime(rule QuotaRule, at time.Time) time.Time {
+	return WindowStart(rule, at).Add(time.Duration(rule.ResetHour) * time.Hour)
+}
+
 // WindowSecs 返回窗口的标称长度（秒），随行落库到 usage_daily.window_secs。
 //
 // 为什么落库而不是靠子 Key 当前配置反推：周期可以随时改，历史行的 day 对应的是

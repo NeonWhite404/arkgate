@@ -2,6 +2,8 @@ package store
 
 import (
 	"testing"
+
+	"arkgate/internal/model"
 )
 
 // TestGetWindowUsageBatch 批量读取窗口用量。
@@ -64,6 +66,74 @@ func TestGetWindowUsageBatch(t *testing.T) {
 	}
 	if wrong["k2"].Tokens != 0 {
 		t.Fatalf("窗口日不匹配时应为零用量, got %+v", wrong["k2"])
+	}
+}
+
+// TestSubKeyRawTokensSince 批量读取子 Key 自各自起点起的**上游原始 token**。
+//
+// 这一列存在的理由是「加权配额」与「上游原始量」是两个量纲（见门户对比行
+// 与子 Key 列表）：前者存 usage_daily（已乘缓存倍率），后者只能从 usage_logs
+// 聚合。测试钉住四点：
+//  1. 只统计 ts>=since 的日志（窗口外一律不计）；
+//  2. 各 Key 的起点**各自生效**（周期不同不能共用一个时间）；
+//  3. 无日志的 Key 返回 0 而不是缺失；
+//  4. 与 SubKeyLogStats 同口径（都是 SUM(total_tokens)）。
+func TestSubKeyRawTokensSince(t *testing.T) {
+	s := newTestStore(t)
+
+	// 用相对时间构造，避免把测试写死到某个日期。
+	t0 := nowUnix()
+	add := func(sub string, ts, total int64) {
+		t.Helper()
+		if err := s.AddUsageLog(&model.UsageLog{TS: ts, SubKeyID: sub,
+			Model: "m", Status: "ok", TotalTokens: total}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// k1：窗口内 100+200，窗口外 9999（不得计入）。
+	add("k1", t0-60, 100)
+	add("k1", t0-30, 200)
+	add("k1", t0-1000, 9999)
+	// k2：起点更早，所以能拿到多于 k1 的量。
+	add("k2", t0-60, 50)
+	add("k2", t0-500, 500)
+
+	got, err := s.SubKeyRawTokensSince(map[string]int64{
+		"k1": t0 - 100,
+		"k2": t0 - 600,
+		"k3": t0 - 100, // 无日志 → 0，不是缺失
+	})
+	if err != nil {
+		t.Fatalf("批量查询: %v", err)
+	}
+	if got["k1"] != 300 {
+		t.Fatalf("k1 应只统计窗口内（300）, got %d（窗口外被算进来了？）", got["k1"])
+	}
+	if got["k2"] != 550 {
+		t.Fatalf("k2 起点更早，应为 550, got %d（各自起点没生效？）", got["k2"])
+	}
+	if v, ok := got["k3"]; !ok || v != 0 {
+		t.Fatalf("k3 应有 0 值而非缺失: %v ok=%v", v, ok)
+	}
+
+	// 与既有单 Key 聚合同口径（同一数据源，不能各自一套算法）。
+	st, err := s.SubKeyLogStats("k2", t0-600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Tokens != got["k2"] {
+		t.Fatalf("应与 SubKeyLogStats 一致: %d vs %d", st.Tokens, got["k2"])
+	}
+}
+
+// TestSubKeyRawTokensSinceEmpty 空输入不报错、不发查询。
+func TestSubKeyRawTokensSinceEmpty(t *testing.T) {
+	s := newTestStore(t)
+	for _, in := range []map[string]int64{nil, {}} {
+		got, err := s.SubKeyRawTokensSince(in)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("空输入应正常返回空 map: %v %+v", err, got)
+		}
 	}
 }
 

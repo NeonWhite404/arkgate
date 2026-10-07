@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -152,6 +153,19 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		today = &store.DailyUsage{}
 	}
+	// 同一周期的**上游原始 token**：与 today.tokens（加权配额）并列下发。
+	// 两个数派生自不同数据源（usage_daily / usage_logs），只有真实的原始值
+	// 才能让用户看懂「额度为什么扣得比总量少」。
+	// 下界用真实窗口起点（含 ResetHour 偏移），与 usage_daily 的行归属一致。
+	winRawTokens := int64(0)
+	if raw, rerr := p.store.SubKeyRawTokensSince(map[string]int64{
+		sk.ID: model.WindowStartTime(quotaRule, time.Now()).Unix(),
+	}); rerr == nil {
+		winRawTokens = raw[sk.ID]
+	} else {
+		// 不阻断门户：缺失时前端会回落为不展示该对比行。
+		log.Printf("portal: 读取子 Key %s 周期原始 token 失败: %v", sk.ID, rerr)
+	}
 	week, _ := p.store.SubKeyLogStats(sk.ID, time.Now().Unix()-7*86400)
 	total, _ := p.store.SubKeyLogStats(sk.ID, 0)
 
@@ -222,6 +236,9 @@ func (p *Portal) handleOverview(w http.ResponseWriter, r *http.Request) {
 		},
 		"models":          models,
 		"today":              today,
+		// 本周期上游原始 token（与 today.tokens 的加权额度同周期），
+		// 供前端直接对比，不再用缓存量估算。
+		"today_raw_tokens":   winRawTokens,
 		"week":               week,
 		"total":              total,
 		"success_rate_7d":    successRate,

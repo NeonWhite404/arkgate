@@ -880,6 +880,16 @@ const SubKeysPage = {
       const label = q.period === "week" ? "本周" : q.period === "month" ? "本月" : "今日";
       return label + "（自 " + q.window_day + " 起）";
     },
+    // cacheDiscount 把「同周期原始 → 加权额度」的差额写成百分比文案。
+    //
+    // 只在启用加权且原始量大于加权值（即缓存读过、确实省了额度）时才返回；
+    // 原始量 ≤ 加权（缓存写溢价把额度放大）时不返回，避免出现负数百分比。
+    cacheDiscount(q) {
+      if (!q || !q.weighted) return null;
+      const raw = q.raw_tokens || 0;
+      if (raw <= 0 || raw <= q.used_tokens) return null;
+      return "省 " + Math.round((1 - q.used_tokens / raw) * 100) + "%";
+    },
 
     load() {
       Promise.all([req("GET", "/api/subkeys"), req("GET", "/api/models"), req("GET", "/api/accounts")])
@@ -956,15 +966,19 @@ const SubKeysPage = {
     <div class="page-title">子 API Key</div>
     <div class="toolbar"><button class="btn btn-primary" @click="openModal(null)">+ 新建子 Key</button><div class="spacer"></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token<span class="th-sub">累计·上游原始</span></th><th>本周期配额<span class="th-sub">加权，与限额同口径</span></th><th>图像</th><th>操作</th>
+      <th>名称</th><th>Key</th><th>状态</th><th>可访问模型</th><th>请求</th><th>Token<span class="th-sub">累计·上游原始</span></th><th>本周期 Token<span class="th-sub">上游原始，与右列同周期</span></th><th>本周期配额<span class="th-sub">加权，与限额同口径</span></th><th>图像</th><th>操作</th>
     </tr></thead><tbody>
-      <tr v-if="!subs.length"><td colspan="9" class="empty">暂无子 Key</td></tr>
+      <tr v-if="!subs.length"><td colspan="10" class="empty">暂无子 Key</td></tr>
       <tr v-for="s in subs" :key="s.id">
         <td><strong>{{ s.name || s.id }}</strong></td>
         <td class="mono"><span class="code-copy" title="点击复制" @click="copy(s.key)">{{ s.key }}</span></td>
         <td><span :class="s.enabled ? 'tag tag-green' : 'tag tag-gray'">{{ s.enabled ? '启用' : '禁用' }}</span></td>
         <td>{{ (s.allowed_models && s.allowed_models.length) ? s.allowed_models.join(', ') : '全部' }}</td>
         <td>{{ s.total_requests }}</td><td>{{ fmtTokens(s.total_tokens) }}</td>
+        <td class="mono" :title="'本周期上游原始 token（prompt+completion，含缓存命中）' + periodShort(s.quota)">
+          <template v-if="s.quota">{{ fmtTokens(s.quota.raw_tokens || 0) }}</template>
+          <span v-else class="muted">—</span>
+        </td>
         <td class="quota-cell">
           <template v-if="s.quota && (s.quota.limit_tokens || s.quota.limit_requests)">
             <div class="quota-line" v-if="s.quota.limit_tokens">
@@ -984,6 +998,12 @@ const SubKeysPage = {
               {{ periodShort(s.quota) }}
               <template v-if="s.quota.weighted"> · 缓存加权 读×{{ (s.quota.cache_read_permille || 1000) / 1000 }} 写×{{ (s.quota.cache_write_permille || 1000) / 1000 }}</template>
               <template v-else> · 未加权（= 上游原始）</template>
+            </div>
+            <!-- 同周期加权 vs 原始对照：倍率配错与「真的用得多」在界面上的表现
+                 完全不同，两个数并列才能区分。 -->
+            <div class="quota-meta" v-if="s.quota.weighted">
+              同周期原始 {{ fmtTokens(s.quota.raw_tokens || 0) }}
+              <template v-if="cacheDiscount(s.quota)"> · 缓存折扣后 {{ cacheDiscount(s.quota) }}</template>
             </div>
           </template>
           <span v-else class="muted">不限</span>
@@ -1333,8 +1353,11 @@ const UsagePage = {
     },
     // 是否存在「未分类」失败（升级前的历史行）。有则给一句解释，免得被当成数据错误。
     hasUnclassified() { return this.errors.some((e) => e.kind === "unclassified" || !e.kind); },
-    // 缓存命中率 = 缓存读取 /（缓存读取 + 输入）。只用输入侧口径：
-    // 缓存读是「输入被缓存掉的部分」，与输出无关。
+    // 缓存命中率（输入侧口径）= 缓存读取 /（缓存读取 + 非缓存输入）。
+    //
+    // 本页只做**纯展示**：四个 token 指标全部是上游原始值，不做加权也不做折算。
+    // 这个百分比是「两个原始量的比值」而不是对 token 的折算，只用于图表区的
+    // 附注说明，未参与任何额度/费用计算。
     cacheHitRate() {
       const s = this.summary;
       const read = s.cache_read_tokens || 0;
@@ -1452,9 +1475,11 @@ const UsagePage = {
     <div class="stat-row">
       <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ summary.requests || 0 }}</div><div class="l">调用次数</div></div></div>
       <div class="stat-card"><div class="ic" :class="successRateCls">✓</div><div class="body"><div class="v">{{ successRate }}</div><div class="l">成功率</div></div></div>
-      <div class="stat-card" title="上游报告的总 token（prompt+completion，含缓存命中），不是子 Key 额度消耗"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(summary.total_tokens) }}</div><div class="l">总 Tokens<span class="stat-sub">上游原始</span></div></div></div>
-      <div class="stat-card" title="上游报告的 prompt_tokens，含缓存命中量"><div class="ic ic-green">↓</div><div class="body"><div class="v">{{ fmtTokens(summary.prompt_tokens) }}</div><div class="l">输入 Tokens<span class="stat-sub">含缓存命中</span></div></div></div>
-      <div class="stat-card"><div class="ic ic-purple">↑</div><div class="body"><div class="v">{{ fmtTokens(summary.completion_tokens) }}</div><div class="l">输出 Tokens</div></div></div>
+      <div class="stat-card" title="上游报告的总 token = 输入 + 输出（输入已含缓存命中）。纯原始量，不做任何加权或折算"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(summary.total_tokens) }}</div><div class="l">总 Tokens<span class="stat-sub">上游原始</span></div></div></div>
+      <div class="stat-card" title="上游报告的 prompt_tokens，**含缓存命中量**；非缓存输入 = 输入 − 缓存命中 − 缓存写入"><div class="ic ic-green">↓</div><div class="body"><div class="v">{{ fmtTokens(summary.prompt_tokens) }}</div><div class="l">输入 Tokens<span class="stat-sub">含缓存命中</span></div></div></div>
+      <div class="stat-card" title="上游报告的 completion_tokens"><div class="ic ic-purple">↑</div><div class="body"><div class="v">{{ fmtTokens(summary.completion_tokens) }}</div><div class="l">输出 Tokens</div></div></div>
+      <div class="stat-card" title="缓存命中读取量（cache read）。它是输入的一部分，不参与任何倍率加权"><div class="ic ic-teal">♻</div><div class="body"><div class="v">{{ fmtTokens(summary.cache_read_tokens || 0) }}</div><div class="l">缓存命中 Tokens<span class="stat-sub">输入的子集</span></div></div></div>
+      <div class="stat-card" title="缓存写入量（cache creation）。不计入输入总量，单独列示"><div class="ic ic-teal">✎</div><div class="body"><div class="v">{{ fmtTokens(summary.cache_creation_tokens || 0) }}</div><div class="l">缓存写入 Tokens<span class="stat-sub">不属输入</span></div></div></div>
       <div class="stat-card"><div class="ic ic-orange">🖼</div><div class="body"><div class="v">{{ summary.images || 0 }}</div><div class="l">图像（张）</div></div></div>
       <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(summary.cost) }}</div><div class="l">费用</div></div></div>
     </div>
@@ -1465,7 +1490,6 @@ const UsagePage = {
       <div class="stat-card"><div class="ic ic-purple">⇄</div><div class="body"><div class="v">{{ fmtInt(summary.stream_requests || 0) }}</div><div class="l">流式请求</div></div></div>
       <div class="stat-card"><div class="ic ic-blue">⏱</div><div class="body"><div class="v">{{ avgFirstToken }}</div><div class="l">平均首字耗时</div></div></div>
       <div class="stat-card"><div class="ic ic-green">⏳</div><div class="body"><div class="v">{{ avgLatency }}</div><div class="l">平均总耗时</div></div></div>
-      <div class="stat-card"><div class="ic ic-teal">♻</div><div class="body"><div class="v">{{ cacheHitRate }}</div><div class="l">缓存命中占输入</div></div></div>
     </div>
 
     <div class="card">
@@ -1509,10 +1533,12 @@ const UsagePage = {
       </div>
 
       <div class="card" v-if="(summary.cache_read_tokens || 0) + (summary.cache_creation_tokens || 0) > 0">
-        <div class="card-head"><div class="card-title">缓存 Token</div></div>
+        <div class="card-head"><div class="card-title">缓存拆分（上游原始值）</div></div>
         <table class="mini-table">
-          <tr><td>缓存读取</td><td>{{ fmtTokens(summary.cache_read_tokens) }}</td><td class="muted">命中占输入 {{ cacheHitRate }}</td></tr>
-          <tr><td>缓存写入</td><td>{{ fmtTokens(summary.cache_creation_tokens) }}</td><td class="muted"></td></tr>
+          <tr><td>总 Token</td><td>{{ fmtTokens(summary.total_tokens) }}</td><td class="muted">= 输入 + 输出</td></tr>
+          <tr><td>— 输入</td><td>{{ fmtTokens(summary.prompt_tokens) }}</td><td class="muted">含缓存命中（prompt_tokens）</td></tr>
+          <tr><td>— 缓存命中</td><td>{{ fmtTokens(summary.cache_read_tokens) }}</td><td class="muted">输入的子集，命中占输入 {{ cacheHitRate }}</td></tr>
+          <tr><td>缓存写入</td><td>{{ fmtTokens(summary.cache_creation_tokens) }}</td><td class="muted">单独计量，不计入输入</td></tr>
         </table>
       </div>
     </div>
@@ -1520,7 +1546,7 @@ const UsagePage = {
     <div class="card" v-if="dim">
       <div class="card-head"><div class="card-title">{{ dimLabel }}拆分（点击行下钻，再点取消）</div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th title="上游报告的总 token（prompt+completion，含缓存命中）。计费与展示口径，不是子 Key 额度消耗">Tokens<span class="th-sub">上游原始</span></th><th>缓存读取</th><th>图像</th><th>成本</th><th>上游失败</th>
+        <th>{{ dimLabel }}</th><th>次数</th><th>成功率</th><th title="上游报告的总 token（prompt+completion，含缓存命中）。纯原始值，不做任何加权或折算">Tokens<span class="th-sub">上游原始</span></th><th title="缓存命中读取量（cache read），是输入的子集">缓存命中</th><th>图像</th><th>成本</th><th>上游失败</th>
       </tr></thead><tbody>
         <tr class="clickable" :class="{selected: entity===''}" @click="pick('')">
           <td>全部</td><td>{{ summary.requests || 0 }}</td><td>{{ successRate }}</td>
@@ -2246,21 +2272,22 @@ const PortalPage = {
       const p = (this.d.today.requests / lim) * 100;
       return { pct: Math.min(100, p), cls: p >= 90 ? "danger" : p >= 70 ? "warn" : "" };
     },
-    // quotaVsRaw 把加权后的额度消耗换算回「上游原始 token」的量级，
-    // 用于向用户解释「为什么表格里的 Tokens 比额度大」。
+    // quotaVsRaw 给出「本周期加权额度」对应的「上游原始 token」用于对比。
     //
-    // 注意这是**估算**：加权计数是 plain + output + read×kr + write×kw，
-    // 反推需要知道各段的原始构成，而中间那张卡只有 week 的聚合值。
-    // 因此这里只在「有缓存用量」时按最简单可靠的关系给出量级：
-    // 加权 ≈ 原始 - 缓存读×(1-kr) - 缓存写×(1-kw)。取负则不出示。
+    // 优先用后端下发的真实值（today_raw_tokens，usage_logs 按窗口起点聚合）——
+    // 它与 today.tokens 同周期、同数据源语义，差额就是缓存折扣的真实贡献。
+    // 旧实现靠 7 天缓存量反推（估算），已改为真实值；仅当后端未下发（升级前的
+    // 缓存响应或查询失败）时才回落估算，保证不会出现空值。
     quotaVsRaw() {
       if (!this.d || !this.d.today || !this.d.quota) return null;
       const q = this.d.quota;
       const kr = q.cache_read_permille ? q.cache_read_permille / 1000 : 1;
       const kw = q.cache_write_permille ? q.cache_write_permille / 1000 : 1;
       if (kr === 1 && kw === 1) return null; // 未启用加权，两个数本来就一样
+      // 真实值：直接采用（只要它不小于加权值，说明确实存在折扣）。
+      const real = this.d.today_raw_tokens;
+      if (typeof real === "number" && real > this.d.today.tokens) return real;
       const w = this.d.week || {};
-      // 用本周期加权值 + 7 天缓存量做量级换算（缓存倍率是折扣的来源）。
       const saved = (w.cache_read_tokens || 0) * (1 - kr) + (w.cache_creation_tokens || 0) * (1 - kw);
       if (saved <= 0) return null;
       const approx = this.d.today.tokens + saved;
@@ -2341,7 +2368,7 @@ const PortalPage = {
     </div>
     <div class="page" v-if="d">
       <div class="stat-row">
-        <div class="stat-card" :title="d.quota && (d.quota.cache_read_permille || d.quota.cache_write_permille) ? '这是加权配额计数（与限额同口径），不是上游原始 token——缓存读取与写入已各乘自己的倍率' : '未启用缓存加权，本值等于上游原始 token（prompt+completion）'"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">{{ periodLabel }} Tokens<span class="stat-sub">额度消耗（加权）</span></div></div></div>
+        <div class="stat-card" :title="d.quota && (d.quota.cache_read_permille || d.quota.cache_write_permille) ? '这是加权配额计数（与限额同口径），不是上游原始 token——缓存读取与写入已各乘自己的倍率。同周期原始量见下方「限额」卡的对比行' : '未启用缓存加权，本值等于上游原始 token（prompt+completion）'"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">{{ periodLabel }} Tokens<span class="stat-sub">额度消耗（加权）</span></div></div></div>
         <div class="stat-card"><div class="ic ic-green">⚡</div><div class="body"><div class="v">{{ d.today.requests }}</div><div class="l">{{ periodLabel }}请求数</div></div></div>
         <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">{{ periodLabel }}图像（张）</div></div></div>
         <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">{{ periodLabel }}成本（参考）</div></div></div>
@@ -2356,7 +2383,15 @@ const PortalPage = {
         </div>
         <template v-if="d.daily_limit_tokens">
           <div class="kv"><span class="k">Token 限额（加权）</span><span class="v">{{ fmtTokens(d.today.tokens) }} / {{ fmtTokens(d.daily_limit_tokens) }}</span></div>
-          <div class="progress" style="margin:8px 0 14px"><div class="bar" :class="tokenProgress.cls" :style="{width: tokenProgress.pct + '%'}"></div></div>
+          <div class="progress" style="margin:8px 0 6px"><div class="bar" :class="tokenProgress.cls" :style="{width: tokenProgress.pct + '%'}"></div></div>
+          <!-- 同周期原始量：用户最直观的「我到底用了多少」参考值。
+               与加权额度并列才能看出缓存折扣的实际效果。 -->
+          <div class="kv" style="padding-top:0">
+            <span class="k">{{ periodLabel }}上游原始 Token</span>
+            <span class="v">{{ fmtTokens(d.today_raw_tokens || 0) }}
+              <span class="muted" v-if="(d.today_raw_tokens || 0) > d.today.tokens">（缓存折扣后 = 上方额度）</span>
+            </span>
+          </div>
         </template>
         <template v-if="d.quota && d.quota.limit_requests">
           <div class="kv"><span class="k">请求数限额</span><span class="v">{{ d.today.requests }} / {{ d.quota.limit_requests }}</span></div>
@@ -2374,7 +2409,7 @@ const PortalPage = {
             （当前：读 ×{{ ((d.quota.cache_read_permille || 1000) / 1000) }}、写 ×{{ ((d.quota.cache_write_permille || 1000) / 1000) }}）
           </template>。
           <template v-if="quotaVsRaw">{{ periodLabel }}已用额度 {{ fmtTokens(d.today.tokens) }}，
-          对应上游原始 {{ fmtTokens(quotaVsRaw) }} —— 两者相差 {{ (quotaVsRaw / Math.max(1, d.today.tokens)).toFixed(1) }} 倍，
+          同周期上游原始 {{ fmtTokens(quotaVsRaw) }} —— 两者相差 {{ (quotaVsRaw / Math.max(1, d.today.tokens)).toFixed(1) }} 倍，
           这是缓存命中带来的折扣，不是统计错误。</template>
         </p>
       </div>

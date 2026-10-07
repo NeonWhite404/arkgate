@@ -1742,6 +1742,13 @@ type subKeyQuota struct {
 	WindowDay string `json:"window_day"`
 	// UsedTokens 是**加权后**的已用额度（与限额同一口径，可直接相比）。
 	UsedTokens int64 `json:"used_tokens"`
+	// RawTokens 是**同一周期**的上游原始 token 合计（prompt+completion，含缓存命中）。
+	//
+	// 与 UsedTokens 并列展示是刻意的：只给加权值会让管理员无法判断
+	// 「扣得快是因为用量大，还是因为倍率配错」。两者之差就是缓存折扣的贡献。
+	// 取自 usage_logs 聚合（usage_daily 只有加权值，反推需要历史倍率，无法做到）。
+	// 未启用加权（Weighted=false）时两者应当相等，不等则说明窗口边界对不齐。
+	RawTokens int64 `json:"raw_tokens"`
 	// RawTokens 是同一周期的**上游原始** token 合计，仅供对照解释差额；
 	// 取自 usage_logs 聚合会比 usage_daily 更贵，故这里不做——真实原始量
 	// 已在用量分析页提供，这里只给加权值与额度判定所需字段。
@@ -1772,17 +1779,29 @@ func (a *Admin) withQuotaUsage(keys []*model.SubKey) []*subKeyWithUsage {
 	}
 	now := time.Now()
 	days := make(map[string]string, len(keys))
+	sinceByKey := make(map[string]int64, len(keys))
 	for _, sk := range keys {
 		if sk.ID == "" {
 			continue
 		}
-		days[sk.ID] = model.WindowDay(model.QuotaRuleOf(sk), now)
+		rule := model.QuotaRuleOf(sk)
+		days[sk.ID] = model.WindowDay(rule, now)
+		// 聚合下界用**真实窗口起点**（含 ResetHour 偏移），不能用 WindowDay 的 00:00：
+		// 业务日 00:00~ResetHour 之间的请求在 usage_daily 里归属上一个窗口。
+		sinceByKey[sk.ID] = model.WindowStartTime(rule, now).Unix()
 	}
 	usage, err := a.store.GetWindowUsageBatch(days)
 	if err != nil {
 		// 留痕后降级：不阻断列表。
 		log.Printf("admin: 读取子 Key 周期用量失败，列表将不含配额进度: %v", err)
 		usage = nil
+	}
+	// 上游原始量：与加权值同时读，保证两列来自同一时刻，差值是可信的。
+	// 同样不因失败而阻断列表。
+	rawTokens, err := a.store.SubKeyRawTokensSince(sinceByKey)
+	if err != nil {
+		log.Printf("admin: 读取子 Key 周期原始 token 失败，列表将不含该列: %v", err)
+		rawTokens = nil
 	}
 	for _, sk := range keys {
 		item := &subKeyWithUsage{SubKey: sk}
@@ -1796,6 +1815,7 @@ func (a *Admin) withQuotaUsage(keys []*model.SubKey) []*subKeyWithUsage {
 				Period:        rule.Period,
 				WindowDay:     days[sk.ID],
 				UsedTokens:    du.Tokens,
+				RawTokens:     rawTokens[sk.ID],
 				LimitTokens:   sk.DailyLimitTokens,
 				Requests:      du.Requests,
 				LimitRequests: sk.WindowLimitRequests,

@@ -106,6 +106,98 @@ func TestWithQuotaUsageZeroWhenNoRows(t *testing.T) {
 	}
 }
 
+// TestWithQuotaUsageRawTokensSameWindow 子 Key 列表必须同时给出
+// **同一周期**的上游原始 token，供管理员对比加权与未加权。
+//
+// 为什么需要这一列：只有加权值（usage_daily）时，管理员无法判断「额度扣得快」
+// 是「用量真的很大」还是「倍率配错」。两个数并列才能区分。
+//
+// 本测试同时钉住三个边界：
+//  1. 原始量取自 usage_logs（total_tokens），且与加权值确实不等；
+//  2. **窗口外的日志不得计入**（否则周期对比失去意义）；
+//  3. 未启用加权的 Key 两个数应当相等——不等就意味着窗口边界对不齐。
+func TestWithQuotaUsageRawTokensSameWindow(t *testing.T) {
+	a := newQuotaTestAdmin(t)
+
+	// 日周期 + 加权（读 0.1x）：prompt 1000（其中缓存读 800）+ output 100
+	//   → 原始 = 1100
+	//   → 加权 = (1000-800) + 100 + 800*0.1 = 380
+	weighted := &model.SubKey{ID: "sk_w", Name: "加权", DailyLimitTokens: 10000,
+		CacheReadPermille: 100}
+	// 同样的用量，但不配倍率 → 两个数应相等。
+	plain := &model.SubKey{ID: "sk_p", Name: "未加权", DailyLimitTokens: 10000}
+	for _, sk := range []*model.SubKey{weighted, plain} {
+		if err := a.store.UpsertSubKey(sk); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Now()
+	// 窗口内（今天）的日志：两个 Key 各一条。
+	for _, id := range []string{"sk_w", "sk_p"} {
+		if err := a.store.AddUsageLog(&model.UsageLog{
+			TS: now.Unix(), SubKeyID: id, Model: "m", Status: "ok",
+			PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100,
+			CacheReadTokens: 800,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 窗口外的日志（3 天前）：绝不能计入本周期原始量。
+	for _, id := range []string{"sk_w", "sk_p"} {
+		if err := a.store.AddUsageLog(&model.UsageLog{
+			TS: now.AddDate(0, 0, -3).Unix(), SubKeyID: id, Model: "m", Status: "ok",
+			PromptTokens: 900000, CompletionTokens: 99000, TotalTokens: 999000,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := a.withQuotaUsage([]*model.SubKey{weighted, plain})
+	if got[0].Quota.RawTokens != 1100 {
+		t.Fatalf("本周期原始 token 应只含窗口内日志, got %d (窗口外日志被算进来了？)",
+			got[0].Quota.RawTokens)
+	}
+	// 加权值只在这里写（usage_daily），与原始量不同源，两者独立核对。
+	if err := a.store.AddWindowUsage(store.WindowUsage{
+		SubKeyID: "sk_w", Day: model.WindowDay(model.QuotaRuleOf(weighted), now),
+		Tokens: 380, WindowSecs: 86400}); err != nil {
+		t.Fatal(err)
+	}
+	got = a.withQuotaUsage([]*model.SubKey{weighted, plain})
+	if got[0].Quota.UsedTokens != 380 || got[0].Quota.RawTokens != 1100 {
+		t.Fatalf("加权与原始应并列可得: used=%d raw=%d",
+			got[0].Quota.UsedTokens, got[0].Quota.RawTokens)
+	}
+	// 未启用加权的 Key：没有 usage_daily 行 → 加权值为 0，但原始量照给，
+	// 界面据此显示「未加权（= 上游原始）」，两个口径不会互相污染。
+	if got[1].Quota.Weighted {
+		t.Fatalf("未配倍率不应报告为加权: %+v", got[1].Quota)
+	}
+	if got[1].Quota.RawTokens != 1100 {
+		t.Fatalf("未加权 Key 的原始量同样要有, got %d", got[1].Quota.RawTokens)
+	}
+}
+
+// TestWithQuotaUsageRawTokensReadFailureDegrades 原始量读取失败时只丢该列，
+// 不能让整个子 Key 列表 500（与配额列同样的降级约定）。
+func TestWithQuotaUsageRawTokensReadFailureDegrades(t *testing.T) {
+	a := newQuotaTestAdmin(t)
+	sk := &model.SubKey{ID: "sk_x", Name: "x", DailyLimitTokens: 100}
+	if err := a.store.UpsertSubKey(sk); err != nil {
+		t.Fatal(err)
+	}
+	// 关掉底层库，模拟统计不可用。
+	a.store.Close()
+	got := a.withQuotaUsage([]*model.SubKey{sk})
+	if len(got) != 1 {
+		t.Fatalf("库不可用时仍应返回列表, got %d", len(got))
+	}
+	if got[0].Quota != nil {
+		t.Fatalf("配额读取失败时该行不应带 quota（界面显示 —）: %+v", got[0].Quota)
+	}
+}
+
 // TestWithQuotaUsageEmptyInput 空列表不 panic、不报错。
 func TestWithQuotaUsageEmptyInput(t *testing.T) {
 	a := newQuotaTestAdmin(t)
