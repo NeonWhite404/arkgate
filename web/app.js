@@ -370,7 +370,7 @@ const OverviewPage = {
       <div class="stat-card"><div class="ic ic-purple">🧩</div><div class="body"><div class="v">{{ o.model_count }}</div><div class="l">模型</div></div></div>
       <div class="stat-card"><div class="ic ic-orange">🔑</div><div class="body"><div class="v">{{ o.subkey_count }}</div><div class="l">子 Key</div></div></div>
       <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ o.total_requests }}</div><div class="l">总请求</div></div></div>
-      <div class="stat-card"><div class="ic ic-green">⬤</div><div class="body"><div class="v">{{ fmtTokens(o.total_tokens) }}</div><div class="l">总 Token</div></div></div>
+      <div class="stat-card" title="上游报告的总 token（prompt+completion，含缓存命中）。是计费与展示口径，不是子 Key 额度消耗——额度按缓存倍率加权计量"><div class="ic ic-green">⬤</div><div class="body"><div class="v">{{ fmtTokens(o.total_tokens) }}</div><div class="l">总 Token<span class="stat-sub">上游原始</span></div></div></div>
       <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(o.total_cost) }}</div><div class="l">总成本（24h {{ fmtCost(o.cost_24h) }}）</div></div></div>
     </div>
 
@@ -787,7 +787,7 @@ const AccountsPage = {
     <div class="page-title">上游账号</div>
     <div class="toolbar"><button class="btn btn-primary" @click="openModal(null)">+ 添加账号</button><div class="spacer"></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>名称</th><th>供应商</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th>Token</th><th>图像</th><th>操作</th>
+      <th>名称</th><th>供应商</th><th>Key</th><th>状态</th><th>权重</th><th>请求/成功/失败</th><th title="上游报告的总 token（prompt+completion，含缓存命中）。账号层不做限流，此列只作容量参考">Token<span class="th-sub">累加·上游原始</span></th><th>图像</th><th>操作</th>
     </tr></thead><tbody>
       <tr v-if="!accs.length"><td colspan="9" class="empty">暂无账号</td></tr>
       <tr v-for="a in accs" :key="a.id">
@@ -1197,7 +1197,7 @@ const LogsPage = {
       <button class="btn btn-outline btn-sm" @click="resetFilters">重置</button>
     </div>
     <div class="card"><div class="table-wrap"><table><thead><tr>
-      <th>时间</th><th>来源 IP</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>图像</th><th>成本</th><th>首字 / 总耗时</th><th>状态</th><th>错误</th>
+      <th>时间</th><th>来源 IP</th><th>子 Key</th><th>账号</th><th>供应商</th><th>请求模型</th><th>真实模型</th><th title="上游报告的 prompt_tokens，**含缓存命中量**；不是「非缓存输入」。非缓存部分 = 输入 − 缓存读取 − 缓存写入">输入<span class="th-sub">含缓存命中</span></th><th>输出</th><th title="prompt_tokens + completion_tokens，上游原始量">总 Token<span class="th-sub">= 输入 + 输出</span></th><th>图像</th><th>成本</th><th>首字 / 总耗时</th><th>状态</th><th>错误</th>
     </tr></thead><tbody>
       <tr v-if="!logs.length"><td colspan="15" class="empty">暂无日志</td></tr>
       <tr v-for="l in logs" :key="l.id" class="row-in">
@@ -1452,8 +1452,8 @@ const UsagePage = {
     <div class="stat-row">
       <div class="stat-card"><div class="ic ic-blue">⚡</div><div class="body"><div class="v">{{ summary.requests || 0 }}</div><div class="l">调用次数</div></div></div>
       <div class="stat-card"><div class="ic" :class="successRateCls">✓</div><div class="body"><div class="v">{{ successRate }}</div><div class="l">成功率</div></div></div>
-      <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(summary.total_tokens) }}</div><div class="l">总 Tokens</div></div></div>
-      <div class="stat-card"><div class="ic ic-green">↓</div><div class="body"><div class="v">{{ fmtTokens(summary.prompt_tokens) }}</div><div class="l">输入 Tokens</div></div></div>
+      <div class="stat-card" title="上游报告的总 token（prompt+completion，含缓存命中），不是子 Key 额度消耗"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(summary.total_tokens) }}</div><div class="l">总 Tokens<span class="stat-sub">上游原始</span></div></div></div>
+      <div class="stat-card" title="上游报告的 prompt_tokens，含缓存命中量"><div class="ic ic-green">↓</div><div class="body"><div class="v">{{ fmtTokens(summary.prompt_tokens) }}</div><div class="l">输入 Tokens<span class="stat-sub">含缓存命中</span></div></div></div>
       <div class="stat-card"><div class="ic ic-purple">↑</div><div class="body"><div class="v">{{ fmtTokens(summary.completion_tokens) }}</div><div class="l">输出 Tokens</div></div></div>
       <div class="stat-card"><div class="ic ic-orange">🖼</div><div class="body"><div class="v">{{ summary.images || 0 }}</div><div class="l">图像（张）</div></div></div>
       <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(summary.cost) }}</div><div class="l">费用</div></div></div>
@@ -2341,7 +2341,7 @@ const PortalPage = {
     </div>
     <div class="page" v-if="d">
       <div class="stat-row">
-        <div class="stat-card"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">{{ periodLabel }} Tokens</div></div></div>
+        <div class="stat-card" :title="d.quota && (d.quota.cache_read_permille || d.quota.cache_write_permille) ? '这是加权配额计数（与限额同口径），不是上游原始 token——缓存读取与写入已各乘自己的倍率' : '未启用缓存加权，本值等于上游原始 token（prompt+completion）'"><div class="ic ic-blue">⬤</div><div class="body"><div class="v">{{ fmtTokens(d.today.tokens) }}</div><div class="l">{{ periodLabel }} Tokens<span class="stat-sub">额度消耗（加权）</span></div></div></div>
         <div class="stat-card"><div class="ic ic-green">⚡</div><div class="body"><div class="v">{{ d.today.requests }}</div><div class="l">{{ periodLabel }}请求数</div></div></div>
         <div class="stat-card"><div class="ic ic-purple">🖼</div><div class="body"><div class="v">{{ d.today.images }}</div><div class="l">{{ periodLabel }}图像（张）</div></div></div>
         <div class="stat-card"><div class="ic ic-orange">💰</div><div class="body"><div class="v">{{ fmtCost(d.today.cost) }}</div><div class="l">{{ periodLabel }}成本（参考）</div></div></div>
@@ -2403,7 +2403,7 @@ const PortalPage = {
       <div class="card">
         <div class="card-head"><div class="card-title">最近调用（最多 100 条）</div></div>
         <div class="table-wrap"><table><thead><tr>
-          <th>时间</th><th>模型</th><th>模态</th><th>输入</th><th>输出</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th>
+          <th>时间</th><th>模型</th><th>模态</th><th title="上游报告的 prompt_tokens，含缓存命中量；不是「非缓存输入」">输入<span class="th-sub">含缓存命中</span></th><th>输出</th><th>图像</th><th>成本</th><th>耗时</th><th>状态</th>
         </tr></thead><tbody>
           <tr v-if="!d.logs.length"><td colspan="9" class="empty">暂无调用记录</td></tr>
           <tr v-for="l in d.logs" :key="l.id">
