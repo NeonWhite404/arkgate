@@ -23,4 +23,6 @@ secret.key
 # AI slop
 AGENTS.md
 docs/
-./.zcode/
+
+# 辅助计算
+tools/

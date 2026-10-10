@@ -2173,6 +2173,7 @@ const SettingsPage = {
 const MENU = [
   { key: "overview", label: "总览", icon: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>', comp: "OverviewPage" },
   { key: "usage", label: "用量分析", icon: '<path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 5-6"/>', comp: "UsagePage" },
+  { key: "sharedetect", label: "分发检测", icon: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>', comp: "ShareDetectPage" },
   { key: "accounts", label: "上游账号", icon: '<rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01M6 16.5h.01"/>', comp: "AccountsPage" },
   { key: "models", label: "模型映射", icon: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/>', comp: "ModelsPage" },
   { key: "routing", label: "分流配置", icon: '<path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="m21 3-6.5 6.5"/><path d="m3 3 7 7"/><path d="M16 21h5v-5"/><path d="m21 21-5-5"/>', comp: "RoutingPage" },
@@ -2558,6 +2559,7 @@ app.component("ProbeTest", ProbeTest)
   .component("UiSwitch", UiSwitch)   // ui.js：开关
   .component("OverviewPage", OverviewPage)
   .component("UsagePage", UsagePage)
+  .component("ShareDetectPage", ShareDetectPage)
   .component("AccountsPage", AccountsPage)
   .component("ModelsPage", ModelsPage)
   .component("RoutingPage", RoutingPage)

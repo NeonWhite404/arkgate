@@ -1455,6 +1455,18 @@ type UsageSeriesPoint struct {
 	Cost     float64 `json:"cost"`
 }
 
+// ShareGroup 是一个子 Key 的日用量序列（分发检测的观察单元）。
+//
+// Buckets 与 Days 一一对应：Buckets 是桶值（本地日 00:00 的 UTC 秒，供前端画
+// 时间线），Days 是当日请求数（供 EVT 模型）。模型只用 Days 的取值分布，
+// 顺序无关；顺序只在图表里才有意义。
+type ShareGroup struct {
+	Key     string    `json:"key"`
+	Label   string    `json:"label"`
+	Buckets []int64   `json:"buckets"`
+	Days    []float64 `json:"days"`
+}
+
 // usageSeriesMaxRows 限制单次序列查询返回的点数，避免长时间窗 × 多子 Key ×
 // 多模型时序列化出超大响应。
 const usageSeriesMaxRows = 5000
@@ -1492,6 +1504,85 @@ func (s *Store) QueryUsageSeries(hours int) ([]*UsageSeriesPoint, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ─────────────────────────── 分发检测（子 Key 日用量序列） ───────────────────────────
+
+// ShareGroup 是一个子 Key 的日用量序列（分发检测的观察单元）。
+//
+// Days 是「有使用的日子」的请求数，**不补零**：需求里的「波动」指使用日之间的
+// 起伏，把「没用过的日子」算成 0 会把间歇性使用（周末不干活）误判成高波动，
+// 从而让「稳定」这个判据失效。
+//
+// Order 保留日桶的先后顺序（桶值为本地日 00:00 的 UTC 秒），供前端画时间线；
+// 模型本身只用 Days 的取值分布（顺序无关）。
+// 一并返回 Days 是刻意的：图表要按时间轴呈现趋势，而模型只要分布——
+// 两者共用一次查询，避免同一批数据查两遍。
+func (s *Store) ShareDetectionSeries(from, to int64, minReqPerDay int) ([]*ShareGroup, error) {
+	if to <= 0 || to > nowUnix() {
+		to = nowUnix()
+	}
+	if from <= 0 || from >= to {
+		from = to - 30*86400
+	}
+	if to-from > usageQueryMaxSpan {
+		from = to - usageQueryMaxSpan
+	}
+	if minReqPerDay < 1 {
+		minReqPerDay = 1
+	}
+	// 天桶复用 usageBucketExpr：本地时区自然日、DST-safe。绝不能在这里自己写
+	// 「除以 86400」的算术——跨 DST 时同一区间内的天属于不同偏移，会被归错桶
+	// （与用量分析出现两种日界线，是最难排查的一类不一致）。
+	bucketExpr := usageBucketExpr("day", from, to, time.Local)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// subkey_name 一并进 GROUP BY：子 Key 改过名时否则标签会随机取新旧名之一
+	// （与 QueryUsageSeries 同一约定）。
+	rows, err := s.db.Query(`SELECT subkey_id, subkey_name, `+bucketExpr+` AS bucket, COUNT(*)
+		FROM usage_logs
+		WHERE ts >= ? AND ts < ? AND subkey_id <> ''
+		GROUP BY subkey_id, subkey_name, bucket
+		ORDER BY subkey_id ASC, bucket ASC`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// 按子 Key 归并。用 map 保序构造切片，避免依赖 SQL 的 id 排序语义。
+	order := []string{}
+	byKey := map[string]*ShareGroup{}
+	for rows.Next() {
+		var id, name string
+		var bucket, count int64
+		if err := rows.Scan(&id, &name, &bucket, &count); err != nil {
+			return nil, err
+		}
+		if count < int64(minReqPerDay) {
+			continue // 低量日弃用：一两条请求的「用量」不代表该日使用强度
+		}
+		g := byKey[id]
+		if g == nil {
+			g = &ShareGroup{Key: id, Label: name}
+			byKey[id] = g
+			order = append(order, id)
+		}
+		// 改名后同一子 Key 会出现多行 name，取非空的最新值即可（名称只用于展示）。
+		if name != "" {
+			g.Label = name
+		}
+		g.Buckets = append(g.Buckets, bucket)
+		g.Days = append(g.Days, float64(count))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]*ShareGroup, 0, len(order))
+	for _, k := range order {
+		out = append(out, byKey[k])
+	}
+	return out, nil
 }
 
 // ─────────────────────────── Daily usage（日限额） ───────────────────────────

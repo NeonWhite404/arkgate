@@ -26,6 +26,7 @@ import (
 	"arkgate/internal/model"
 	"arkgate/internal/provider"
 	"arkgate/internal/secure"
+	"arkgate/internal/shareanalytics"
 	"arkgate/internal/store"
 )
 
@@ -205,6 +206,7 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/usage/rollup", a.handleUsageRollup)
 	reg("/api/usage/rollup/rebuild", a.handleUsageRollupRebuild)
 	reg("/api/usage/cost/backfill", a.handleCostBackfill)
+	reg("/api/share-detection", a.handleShareDetection)
 
 	return mux
 }
@@ -290,6 +292,90 @@ func (a *Admin) handleCostBackfill(w http.ResponseWriter, r *http.Request) {
 		out["daily_error"] = dailyErr.Error()
 	}
 	writeJSON(w, 200, out)
+}
+
+// handleShareDetection 分发检测：按子 Key 对其日用量做极值理论（EVT）分析。
+//
+// 模型定稿见 docs/downstream-sharing-detection.md：把「分发」定义为
+// 「量级显著超出个人使用 **且** 波动显著低于个人使用」——两个条件缺一不可。
+// 量级用 GPD 外推的**返回期**（平均多少天才出现一次该量级的日用量），
+// 波动用正常组 CV 的对数正态下界。
+//
+// 为什么只读原始表、不做预聚合：模型需要**每组（子 Key）的日请求量分布**，
+// 而 usage_rollup_* 是 SUM 语义的聚合表，还原不出分布形状（同样的理由让
+// tools/shareanalyze 坚持只读 usage_logs）。数据量大时这里会比用量分析慢，
+// 但这是一次显式触发的分析视图，不在转发热路径上。
+//
+// 参数全部走查询串且**收敛而非报错**（见 Params.Normalize）：这些是分析视角
+// 而非网关行为，一个手滑的值不该让页面查不出结果。实际生效值在响应里回显。
+func (a *Admin) handleShareDetection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	qv := r.URL.Query()
+	toInt := func(key string) int64 {
+		n, _ := strconv.ParseInt(qv.Get(key), 10, 64)
+		return n
+	}
+	toFloat := func(key string) float64 {
+		f, _ := strconv.ParseFloat(qv.Get(key), 64)
+		return f
+	}
+
+	to := toInt("to")
+	if to <= 0 || to > time.Now().Unix() {
+		to = time.Now().Unix()
+	}
+	from := toInt("from")
+	if from <= 0 || from >= to {
+		from = to - 30*86400
+	}
+	// 区间上限：EVT 外推需要天数，但也不能让一次请求把整张日志表拖进内存。
+	// 92 天与用量分析/预聚合重建保持一致（同一套区间语义，避免两处口径不同）。
+	const maxSpan = 92 * 86400
+	if to-from > maxSpan {
+		from = to - maxSpan
+	}
+
+	minReqPerDay := int(toInt("min_req_per_day"))
+	series, err := a.store.ShareDetectionSeries(from, to, minReqPerDay)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+
+	p := shareanalytics.Params{
+		QThreshold:       toFloat("q_threshold"),
+		ReturnPeriodDays: toFloat("return_period_days"),
+		CVAlpha:          toFloat("cv_alpha"),
+		ExcludeK:         toFloat("exclude_k"),
+		MinDays:          int(toInt("min_days")),
+		ReliableDays:     int(toInt("reliable_days")),
+		MaxRounds:        int(toInt("max_rounds")),
+	}
+
+	// 转成分析包的输入。Buckets 一并保留：模型只用取值分布，但趋势图需要时间轴。
+	in := make([]shareanalytics.GroupSeries, 0, len(series))
+	for _, g := range series {
+		in = append(in, shareanalytics.GroupSeries{Key: g.Key, Label: g.Label, Days: g.Days})
+	}
+	res := shareanalytics.Analyze(in, p)
+
+	// 趋势与散点共用同一批日序列：模型要分布、图表要时间轴，同一次查询出两份数据，
+	// 避免前端为画图再查一遍（也避免两次查询之间数据变动导致图与表不一致）。
+	trends := make([]*store.ShareGroup, 0, len(series))
+	for _, g := range series {
+		trends = append(trends, g)
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"result": res,
+		"trends": trends,
+		"from":   from,
+		"to":     to,
+		"groups": len(series),
+	})
 }
 
 // handleUsageRollup 预聚合健康度（watermark / 滞后秒数 / 聚合表行数）。

@@ -31,7 +31,7 @@ import (
 // 这种写法下「同一行有 </div> 但没有 <div>」是**合法的**，按行统计会产生
 // 假阳性（初版就因此把一个正确的模板报成不平衡，白花时间排查）。
 func TestWebTemplatesTagBalanced(t *testing.T) {
-	files := []string{"web/app.js", "web/models.js", "web/ui.js", "web/index.html"}
+	files := []string{"web/app.js", "web/models.js", "web/share.js", "web/ui.js", "web/index.html"}
 	// 只关心 div —— 它占了模板标签的绝大多数，且是最容易配错的那个。
 	// 同样配平的还有 span/template/table 系，但那些嵌套少、出错概率低，
 	// 全量实现会引入 <br>/<img> 等自闭合标签的复杂度，不划算。
