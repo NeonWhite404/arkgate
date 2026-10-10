@@ -24,5 +24,8 @@ secret.key
 AGENTS.md
 docs/
 
+# 离线分析产物（tools/shareanalyze -charts 生成的报告，不入库）
+charts.html
+
 # 辅助计算
 tools/
