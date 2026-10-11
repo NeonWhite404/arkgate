@@ -253,8 +253,31 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
     return sdEmptyFrame(axis, "图表数据与时间轴不匹配",
       "已选中 " + picked.length + " 个子 Key，但其日用量均未落在当前日期区间内（请刷新重试）");
   }
+  // Y 轴量程：不仅要覆盖每个槽的 max/min，还要覆盖**蜡烛实体的另一个端点**。
+  //
+  // 实体纵向跨度是 [本槽合计 total, 上一个有数据的槽合计 prev]，而 prev 可能
+  // 比当前区间任何槽的 max 都大（典型：区间首日的前一天量特别高）。只按 s.max
+  // 定量程时 yOf(prev) 会被 Math.min(v, maxV) 夹到顶部，实体塌成 1.2px 贴在最
+  // 上边——而影线仍按 s.min/s.max 正确定位，于是出现「柱子在线外面」的错位
+  // （实测截图确认）。两侧统计必须同一把尺。
+  const totalsForScale = [];
+  {
+    let p = null;
+    stats.forEach((s) => {
+      if (!s) return;
+      if (p !== null) totalsForScale.push(p);
+      totalsForScale.push(s.total);
+      p = s.total;
+    });
+  }
   let maxV = 1;
-  stats.forEach((s) => { if (s && s.max > maxV) maxV = s.max; });
+  stats.forEach((s) => {
+    if (!s) return;
+    if (s.max > maxV) maxV = s.max;
+    if (s.total > maxV) maxV = s.total;
+  });
+  totalsForScale.forEach((v) => { if (v > maxV) maxV = v; });
+  // 影线要画到 s.min，但 min 不会超过 maxV，无需额外放宽。
   maxV *= 1.06;
   const yOf = (v) => padT + plotH * (1 - Math.min(v, maxV) / maxV);
 

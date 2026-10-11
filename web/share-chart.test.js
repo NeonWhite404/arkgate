@@ -384,5 +384,31 @@ console.log("\n19) 数据与轴错配时必须显式报错，不得静默画空�
   ok((good.match(/<rect/g) || []).length > 0, "正常轴下确实画出蜡烛（对照）");
 }
 
+console.log("\n20) 蜡烛实体必须在真实量程内（不得塌在顶部）");
+{
+  // 实测 bug：实体纵向跨度是 [本槽 total, 上一个有数据槽 prev]，但 maxV 只按
+  // s.max 算。当 prev 大于区间内任何 s.max 时 yOf(prev) 被夹到顶部，实体塌成
+  // 1.2px 贴在 y=padT，而影线仍按 s.min/s.max 正确定位 → 看起来「柱子跑到线外面」。
+  const day = 86400, b0 = 1789142400;
+  const mk = (pairs) => ({
+    key: "k", label: "K",
+    buckets: pairs.map((p) => b0 + p[0] * day),
+    days: pairs.map((p) => p[1]),
+  });
+  // 三日量：首日 1.0K、次日 2.0K（prev 高峰）、末日 1.2K（跌）
+  const t = [mk([[0, 1000], [1, 2000], [2, 1200]])];
+  const ax = { slots: [0, 1, 2].map((i) => ({ ts: b0 + i * day, label: "d" + i })), n: 3 };
+  const h = SD.renderSDTimeline(t, [], ax, null);
+  const rects = [...h.matchAll(/<rect x="[\d.]+" y="([\d.]+)" width="[\d.]+" height="([\d.]+)"/g)]
+    .map((m) => ({ y: Number(m[1]), h: Number(m[2]) }));
+  eq(rects.length, 3, "画出 3 根蜡烛");
+  // 第二天 1000→2000 是涨（实体跨 1.0K~2.0K），应明显高于 1.2px
+  ok(rects[1].h > 20, "涨日实体高度按真实差值（不被夹成 1.2px），实际 h=" + rects[1].h.toFixed(1));
+  // 第三日 2000→1200 是跌，实体底就是 2000（区间最高）→ 实体必须同样可见
+  ok(rects[2].h > 20, "跌日实体高度按真实差值，实际 h=" + rects[2].h.toFixed(1));
+  // 且跌日实体的顶端应低于涨日（同一量程下 1200 < 2000）
+  ok(rects[2].y >= rects[1].y, "跌日实体顶端不低于涨日（同一把尺）");
+}
+
 console.log("\n" + (failed ? "✗ " + failed + " 项失败" : "✓ 全部通过") + "（通过 " + passed + " 项）");
 process.exit(failed ? 1 : 0);
