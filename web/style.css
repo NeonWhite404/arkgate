@@ -639,6 +639,34 @@ th .th-sub { display:block; font-weight:400; font-size:11px; opacity:.62; margin
 .sd-row-flagged { background: rgba(185, 28, 28, .05); }
 .sd-row-flagged:hover { background: rgba(185, 28, 28, .09); }
 .sd-hot { color:#dc2626; font-weight:600; font-variant-numeric: tabular-nums; }
+
+/* 趋势图的子 Key 参与开关。
+   列表用 flex-wrap 而非滚动容器：子 Key 数量常规在 10~30 之间，
+   自然换行比给固定高度更好用（不会出现「看不到底下的」）。
+   超长列表的收缩交给页面的搜索框，不在这里加 max-height。 */
+.sd-pick { margin-bottom: 12px; }
+.sd-pick-bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.sd-pick-bar .spacer { flex:1; }
+.sd-pick-count { font-size:12px; color:var(--color-text-3); }
+.sd-pick-count b { color:rgb(var(--primary-6)); font-variant-numeric: tabular-nums; }
+.sd-pick-warn { margin-left:4px; }
+.sd-pick-search { width:180px; padding:4px 8px; font-size:12px; }
+.sd-pick-list { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;
+  padding-top:10px; border-top:1px solid var(--color-border-1); }
+.sd-pick-item { display:inline-flex; align-items:center; gap:5px; padding:3px 9px;
+  font-size:12px; border:1px solid var(--color-border-2); border-radius:12px;
+  background:var(--color-bg-1); color:var(--color-text-3); cursor:pointer;
+  transition:color .12s, border-color .12s, background .12s; }
+.sd-pick-item:hover { border-color:rgb(var(--primary-6)); color:var(--color-text-1); }
+/* 选中态：降饱和的蓝底 + 深色字（而非纯蓝底白字）——一屏可能同时选中几十个，
+   高对比满色会变成一片色块，反而看不出选了什么。 */
+.sd-pick-item.on { background:rgba(var(--primary-6), .10); border-color:rgb(var(--primary-6));
+  color:var(--color-text-1); }
+.sd-pick-dot { width:8px; height:8px; border-radius:50%; flex:none; opacity:.35; }
+.sd-pick-item.on .sd-pick-dot { opacity:1; }
+.sd-pick-name { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sd-pick-rp { color:#dc2626; font-weight:700; }
 [data-theme="dark"] .sd-row-flagged { background: rgba(248, 113, 113, .09); }
 [data-theme="dark"] .sd-row-flagged:hover { background: rgba(248, 113, 113, .14); }
 [data-theme="dark"] .sd-hot { color:#f87171; }
+[data-theme="dark"] .sd-pick-rp { color:#f87171; }

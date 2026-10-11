@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -31,7 +33,23 @@ import (
 // 这种写法下「同一行有 </div> 但没有 <div>」是**合法的**，按行统计会产生
 // 假阳性（初版就因此把一个正确的模板报成不平衡，白花时间排查）。
 func TestWebTemplatesTagBalanced(t *testing.T) {
-	files := []string{"web/app.js", "web/models.js", "web/share.js", "web/ui.js", "web/index.html"}
+	// 自动发现 web/*.js（而不是写死文件名）：2026-10 把分发检测的图表层从 share.js
+	// 拆成 share-chart.js 时，写死的列表会让新文件**静默地不被检查**——测试照样绿，
+	// 保护范围却小了一块。目录扫描让「新增前端文件」自动进入保护范围。
+	// index.html 单独列出（它不是 .js，且确实含模板）。
+	matches, err := filepath.Glob(filepath.Join("web", "*.js"))
+	if err != nil {
+		t.Fatalf("扫描 web/*.js: %v", err)
+	}
+	if len(matches) < 4 {
+		t.Fatalf("web/*.js 只找到 %d 个文件，路径或工作目录不对", len(matches))
+	}
+	files := append(matches, "web/index.html")
+	// web/share-chart.test.js 是 Node 校验器（用法见其文件头），
+	// 不是浏览器加载的前端资源，不参与模板配平。
+	files = slices.DeleteFunc(files, func(f string) bool {
+		return filepath.Ext(f) == ".js" && len(f) > 3 && f[len(f)-8:] == ".test.js"
+	})
 	// 只关心 div —— 它占了模板标签的绝大多数，且是最容易配错的那个。
 	// 同样配平的还有 span/template/table 系，但那些嵌套少、出错概率低，
 	// 全量实现会引入 <br>/<img> 等自闭合标签的复杂度，不划算。

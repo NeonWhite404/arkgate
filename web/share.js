@@ -9,8 +9,9 @@
  * 产生的概率」＝ 1/返回期。这是本页存在的理由——早期版本用组间相对排名，
  * 永远会选出一个「最高」的组，无法表达「显著」。
  *
- * 本文件在 app.js 之前加载（同 models.js 的约定），依赖但不注册任何全局组件；
- * 由 app.js 负责 app.component("ShareDetectPage", ...)。
+ * 本文件只含**页面组件与偏好读写**；四张图的渲染函数在 share-chart.js
+ * （先于本文件加载，见 index.html 的 script 顺序）。
+ * 本文件不注册组件，由 app.js 负责 app.component("ShareDetectPage", ...)。
  */
 "use strict";
 
@@ -36,355 +37,6 @@ const SD_FLAGS = {
   insufficient: { label: "样本不足", cls: "tag-gray", tip: "天数不足，未做有效检验" },
 };
 
-// ── 图表 1（主判据）：极值散点 —— 返回期 × 波动 CV ──
-//
-// 这是文档里的「图 0」，也是本页唯一带**判定语义**的图：右上角红色区
-// （返回期 > 阈值 且 CV < 显著平稳线）= 显著异常区。横轴对数刻度——
-// 返回期跨好几个数量级，线性刻度会把所有正常组挤在左边缘。
-function renderSDScatter(groups, fit, cvf, params) {
-  if (!groups || !groups.length) return '<div class="empty">所选区间暂无数据</div>';
-  const W = 820, H = 340, padL = 64, padR = 132, padT = 34, padB = 46;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-
-  // 横轴范围：至少覆盖判据阈值，并留出到最大返回期的空间。
-  const critRP = params.return_period_days || 1000;
-  let maxRP = critRP * 4;
-  for (const g of groups) {
-    if (g.return_period_days > maxRP) maxRP = g.return_period_days;
-  }
-  maxRP *= 1.6;
-  const lx = (v) => {
-    const lg = Math.log10(Math.max(v, 1));
-    return padL + (lg / Math.log10(maxRP)) * plotW;
-  };
-  // 纵轴范围：覆盖最大 CV 与显著线。
-  let maxCV = 0.2;
-  for (const g of groups) if (g.cv > maxCV) maxCV = g.cv;
-  if (cvf && cvf.valid && cvf.crit_cv > maxCV) maxCV = cvf.crit_cv;
-  maxCV *= 1.15;
-  const yOf = (v) => padT + plotH * (1 - Math.min(v, maxCV) / maxCV);
-
-  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
-    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
-
-  // 危险区（右上）：返回期超阈值 且 CV 低于显著平稳线。
-  const xc = lx(critRP);
-  const critCV = cvf && cvf.valid ? cvf.crit_cv : 0;
-  const yc = critCV > 0 ? yOf(critCV) : padT;
-  if (critCV > 0) {
-    svg += '<rect x="' + xc.toFixed(1) + '" y="' + padT + '" width="' + (W - padR - xc).toFixed(1) +
-      '" height="' + (yc - padT).toFixed(1) + '" fill="rgba(185,28,28,.09)"/>';
-  }
-
-  // 网格：横轴按 10 的幂，纵轴 4 等分。
-  const powLabels = [];
-  for (let p = 0; p <= 12; p++) {
-    const v = Math.pow(10, p);
-    if (v > maxRP) break;
-    powLabels.push(v);
-  }
-  powLabels.forEach((v) => {
-    const x = lx(v);
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' + fmtRPTick(v) + '</text>';
-  });
-  for (let i = 0; i <= 4; i++) {
-    const v = maxCV * (i / 4);
-    const y = yOf(v);
-    svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">' + v.toFixed(2) + '</text>';
-  }
-
-  // 判定线。
-  svg += '<line x1="' + xc.toFixed(1) + '" y1="' + padT + '" x2="' + xc.toFixed(1) + '" y2="' + (H - padB) +
-    '" stroke="#b91c1c" stroke-width="1.4" stroke-dasharray="4 3"/>';
-  svg += '<text x="' + xc.toFixed(1) + '" y="' + (padT - 6) + '" font-size="10" fill="#b91c1c" text-anchor="middle">' +
-    fmtInt(critRP) + ' 天</text>';
-  if (critCV > 0) {
-    svg += '<line x1="' + padL + '" y1="' + yc.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + yc.toFixed(1) +
-      '" stroke="#b91c1c" stroke-width="1.4" stroke-dasharray="4 3"/>';
-    svg += '<text x="' + (padL + 4) + '" y="' + (yc - 5).toFixed(1) + '" font-size="10" fill="#b91c1c">显著平稳线 CV=' +
-      critCV.toFixed(2) + '</text>';
-  }
-
-  // 点：flag 决定半径与光晕，颜色按名称哈希取稳定调色板（刷新不跳变）。
-  groups.forEach((g) => {
-    let x = lx(g.return_period_days);
-    if (x > W - padR) x = W - padR;
-    const y = yOf(g.cv);
-    const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
-    if (flagged) {
-      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="14" fill="#b91c1c" fill-opacity=".16"/>';
-    }
-    svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (flagged ? 7.5 : 5) + '" fill="' + color +
-      '" fill-opacity=".88"><title>' + escHtml(sdTitle(g)) + '</title></circle>';
-    // 只给命中判据的点标签（全部标注会糊成一团，而没命中的看表格即可）。
-    if (flagged) {
-      svg += '<text x="' + (x + 11).toFixed(1) + '" y="' + (y + 4).toFixed(1) + '" font-size="11" fill="' + color + '">' +
-        escHtml(truncText(g.label || g.key, 12)) + ' ★</text>';
-    }
-  });
-
-  svg += '<text x="' + (padL + plotW / 2).toFixed(1) + '" y="' + (H - 8) + '" font-size="11" fill="#6b7280" text-anchor="middle">返回期（天，对数刻度；平均多少天才出现一次该量级的日用量）→</text>';
-  svg += '<text x="14" y="' + (padT + plotH / 2).toFixed(1) + '" font-size="11" fill="#6b7280" text-anchor="middle" transform="rotate(-90 14 ' +
-    (padT + plotH / 2).toFixed(1) + ')">日用量波动 CV（越小越平稳）→</text>';
-  if (critCV > 0) {
-    svg += '<text x="' + ((xc + W - padR) / 2).toFixed(1) + '" y="' + (padT + 14) + '" font-size="11" fill="#b91c1c" text-anchor="middle">右上 = 显著异常区</text>';
-  }
-  svg += "</svg>";
-  return svg;
-}
-
-// sdTitle 散点/趋势图共用：一个点的完整读数 + 判读依据。
-function sdTitle(g) {
-  const seg = [];
-  seg.push((g.label || g.key) + (g.flag === "flagged" ? "【显著异常】" : g.flag === "excluded" ? "【粗筛偏高】" : ""));
-  seg.push("天数 " + g.days);
-  seg.push("日量 中位 " + fmtInt(Math.round(g.level_median)) + " / P90 " + fmtInt(Math.round(g.level_p90)) + " / 最大 " + fmtInt(Math.round(g.level_max)));
-  seg.push("波动 CV " + (g.cv || 0).toFixed(3) + (g.cv_pct ? "（p=" + g.cv_pct.toFixed(3) + "）" : ""));
-  seg.push("返回期 " + fmtReturnPeriod(g) + " 天");
-  return seg.join(" · ");
-}
-
-// ── 图表 2（量级视角）：各子 Key 日量箱线对比 ──
-//
-// 横条 = P10~P90 范围、竖线 = 中位数、圆点 = 极值。比散点更直观地回答
-// 「谁的日常水平高」——但注意它**只是描述**：中位数高不等于分发（重度个人
-// 用户的中位数同样高），判定仍看散点图的两个判据。
-function renderSDBox(groups, fit) {
-  const rows = (groups || []).slice().sort((a, b) => b.level_median - a.level_median);
-  if (!rows.length) return '<div class="empty">暂无数据</div>';
-  const H = Math.max(120, rows.length * 26 + 26);
-  const W = 820, padL = 118, padR = 74, padT = 12, padB = 26;
-  const plotW = W - padL - padR;
-  let maxV = 1;
-  rows.forEach((g) => { if (g.level_max > maxV) maxV = g.level_max; });
-  if (fit && fit.valid && fit.upper_endpoint > 0 && fit.upper_endpoint > maxV) maxV = fit.upper_endpoint;
-  maxV *= 1.06;
-  const xOf = (v) => padL + (v / maxV) * plotW;
-
-  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
-    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
-  for (let i = 0; i <= 4; i++) {
-    const v = maxV * (i / 4);
-    const x = xOf(v);
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' + fmtInt(Math.round(v)) + '</text>';
-  }
-  rows.forEach((g, i) => {
-    const y = padT + i * 26 + 13;
-    const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
-    const label = truncText(g.label || g.key, 13);
-    svg += '<text x="' + (padL - 10) + '" y="' + (y + 4) + '" font-size="11" fill="#4e5969" text-anchor="end">' +
-      escHtml(label) + (flagged ? " ★" : "") + '</text>';
-    // P10~P90 范围条（用 level_p90 与中位数对称近似下限，避免后端再传一列）。
-    const p10 = Math.max(0, g.level_median - (g.level_p90 - g.level_median));
-    svg += '<rect x="' + xOf(p10).toFixed(1) + '" y="' + (y - 4) + '" width="' + Math.max(1, xOf(g.level_p90) - xOf(p10)).toFixed(1) +
-      '" height="8" rx="2" fill="' + color + '" fill-opacity=".26"/>';
-    svg += '<line x1="' + xOf(g.level_median).toFixed(1) + '" y1="' + (y - 7) + '" x2="' + xOf(g.level_median).toFixed(1) + '" y2="' + (y + 7) +
-      '" stroke="' + color + '" stroke-width="2"/>';
-    svg += '<circle cx="' + xOf(g.level_max).toFixed(1) + '" cy="' + y + '" r="3" fill="' + color +
-      '"><title>' + escHtml(sdTitle(g)) + '</title></circle>';
-    // 右侧标注最大日量与其倍数（相对正常组中位数），回答「高多少倍」。
-    svg += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="10" fill="#86909c">' +
-      fmtInt(Math.round(g.level_max)) + '</text>';
-  });
-  svg += '<text x="' + (padL + plotW / 2).toFixed(1) + '" y="' + (H - 8) + '" font-size="11" fill="#6b7280" text-anchor="middle">日请求量（条 = 中位两侧范围，竖线 = 中位数，点 = 最大）→</text>';
-  svg += "</svg>";
-  return svg;
-}
-
-// ── 图表 3（趋势视角）：多子 Key 日用量时间线 ──
-//
-// 文档「图 1」。这条线回答的是散点图回答不了的问题：**偶发尖峰 vs 持续高位**。
-// 分发必然是后者（整条线抬升且平稳），单点突起很常见、不必紧张。
-function renderSDTimeline(trends, groups, days) {
-  if (!trends || !trends.length || !days) return '<div class="empty">暂无数据</div>';
-  const byKey = {};
-  (groups || []).forEach((g) => { byKey[g.key] = g; });
-
-  const W = 820, H = 300, padL = 56, padR = 96, padT = 14, padB = 30;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const maxV = Math.max(1, days.max);
-  const xOf = (t) => padL + (days.n > 1 ? ((t - days.min) / (days.max_t - days.min)) * plotW : plotW / 2);
-  const yOf = (v) => padT + plotH * (1 - Math.min(v, maxV) / maxV);
-
-  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
-    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
-  for (let i = 0; i <= 4; i++) {
-    const v = maxV * (1 - i / 4);
-    const y = padT + plotH * (i / 4);
-    svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">' + fmtInt(Math.round(v)) + '</text>';
-  }
-  // 日刻度：最多 8 个。
-  const step = Math.max(1, Math.floor(days.n / 8));
-  for (let k = 0; k < days.n; k += step) {
-    const x = xOf(days.min + k * 86400);
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' +
-      (days.labels[k] || "") + '</text>';
-  }
-
-  // 折线：只画「天数 ≥ minDays」的组（与参与统计的组一致），其余画淡。
-  const drawn = [];
-  (trends || []).forEach((t) => {
-    const g = byKey[t.key];
-    if (!g) return;
-    const flagged = g.flag === "flagged";
-    const excluded = g.flag === "excluded";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(t.label || t.key), PIE_COLORS.length)];
-    const dim = !flagged && !excluded;
-    let d = "";
-    (t.buckets || []).forEach((b, i) => {
-      const v = (t.days || [])[i] || 0;
-      const x = xOf(b);
-      const y = yOf(v);
-      d += (i === 0 ? "M" : "L") + x.toFixed(1) + " " + y.toFixed(1) + " ";
-    });
-    if (!d) return;
-    svg += '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="' + (flagged ? 2.2 : 1.4) +
-      '" stroke-opacity="' + (dim ? 0.5 : 0.95) + '" stroke-linejoin="round"><title>' +
-      escHtml((t.label || t.key) + "：" + (SD_FLAGS[g.flag] || {}).label) + '</title></path>';
-    drawn.push({ t: t, g: g, color: color, flagged: flagged });
-  });
-
-  // 右侧直接标注高量级组（图例式）：线条颜色 + 名称，省掉单独的图例块。
-  const labeled = drawn.filter((x) => x.flagged || x.g.flag === "excluded" || x.g.excluded)
-    .concat(drawn.filter((x) => !x.flagged && x.g.flag !== "excluded").slice(0, 5));
-  let ly = padT + 6;
-  const seen = {};
-  labeled.forEach((x) => {
-    if (seen[x.t.key] || ly > H - padB) return;
-    seen[x.t.key] = 1;
-    svg += '<line x1="' + (W - padR + 4) + '" y1="' + (ly - 3) + '" x2="' + (W - padR + 18) + '" y2="' + (ly - 3) + '" stroke="' + x.color + '" stroke-width="2"/>';
-    svg += '<text x="' + (W - padR + 22) + '" y="' + ly + '" font-size="10" fill="' + x.color + '">' +
-      escHtml(truncText(x.t.label || x.t.key, 9)) + (x.flagged ? " ★" : "") + '</text>';
-    ly += 14;
-  });
-  svg += "</svg>";
-  return svg;
-}
-
-// ── 图表 4（模型视角）：拟合分布与判定位置 ──
-//
-// 把模型本身画出来：正常组日量的经验生存函数（对数纵轴）叠上拟合的 GPD 外推，
-// 再标出各子 Key 的最大日量落在哪里。这张图回答「返回期是怎么算出来的」——
-// 让人能看出外推是否可信（点离拟合线越远/越靠右，外推越不可信）。
-function renderSDFit(groups, fit, params) {
-  if (!fit || !fit.valid || !groups.length) {
-    return '<div class="empty">' + escHtml((fit && fit.reason) || "拟合不可用") + '</div>';
-  }
-  const W = 820, H = 300, padL = 58, padR = 120, padT = 14, padB = 32;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-
-  // 横轴：日量（线性，覆盖到所有组的最大值）。纵轴：超过该量的概率（对数）。
-  let maxX = fit.threshold * 2;
-  groups.forEach((g) => { if (g.level_max > maxX) maxX = g.level_max; });
-  if (fit.upper_endpoint > 0 && fit.upper_endpoint > maxX) maxX = fit.upper_endpoint;
-  maxX *= 1.08;
-  const xOf = (v) => padL + (Math.min(v, maxX) / maxX) * plotW;
-  // 概率下界取「最小可分辨」= 1/(N+1)，再往下是纯外推。
-  const pMin = Math.max(1e-8, 1 / (fit.n + 1) / 50);
-  const yOf = (p) => {
-    const lp = Math.log10(Math.max(p, pMin));
-    const lo = Math.log10(pMin), hi = 0;
-    return padT + plotH * (1 - (lp - lo) / (hi - lo));
-  };
-
-  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
-    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
-  // 网格：横轴 4 等分，纵轴按 10 的幂。
-  for (let i = 0; i <= 4; i++) {
-    const v = maxX * (i / 4);
-    const x = xOf(v);
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' + fmtInt(Math.round(v)) + '</text>';
-  }
-  for (let e = 0; e >= -12; e--) {
-    const p = Math.pow(10, e);
-    if (p < pMin) break;
-    const y = yOf(p);
-    svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">1e' + e + '</text>';
-  }
-
-  // 阈值 u 的竖线。
-  const xu = xOf(fit.threshold);
-  svg += '<line x1="' + xu.toFixed(1) + '" y1="' + padT + '" x2="' + xu.toFixed(1) + '" y2="' + (H - padB) +
-    '" stroke="#86909c" stroke-dasharray="3 3"/>';
-  svg += '<text x="' + xu.toFixed(1) + '" y="' + (padT - 3) + '" font-size="9" fill="#86909c" text-anchor="middle">阈值 u</text>';
-
-  // GPD 外推曲线：P(X > x) = ζ_u · [1 + ξ(x-u)/β]^(-1/ξ)
-  let d = "", started = false;
-  for (let i = 0; i <= 160; i++) {
-    const x = fit.threshold + (maxX - fit.threshold) * (i / 160);
-    let p;
-    if (Math.abs(fit.xi) < 1e-9) {
-      p = fit.zeta * Math.exp(-(x - fit.threshold) / fit.beta);
-    } else {
-      const base = 1 + fit.xi * (x - fit.threshold) / fit.beta;
-      if (base <= 0) break;
-      p = fit.zeta * Math.pow(base, -1 / fit.xi);
-    }
-    if (p < pMin) break;
-    d += (started ? "L" : "M") + xOf(x).toFixed(1) + " " + yOf(p).toFixed(1) + " ";
-    started = true;
-  }
-  if (d) {
-    svg += '<path d="' + d + '" fill="none" stroke="#8b5cf6" stroke-width="1.8" stroke-dasharray="5 3"/>';
-  }
-
-  // 各组最大日量：横轴位置 + 其返回期对应的纵轴位置。
-  groups.forEach((g) => {
-    const x = xOf(g.level_max);
-    const p = g.return_period_days > 0 ? 1 / g.return_period_days : pMin;
-    const y = yOf(Math.max(p, pMin));
-    const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
-    svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (flagged ? 6 : 4) + '" fill="' + color +
-      '" fill-opacity=".9"><title>' + escHtml(sdTitle(g)) + '</title></circle>';
-    if (flagged) {
-      svg += '<text x="' + (x + 9).toFixed(1) + '" y="' + (y - 6).toFixed(1) + '" font-size="10" fill="' + color + '">' +
-        escHtml(truncText(g.label || g.key, 10)) + '</text>';
-    }
-  });
-
-  svg += '<text x="' + (padL + plotW / 2).toFixed(1) + '" y="' + (H - 8) + '" font-size="11" fill="#6b7280" text-anchor="middle">日请求量 →</text>';
-  svg += '<text x="14" y="' + (padT + plotH / 2).toFixed(1) + '" font-size="11" fill="#6b7280" text-anchor="middle" transform="rotate(-90 14 ' +
-    (padT + plotH / 2).toFixed(1) + ')">超过该量的概率 P(X&gt;x)（对数）→</text>';
-  svg += "</svg>";
-  const leg = '<div class="chart-legend">' +
-    '<span class="leg-item"><span class="leg-swatch" style="background:#8b5cf6"></span>GPD 拟合外推（虚线）</span>' +
-    '<span class="leg-item"><span class="leg-swatch" style="background:#b91c1c"></span>显著异常子 Key 的最大日量</span>' +
-    '<span class="leg-item">其余点为各子 Key 最大日量（纵轴位置 = 1/返回期）</span></div>';
-  return svg + leg;
-}
-
-// ── 辅助 ──
-
-function fmtRPTick(v) {
-  if (v >= 1e6) return (v / 1e6) + "M";
-  if (v >= 1e3) return (v / 1e3) + "K";
-  return String(v);
-}
-
-// fmtReturnPeriod 返回期展示：封顶值（后端对 +Inf 的表示）显示为「∞ 以上」，
-// 而不是印一个 1e12 让人误以为是真实外推结果。
-function fmtReturnPeriod(g) {
-  if (g.infinite) return "∞";
-  if (g.return_period_days >= 1e9) return "&gt;1e9";
-  if (!g.return_period_days || g.return_period_days < 1) return "1";
-  return fmtInt(Math.round(g.return_period_days));
-}
-
-function truncText(s, n) {
-  const r = Array.from(String(s || ""));
-  return r.length > n ? r.slice(0, n).join("") + "…" : r.join("");
-}
-
-// ═══════════════ 页面 ═══════════════
 
 const ShareDetectPage = {
   components: {},
@@ -400,9 +52,15 @@ const ShareDetectPage = {
       r: null,
       loading: false,
       tab: "scatter",
+      // 趋势图的子 Key 参与开关：null = 全选（升级前后的默认视角一致）。
+      // 只作用于「日用量趋势」——其余三张图的阈值是全局口径，收窄选中集合
+      // 会让「显著平稳线」看起来变了，是两套语义，不能混。
+      sel: saved.sel,
+      selOpen: false,
+      selQuery: "",
       tabs: [
         { v: "scatter", label: "极值判据", tip: "主判据：返回期 × 波动 CV，右上红区 = 显著异常" },
-        { v: "timeline", label: "日用量趋势", tip: "偶发尖峰 vs 持续高位——分布看不出的时间形态" },
+        { v: "timeline", label: "日用量趋势", tip: "蜡烛图：相邻有数据日比较的合计涨跌 + 当日 min/max 影线；可勾选参与的子 Key" },
         { v: "box", label: "量级对比", tip: "各子 Key 日量的中位数、范围与最大值" },
         { v: "fit", label: "分布拟合", tip: "返回期是怎么算出来的：GPD 外推与判定位置" },
       ],
@@ -415,30 +73,70 @@ const ShareDetectPage = {
     cvf() { return (this.res && this.res.cv) || {}; },
     params() { return (this.res && this.res.params) || SD_DEFAULTS; },
     trends() { return (this.r && this.r.trends) || []; },
-    // 时间轴公共范围：所有子 Key 的桶合并取 min/max，保证各条线横向可比
-    // （每组各自从 0 起画会让「后开始的组」看起来像在剧烈波动）。
+    // 选中集合（数组形式；null = 全选）。模板里到处要判断「是否选中」，
+    // 统一走 selSet（避免每个调用点都把 null 特判一遍）。
+    selAll() { return this.sel === null; },
+    selSet() {
+      const s = {};
+      if (this.sel !== null) (this.sel || []).forEach((k) => { s[k] = 1; });
+      return s;
+    },
+    selCount() { return this.selAll ? this.trends.length : (this.sel || []).length; },
+    // 选择器列表：按当前返回期降序（与明细表同序），带判定与搜索过滤。
+    selList() {
+      const byKey = {};
+      this.groups.forEach((g) => { byKey[g.key] = g; });
+      const q = this.selQuery.trim().toLowerCase();
+      return this.trends
+        .map((t) => {
+          const g = byKey[t.key] || null;
+          return {
+            key: t.key, label: t.label || t.key,
+            flag: g ? g.flag : "insufficient",
+            rp: g && isFinite(g.return_period_days) ? g.return_period_days : -1,
+            median: g ? g.level_median : 0,
+            days: g ? g.days : (t.buckets || []).length,
+          };
+        })
+        .filter((x) => !q || String(x.label).toLowerCase().indexOf(q) >= 0)
+        .sort((a, b) => b.rp - a.rp);
+    },
+    // 趋势图的时间轴：**槽位化**——以区间内每个自然日为一个槽（按选中集合
+    // 过滤后取并集），缺日留空槽不补零。
+    //
+    // 为什么不用渲染器内部的索引：线/蜡烛要按日期对齐，各 trend 的 buckets
+    // 长度可能不同（某 Key 某天没用），必须由轴定义统一的槽序列，
+    // 再把每个 trend 的值映射到槽下标上。
     dayAxis() {
-      let mn = Infinity, mx = -Infinity, n = 0;
-      const labels = [];
-      let first = true;
-      this.trends.forEach((t) => {
-        (t.buckets || []).forEach((b) => {
-          if (b < mn) mn = b;
-          if (b > mx) mx = b;
-          labels.push(b);
-          n++;
+      const trends = sdFilterTrends(this.trends, this.sel);
+      const seen = {};
+      trends.forEach((t) => (t.buckets || []).forEach((b) => { seen[b] = 1; }));
+      const uniq = Object.keys(seen).map((x) => parseInt(x, 10)).sort((a, b) => a - b);
+      if (!uniq.length) return null;
+      // 槽序列补齐：从首桶所在本地日起，逐自然日推进到尾桶所在日，中间的空白日
+      // 也占一个槽（缺日留空不补零——「那天没人用」本身就是信息）。
+      //
+      // 用「本地 00:00 构造 + 日号+1」推进而非 ts + 86400：桶值是「本地日 00:00
+      // 的 UTC 秒」，跨 DST 时相邻两天的差值可能是 ±3600，算术加法会算错日界线。
+      const seenSet = {};
+      uniq.forEach((u) => { seenSet[u] = 1; });
+      const slots = [];
+      const last = uniq[uniq.length - 1];
+      let d = new Date(uniq[0] * 1000);
+      let cur = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      // guard 上限 400 天：与后端的区间上限（92 天）同量级，防脏数据把页面卡死。
+      for (let guard = 0; guard < 400; guard++) {
+        const ts = Math.floor(cur.getTime() / 1000);
+        slots.push({
+          ts: ts,
+          label: (cur.getMonth() + 1) + "/" + cur.getDate(),
+          has: !!seenSet[ts],
         });
-      });
-      if (!n) return null;
-      const uniq = Array.from(new Set(labels)).sort((a, b) => a - b);
-      return {
-        min: uniq[0], max_t: uniq[uniq.length - 1], n: uniq.length,
-        min_: mn, max: Math.max(1, ...this.trends.flatMap((t) => t.days || [])),
-        labels: uniq.map((u) => {
-          const d = new Date(u * 1000);
-          return (d.getMonth() + 1) + "/" + d.getDate();
-        }),
-      };
+        if (ts >= last) break;
+        cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1);
+      }
+      if (!slots.length) return null;
+      return { min: uniq[0], max_t: last, n: slots.length, slots: slots };
     },
     counts() {
       const c = { flagged: 0, excluded: 0, observe: 0, normal: 0, insufficient: 0 };
@@ -449,9 +147,16 @@ const ShareDetectPage = {
     chartHtml() {
       if (!this.res) return "";
       if (this.tab === "box") return renderSDBox(this.groups, this.fit);
-      if (this.tab === "timeline") return renderSDTimeline(this.trends, this.groups, this.dayAxis);
+      if (this.tab === "timeline") return renderSDTimeline(this.trends, this.groups, this.dayAxis, this.sel);
       if (this.tab === "fit") return renderSDFit(this.groups, this.fit, this.params);
       return renderSDScatter(this.groups, this.fit, this.cvf, this.params);
+    },
+    // 趋势图卡片的标题：标出「已选 N / 共 M」，否则用户选完子 Key 再看图
+    // 会以为是自己看错了（图里的形状变了却没有任何文字说明）。
+    timelineTitle() {
+      const tot = this.trends.length;
+      if (this.selAll) return "日用量蜡烛图（全部 " + tot + " 个子 Key）";
+      return "日用量蜡烛图（已选 " + this.selCount + " / " + tot + " 个子 Key）";
     },
     fitSummary() {
       const f = this.fit;
@@ -471,6 +176,55 @@ const ShareDetectPage = {
   methods: {
     flagMeta(g) { return SD_FLAGS[g.flag] || SD_FLAGS.normal; },
     fmtReturnPeriod,
+    // ── 趋势图的子 Key 参与开关 ──
+    // 内部统一存**数组**（null 表示全选），全选/空选/单选都走同一条路径，
+    // 避免「null 与 [] 的语义分叉」。
+    // sdPruneSel 清理已不存在的 key（改区间/换参数后 trends 会变）。
+    // 少了这一步，选中集合残留旧 key 会表现为「选着 5 个但只画 3 条」，
+    // 没有任何提示——是最难自证的一类 UI bug。
+    sdPruneSel() {
+      if (this.sel === null) return;
+      const live = {};
+      this.trends.forEach((t) => { live[t.key] = 1; });
+      const next = this.sel.filter((k) => live[k]);
+      if (next.length !== this.sel.length) {
+        this.sel = next.length ? next : null;
+        sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay, sel: this.sel });
+      }
+    },
+    sdToggle(key) {
+      const cur = this.sel === null ? this.trends.map((t) => t.key) : this.sel.slice();
+      const i = cur.indexOf(key);
+      if (i >= 0) cur.splice(i, 1); else cur.push(key);
+      // 全部选中等价于「全选」（存储为 null）：后续新出现的子 Key 自动参与，
+      // 不必再手动去勾一次。
+      this.sel = cur.length === this.trends.length ? null : cur;
+      this.sdSaveSel();
+    },
+    sdSelectAll() { this.sel = null; this.sdSaveSel(); },
+    sdSelectNone() { this.sel = []; this.sdSaveSel(); },
+    // 仅显著：把命中主判据/粗筛的组一键选中（排查时最常用的一条捷径）。
+    sdSelectFlagged() {
+      const keys = this.selList.filter((x) => x.flag === "flagged" || x.flag === "excluded").map((x) => x.key);
+      if (!keys.length) { toast("当前区间没有命中的子 Key", false); return; }
+      this.sel = keys;
+      this.sdSaveSel();
+    },
+    // Top N：列表已按返回期降序，取前 N 个（量级最高的几个）。
+    sdSelectTop(n) {
+      const keys = this.selList.slice(0, n).map((x) => x.key);
+      this.sel = keys.length === this.trends.length ? null : keys;
+      this.sdSaveSel();
+    },
+    sdSaveSel() {
+      sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay, sel: this.sel });
+    },
+    selColor(key) {
+      const g = this.groups.find((x) => x.key === key);
+      if (g && g.flag === "flagged") return "#b91c1c";
+      if (g && g.flag === "excluded") return "#f59e0b";
+      return PIE_COLORS[hashIdx(String(key), PIE_COLORS.length)];
+    },
     load() {
       this.loading = true;
       const from = Math.floor(new Date(this.from + "T00:00:00").getTime() / 1000);
@@ -485,14 +239,14 @@ const ShareDetectPage = {
         max_rounds: String(f.max_rounds),
       });
       req("GET", "/api/share-detection?" + qs.toString())
-        .then((d) => { this.r = d; })
+        .then((d) => { this.r = d; this.sdPruneSel(); })
         .catch((e) => toast(e.message, false))
         .finally(() => { this.loading = false; });
     },
     openParams() { this.form = Object.assign({}, this.form); this.pOpen = true; },
     saveParams() {
       this.snap = JSON.stringify(this.form);
-      sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay });
+      sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay, sel: this.sel });
       this.pOpen = false;
       this.load();
     },
@@ -501,7 +255,7 @@ const ShareDetectPage = {
       this.minReqPerDay = SD_DEFAULT_MINREQ;
     },
     onMinReqChange() {
-      sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay });
+      sdSavePrefs({ form: this.form, minReqPerDay: this.minReqPerDay, sel: this.sel });
       this.load();
     },
     presetRange(days) {
@@ -545,6 +299,40 @@ const ShareDetectPage = {
     <div class="card">
       <div class="tabs">
         <button v-for="t in tabs" :key="t.v" class="tab-btn" :class="{active: tab === t.v}" :title="t.tip" @click="tab = t.v">{{ t.label }}</button>
+      </div>
+
+      <!-- 子 Key 参与开关：只管「日用量趋势」。散点/量级对比/拟合图的判据是
+           全局口径（阈值由全体样本估出），收窄选中集合会让「显著平稳线」
+           看起来变了——那是两套语义，因此那三张图不接这个开关。 -->
+      <div class="sd-pick" v-if="tab === 'timeline' && trends.length">
+        <div class="sd-pick-bar">
+          <button class="btn btn-outline btn-sm" @click="sdSelectAll" :disabled="selAll">全部</button>
+          <button class="btn btn-outline btn-sm" @click="sdSelectNone" :disabled="!selCount && !selAll">清空</button>
+          <button class="btn btn-outline btn-sm" @click="sdSelectFlagged">仅命中</button>
+          <button class="btn btn-outline btn-sm" @click="sdSelectTop(5)">Top 5</button>
+          <span class="sd-pick-count">
+            已选 <b>{{ selCount }}</b> / {{ trends.length }} 个子 Key
+            <span v-if="!selAll" class="sd-pick-warn">（仅影响本图，其余三张图仍为全局口径）</span>
+          </span>
+          <div class="spacer"></div>
+          <input class="sd-pick-search" v-model="selQuery" placeholder="搜索子 Key" v-if="selOpen"/>
+          <button class="btn btn-outline btn-sm" @click="selOpen = !selOpen">{{ selOpen ? '收起 ▴' : '选择 ▾' }}</button>
+        </div>
+        <div class="sd-pick-list" v-if="selOpen">
+          <button v-for="s in selList" :key="s.key" class="sd-pick-item"
+                  :class="{on: selAll || selSet[s.key]}" @click="sdToggle(s.key)"
+                  :title="s.label + ' · ' + (flagMeta({flag:s.flag}).label) + ' · 返回期 ' + (s.rp >= 0 ? fmtInt(s.rp) : '—') + ' 天 · 中位 ' + fmtInt(Math.round(s.median)) + '/天'">
+            <span class="sd-pick-dot" :style="{background: selColor(s.key)}"></span>
+            <span class="sd-pick-name">{{ s.label }}</span>
+            <span class="sd-pick-rp" v-if="s.flag === 'flagged' || s.flag === 'excluded'">★</span>
+          </button>
+          <div class="empty" v-if="!selList.length">没有匹配的子 Key</div>
+        </div>
+      </div>
+
+      <div class="card-head" v-if="tab === 'timeline'">
+        <div class="card-title">{{ timelineTitle }}</div>
+        <span class="src-badge ic-gray" title="蜡烛实体 = 相邻「有数据的日」合计值的比较；影线 = 当日子 Key 间的 min/max。缺日留空槽，不补零">相邻日比较</span>
       </div>
       <div class="chart-wrap" v-html="chartHtml"></div>
     </div>
@@ -682,14 +470,19 @@ function sdLoadPrefs() {
     const raw = JSON.parse(localStorage.getItem("arkgate_sd_prefs") || "{}");
     const form = Object.assign({}, SD_DEFAULTS, raw.form || {});
     const minReqPerDay = Number(raw.minReqPerDay) > 0 ? Number(raw.minReqPerDay) : SD_DEFAULT_MINREQ;
-    return { form, minReqPerDay };
+    // sel 缺省 = null（全选）。数组才认（空数组 = 明确清空，与未设置不同）。
+    const sel = Array.isArray(raw.sel) ? raw.sel.map(String) : null;
+    return { form, minReqPerDay, sel };
   } catch (e) {
-    return { form: Object.assign({}, SD_DEFAULTS), minReqPerDay: SD_DEFAULT_MINREQ };
+    return { form: Object.assign({}, SD_DEFAULTS), minReqPerDay: SD_DEFAULT_MINREQ, sel: null };
   }
 }
 
 function sdSavePrefs(v) {
   try {
-    localStorage.setItem("arkgate_sd_prefs", JSON.stringify({ form: v.form, minReqPerDay: v.minReqPerDay }));
+    localStorage.setItem("arkgate_sd_prefs", JSON.stringify({
+      form: v.form, minReqPerDay: v.minReqPerDay,
+      sel: Array.isArray(v.sel) ? v.sel : null,
+    }));
   } catch (e) { /* 隐私模式下写不进去，忽略 */ }
 }
