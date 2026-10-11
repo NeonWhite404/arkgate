@@ -242,6 +242,17 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
   // 每个槽的合计值（选中集合）与各子 Key 明细。无数据的槽为 null（不画）。
   const idx = sdTrendIndex(picked, slots);
   const stats = slots.map((_, i) => sdSlotStats(picked, idx, i));
+
+  // 自检：**有选中的子 Key、但这些 Key 的桶一个也没落在时间轴上** → 数据与轴不同源。
+  //
+  // 为什么要显式拦住：这种错配的产物是一张「看似正常的空图」——图例照样列出
+  // 子 Key、网格和日期刻度都在，却一根蜡烛都没有，Y 轴还退化成个位数（maxV 没
+  // 任何真实值可参考，回落到 1）。用户无法区分「区间真没数据」与「程序对不上」，
+  // 只能看到「图是空的」（实测反馈）。宁可把错配明说出来，也不画假图。
+  if (!stats.some((s) => s !== null)) {
+    return sdEmptyFrame(axis, "图表数据与时间轴不匹配",
+      "已选中 " + picked.length + " 个子 Key，但其日用量均未落在当前日期区间内（请刷新重试）");
+  }
   let maxV = 1;
   stats.forEach((s) => { if (s && s.max > maxV) maxV = s.max; });
   maxV *= 1.06;

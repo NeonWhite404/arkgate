@@ -72,7 +72,7 @@ function mkTrend(key, pairs) {
   };
 }
 
-// axisOf 复刻页面组件 dayAxis 的槽位构造逻辑（含缺日留空）。
+// axisOf 复刻 share.js 里 dayAxis 的槽位构造逻辑（含缺日留空），步长固定 86400。
 // 第 13 组用例会断言它与 share.js 里的真实实现口径一致，防止两边漂移。
 function axisOf(trends) {
   const seen = {};
@@ -81,13 +81,11 @@ function axisOf(trends) {
   if (!uniq.length) return null;
   const slots = [];
   const last = uniq[uniq.length - 1];
-  const d = new Date(uniq[0] * 1000);
-  let cur = new Date(d.getFullYear(), d.getMonth(), d.getDate());
   for (let g = 0; g < 400; g++) {
-    const ts = Math.floor(cur.getTime() / 1000);
+    const ts = uniq[0] + g * 86400;
+    const cur = new Date(ts * 1000);
     slots.push({ ts: ts, label: (cur.getMonth() + 1) + "/" + cur.getDate(), has: !!seen[ts] });
     if (ts >= last) break;
-    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1);
   }
   return { min: uniq[0], max_t: last, n: slots.length, slots: slots };
 }
@@ -265,15 +263,18 @@ console.log("\n12) 首日无基准时按持平处理（实体极小但存在，�
 
 console.log("\n13) 防漂移：页面组件的 dayAxis 与本校验器的构造口径一致");
 {
-  // 校验器里的 axisOf 是 share.js 里 dayAxis 的复刻。若真实实现改成别的口径
-  // （比如按 ts+86400 推进，那会跨 DST 算错日界线），这里会失败——否则会出现
-  // 「测试全绿但页面仍是旧行为」的假安全感。
+  // 校验器里的 axisOf 是 share.js 里 dayAxis 的复刻。若真实实现改成别的口径，
+  // 这里会失败——否则会出现「测试全绿但页面仍是旧行为」的假安全感。
   const page = fs.readFileSync(path.join(__dirname, "share.js"), "utf8");
   const i = page.indexOf("dayAxis() {");
   ok(i > 0, "share.js 里 dayAxis 存在");
-  const seg = page.slice(i, i + 1600);
-  ok(seg.indexOf("cur.getFullYear(), cur.getMonth(), cur.getDate() + 1") > 0,
-    "dayAxis 用「本地 00:00 + 日号+1」推进（DST 安全），不是 ts+86400");
+  const seg = page.slice(i, i + 1800);
+  // 核心契约：槽 ts = 首桶 ts + n*86400（沿用后端桶值口径）。
+  // 绝不能改回 new Date(y,m,d) 重建——那是导致「图例有子 Key 但零蜡烛」的旧 bug。
+  ok(seg.indexOf("uniq[0] + guard * 86400") > 0,
+    "dayAxis 用「首桶 ts + n*86400」推进（与后端桶值同源，跨时区才对得上）");
+  ok(seg.indexOf("new Date(d.getFullYear(), d.getMonth(), d.getDate())") < 0,
+    "dayAxis **不**用 new Date(y,m,d) 重建槽 ts（按浏览器时区重算会与桶值全部错开）");
   ok(seg.indexOf("sdFilterTrends(this.trends, this.sel)") < 0,
     "dayAxis **不**按选中集合过滤（轴按全部 trends 建，清空选中不拆图框）");
   ok(seg.indexOf("const trends = this.trends;") > 0,
@@ -348,6 +349,39 @@ console.log("\n17) 蜡烛宽度随槽宽伸缩（不写死小值）");
   const wFew = Number((hFew.match(/<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)"/) || [])[1]);
   ok(wMany > 0 && wFew > 0, "两种密度都取到蜡烛宽度");
   ok(wMany < wFew, "槽多时蜡烛更窄（宽度跟槽宽挂钩），而非固定值");
+}
+
+console.log("\n18) 跨时区：槽 ts 必须与后端桶值精确相等（否则零蜡烛）");
+{
+  // 实测 bug：后端用 time.Local 构造「当日本地 00:00 的 UTC 秒」作为桶值，
+  // 而旧 dayAxis 用 new Date(y,m,d) 按**浏览器**时区重建槽 ts。
+  // 服务器 UTC+8 / 浏览器 UTC 时每个槽错开 8 小时，全部对不上 →
+  // 「图例列出了子 Key、却一根蜡烛都没有」（用户看到的现象）。
+  //
+  // 锁定行为：槽 ts 序列必须逐字包含全部桶值，且末槽 ts === 尾桶 ts。
+  const buckets = [1789142400, 1789228800, 1791475200]; // 9/12, 9/13, 10/9（UTC+8 口径）
+  const trends = [{ key: "a", label: "A", buckets: buckets, days: [5, 9, 7] }];
+  const ax = axisOf(trends);
+  const tsSet = ax.slots.map((s) => s.ts);
+  buckets.forEach((b) => ok(tsSet.indexOf(b) >= 0, "桶 " + b + " 在槽序列中（跨时区仍命中）"));
+  eq(tsSet[tsSet.length - 1], buckets[buckets.length - 1], "末槽 ts === 尾桶");
+  // 命中桶数必须等于真实桶数（缺日只会在中间留空，不会把真数据丢掉）
+  eq(ax.slots.filter((s) => s.has).length, buckets.length, "命中桶数 == 真实桶数");
+  eq(ax.slots.length, 28, "9/12→10/9 补齐为 28 槽（中间空白日占位）");
+}
+
+console.log("\n19) 数据与轴错配时必须显式报错，不得静默画空图");
+{
+  // 旧行为：错配时画一张「看似正常的空图」——图例照列、网格刻度都在、
+  // 零蜡烛、Y 轴还退化成个位数。用户无法区分「真没数据」与「程序对不上」。
+  const trends = [{ key: "a", label: "A", buckets: [1000000, 2000000], days: [5, 9] }];
+  const alien = { slots: [{ ts: 1, label: "x" }, { ts: 2, label: "y" }], n: 2 };
+  const h = SD.renderSDTimeline(trends, [], alien, null);
+  ok(h.indexOf("不匹配") > 0, "错配时提示「数据与时间轴不匹配」");
+  eq((h.match(/<rect/g) || []).length, 0, "错配时不画任何蜡烛");
+  // 对照：正常轴必须真的画出来（防止上面的断言因为「永远不会画」而假通过）
+  const good = SD.renderSDTimeline(trends, [], axisOf(trends), null);
+  ok((good.match(/<rect/g) || []).length > 0, "正常轴下确实画出蜡烛（对照）");
 }
 
 console.log("\n" + (failed ? "✗ " + failed + " 项失败" : "✓ 全部通过") + "（通过 " + passed + " 项）");

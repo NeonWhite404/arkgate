@@ -116,27 +116,31 @@ const ShareDetectPage = {
       trends.forEach((t) => (t.buckets || []).forEach((b) => { seen[b] = 1; }));
       const uniq = Object.keys(seen).map((x) => parseInt(x, 10)).sort((a, b) => a - b);
       if (!uniq.length) return null;
-      // 槽序列补齐：从首桶所在本地日起，逐自然日推进到尾桶所在日，中间的空白日
-      // 也占一个槽（缺日留空不补零——「那天没人用」本身就是信息）。
+      // 槽序列补齐：从首桶所在日逐自然日推进到尾桶所在日，中间空白日也占一个槽
+      // （缺日留空不补零——「那天没人用」本身就是信息）。
       //
-      // 用「本地 00:00 构造 + 日号+1」推进而非 ts + 86400：桶值是「本地日 00:00
-      // 的 UTC 秒」，跨 DST 时相邻两天的差值可能是 ±3600，算术加法会算错日界线。
+      // 关键：槽的 ts 必须**沿用后端给过的桶值口径**（后端用 time.Local 构造当日
+      // 本地 00:00 的 UTC 秒），绝不能自己用 new Date(y,m,d) 重算：后者按**浏览器**
+      // 时区构造，浏览器与服务器时区不一致时（服务器 UTC+8、浏览器 UTC 等）每个槽
+      // 都会错开几小时，槽 ts 与桶值永远对不上——表现为「图例列出了子 Key、却一根
+      // 蜡烛都没有」（实测踩坑）。
+      //
+      // 做法：起点直接用首桶 ts，步长固定 86400。日号（label）仅用于显示，由
+      // 本地时间取月/日得出，不参与 ts 计算，因此它错了也不影响蜡烛能否命中。
       const seenSet = {};
       uniq.forEach((u) => { seenSet[u] = 1; });
       const slots = [];
       const last = uniq[uniq.length - 1];
-      let d = new Date(uniq[0] * 1000);
-      let cur = new Date(d.getFullYear(), d.getMonth(), d.getDate());
       // guard 上限 400 天：与后端的区间上限（92 天）同量级，防脏数据把页面卡死。
       for (let guard = 0; guard < 400; guard++) {
-        const ts = Math.floor(cur.getTime() / 1000);
+        const ts = uniq[0] + guard * 86400;
+        const cur = new Date(ts * 1000);
         slots.push({
           ts: ts,
           label: (cur.getMonth() + 1) + "/" + cur.getDate(),
           has: !!seenSet[ts],
         });
         if (ts >= last) break;
-        cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1);
       }
       if (!slots.length) return null;
       return { min: uniq[0], max_t: last, n: slots.length, slots: slots };
