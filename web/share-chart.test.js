@@ -41,7 +41,8 @@ let SD;
 try {
   SD = new Function(PRELUDE + src + `
     return { renderSDTimeline, renderSDScatter, renderSDBox, renderSDFit,
-             sdIsAll, sdFilterTrends, sdSlotStats, sdTrendIndex, sdCandleTitle, fmtReturnPeriod };
+             sdIsAll, sdFilterTrends, sdSlotStats, sdTrendIndex, sdCandleTitle,
+             sdEmptyFrame, fmtReturnPeriod };
   `)();
 } catch (e) {
   console.error("✗ share-chart.js 无法求值（语法错误？）：" + e.message);
@@ -190,18 +191,32 @@ console.log("\n7) SVG 输出：多选不画散点（改为体内分布线），�
   eq((multi.match(/<circle/g) || []).length, 0, "多选：无散点圆");
   ok(multi.indexOf("<rect") > 0, "多选：有蜡烛实体");
   ok(multi.indexOf("体内横线") > 0, "多选：图例说明体内横线");
+  // 实体必须是不透明色块：半透明在毛玻璃背景/深色主题下会被稀成「空心框」，
+  // 看起来就像图没画出来（实测截图确认）。
+  ok(!/fill-opacity/.test(multi), "实体不使用 fill-opacity（避免被背景稀成空心）");
 
   const single = SD.renderSDTimeline(trends, [], ax, ["A"]);
   eq((single.match(/<circle/g) || []).length, 1, "单选：该槽画 1 个点");
   ok(single.indexOf("右侧点") > 0, "单选：图例说明右侧点");
 }
 
-console.log("\n8) 空选中集合给出可操作的提示（不是「暂无数据」）");
+console.log("\n8) 空选中集合保留图框（不再整块消失），且文案可操作");
 {
-  const trends = [mkTrend("A", [[0, 100]])];
+  const trends = [mkTrend("A", [[0, 100]]), mkTrend("B", [[1, 50]])];
   const ax = axisOf(trends);
-  ok(SD.renderSDTimeline(trends, [], ax, []).indexOf("未选择任何子 Key") > 0, "提示「未选择任何子 Key」");
-  ok(SD.renderSDTimeline([], [], null, null).indexOf("暂无数据") > 0, "真无数据才说「暂无数据」");
+  const none = SD.renderSDTimeline(trends, [], ax, []);
+  // 早期版本 return 一句 .empty 文字，页面上表现为「图为空」（实测反馈）。
+  // 现在必须仍是一张完整的图：有 svg、有网格、有日期刻度。
+  ok(none.indexOf("<svg") === 0, "空选仍输出 SVG 图框（不是一句文字）");
+  ok(none.indexOf("未选择任何子 Key") > 0, "图内提示「未选择任何子 Key」");
+  ok(none.indexOf("勾选") > 0, "提示告知如何恢复（可操作）");
+  eq((none.match(/<line/g) || []).length >= 5, true, "网格线仍在（图框完整）");
+  ok(none.indexOf("/") > 0, "X 轴日期刻度仍在（区间有效的可见证据）");
+
+  // 真无数据（区间本身没数据）也不该只剩一行字。
+  const noData = SD.renderSDTimeline([], [], ax, null);
+  ok(noData.indexOf("<svg") === 0, "区间无数据也保留图框");
+  ok(noData.indexOf("所选区间暂无数据") > 0, "图内提示「所选区间暂无数据」");
 }
 
 console.log("\n9) 单槽（区间只有一天）不除零、不崩");
@@ -259,8 +274,10 @@ console.log("\n13) 防漂移：页面组件的 dayAxis 与本校验器的构造�
   const seg = page.slice(i, i + 1600);
   ok(seg.indexOf("cur.getFullYear(), cur.getMonth(), cur.getDate() + 1") > 0,
     "dayAxis 用「本地 00:00 + 日号+1」推进（DST 安全），不是 ts+86400");
-  ok(seg.indexOf("sdFilterTrends(this.trends, this.sel)") > 0,
-    "dayAxis 按选中集合过滤（这是「随选中刷新」的根）");
+  ok(seg.indexOf("sdFilterTrends(this.trends, this.sel)") < 0,
+    "dayAxis **不**按选中集合过滤（轴按全部 trends 建，清空选中不拆图框）");
+  ok(seg.indexOf("const trends = this.trends;") > 0,
+    "dayAxis 用全部 trends 构造槽位");
 }
 
 console.log("\n14) 依赖边界：图表层不自带全局工具，页面层不重复定义图表函数");
@@ -281,6 +298,20 @@ console.log("\n14) 依赖边界：图表层不自带全局工具，页面层不�
   const pPage = idx.indexOf("/share.js");
   ok(pChart > 0 && pPage > 0, "index.html 同时加载两个文件");
   ok(pChart < pPage, "share-chart.js 先于 share.js 加载（后者依赖前者）");
+}
+
+console.log("\n15) 语法与完整性自检");
+{
+  // 本文件把 share-chart.js 当**字符串**求值，如果源文件语法坏了，
+  // 上面的 new Function 会直接抛错（已有 try/catch 报错并退出）。
+  // 这里额外确认关键函数都真的存在（防被误删后仍“恰好”能求值）。
+  ["renderSDTimeline", "renderSDScatter", "renderSDBox", "renderSDFit", "sdEmptyFrame"].forEach((fn) => {
+    ok(typeof SD[fn] === "function", fn + " 可调用");
+  });
+  // 空图框必须自带 svg 包裹并对成对标签（它现在直接返回整张图）。
+  const f = SD.sdEmptyFrame({ slots: [{ ts: 0, label: "1/1" }] }, "msg", "hint");
+  ok(f.indexOf("<svg") === 0 && f.indexOf("</svg>") > 0, "sdEmptyFrame 输出完整 svg");
+  ok(f.indexOf("msg") > 0 && f.indexOf("hint") > 0, "sdEmptyFrame 带上提示与引导文案");
 }
 
 console.log("\n" + (failed ? "✗ " + failed + " 项失败" : "✓ 全部通过") + "（通过 " + passed + " 项）");

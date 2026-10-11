@@ -544,7 +544,11 @@ html.has-bg .card, html.has-bg .stat-card, html.has-bg .drawer {
   background: color-mix(in srgb, var(--color-bg-1) 86%, transparent); backdrop-filter: blur(8px); }
 html.has-bg .sidebar { background: color-mix(in srgb, var(--color-bg-1) 92%, transparent); }
 html.has-bg .login-card { background: color-mix(in srgb, var(--color-bg-1) 84%, transparent); }
-html.has-bg .table-wrap table, html.has-bg .chart-wrap svg { opacity: .96; }
+html.has-bg .table-wrap table { opacity: .96; }
+/* 图表不叠背景图透明度：蜡烛/柱子靠色块表达，再乘一层透明度会被毛玻璃背景
+   稀成「空心描边」，看起来像图没画出来（实测截图确认）。给 svg 一层不透明底，
+   让数据区彻底与背景图脱钩。 */
+html.has-bg .chart-wrap svg { background: var(--color-bg-1); border-radius: 6px; }
 
 /* ── 动效 ───────────────────────────────────────────────────────────────── */
 .page-enter-active, .page-leave-active,

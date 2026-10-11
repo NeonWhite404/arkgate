@@ -204,14 +204,30 @@ function renderSDBox(groups, fit) {
 // axis 由调用方（页面组件 dayAxis）按选中集合预计算，故本函数是纯函数。
 function renderSDTimeline(trends, groups, axis, selKeys) {
   const picked = sdFilterTrends(trends, selKeys);
+  // 空选中集合**不拆掉图框**：保留坐标轴与网格，只在绘图区中心给一句提示。
+  //
+  // 早期版本直接 return 一个 .empty 提示块，页面上表现为「图表整块消失」——
+  // 用户点「清空」后看到的就是「图为空」，看上去像功能坏了（实测反馈）。
+  // 保留图框后，「清空 = 把所有子 Key 从图上移除」是可读的，也留住了 X 轴的
+  // 日期刻度作为「区间有效」的参考系，便于对照再逐个勾回来的过程。
+  const all = trends || [];
   if (!picked.length) {
-    return '<div class="empty">' + (sdIsAll(selKeys, trends) ? '所选区间暂无数据' : '未选择任何子 Key——请在上方选择要显示的子 Key') + '</div>';
+    if (!axis || !axis.slots.length) {
+      return '<div class="empty">所选区间暂无数据</div>';
+    }
+    const nothing = sdIsAll(selKeys, all);
+    return sdEmptyFrame(axis,
+      nothing ? "所选区间暂无数据" : "未选择任何子 Key",
+      nothing ? "" : "在上方「选择」里勾选子 Key，或点「全部」");
   }
   if (!axis || !axis.slots.length) return '<div class="empty">所选区间暂无数据</div>';
   const byKey = {};
   (groups || []).forEach((g) => { byKey[g.key] = g; });
 
-  const W = 820, H = 300, padL = 56, padR = 24, padT = 14, padB = 30;
+  // padR = 104：右侧要放「颜色块 + 子 Key 名（最多 7 字）」的图例标注。
+  // 早期用了 24px（沿用旧折线图：那时标签是画在绘图区内部的），
+  // 结果中文名被裁成「te」「ss」「fx」这种无法辨认的片段（实测截图确认）。
+  const W = 820, H = 300, padL = 56, padR = 104, padT = 14, padB = 30;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const slots = axis.slots;
   const n = slots.length;
@@ -265,9 +281,11 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
     // 影线：到该槽 min/max（选中集合口径）。
     svg += '<line x1="' + x.toFixed(1) + '" y1="' + yOf(s.max).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yOf(s.min).toFixed(1) +
       '" stroke="' + color + '" stroke-width="1"/>';
-    // 实体（半透明，让体内的分布竖线可见）。
+    // 实体：用**实心填充**（不用半透明）。
+    // 半透明在深色主题与背景图毛玻璃下会被稀成「空心描边」，几条蜡烛看上去像空框
+    // （实测截图确认）。体内的分布信息改用「体内横线」表达，不靠透明度叠加。
     svg += '<rect x="' + (x - candleW / 2).toFixed(1) + '" y="' + yTop.toFixed(1) + '" width="' + candleW.toFixed(1) +
-      '" height="' + bodyH.toFixed(1) + '" fill="' + color + '" fill-opacity="0.55" stroke="' + color + '" stroke-width="1">' +
+      '" height="' + bodyH.toFixed(1) + '" fill="' + color + '" stroke="' + color + '" stroke-width="0.5" rx="0.5">' +
       '<title>' + escHtml(sdCandleTitle(slots[i], s, botV, single)) + '</title></rect>';
 
     if (single) {
@@ -275,10 +293,15 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
       svg += '<circle cx="' + (x + candleW / 2 + 3).toFixed(1) + '" cy="' + yOf(s.total).toFixed(1) + '" r="2" fill="' + color +
         '"><title>' + escHtml(sdCandleTitle(slots[i], s, botV, true)) + '</title></circle>';
     } else {
-      // 多选：实体内部的取值分布竖线（每子 Key 一条，极淡；重叠即「值集中」）。
+      // 多选：体内横向细线 = 各子 Key 当日的取值（重叠即「值集中」）。
+      // 实体是实心的，所以线用白色（深色主题下仍可辨）而非黑，且只在**实体内部**
+      // 的取值上才画 —— 超出实体的值（低于实体底或高于实体顶）画在外面反而
+      // 会被误读为影线，交由 tooltip 给出。
+      const bodyTop = Math.min(topV, botV), bodyBot = Math.max(topV, botV);
       s.items.forEach((it) => {
+        if (it.v < bodyTop || it.v > bodyBot) return;
         svg += '<line x1="' + (x - candleW / 2).toFixed(1) + '" y1="' + yOf(it.v).toFixed(1) + '" x2="' + (x + candleW / 2).toFixed(1) +
-          '" y2="' + yOf(it.v).toFixed(1) + '" stroke="#111827" stroke-opacity="0.22"/>';
+          '" y2="' + yOf(it.v).toFixed(1) + '" stroke="#ffffff" stroke-opacity="0.65"/>';
       });
     }
   });
@@ -290,7 +313,11 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
       (slots[k].label || "") + '</text>';
   }
 
-  // 右侧标注：命中判据 / 粗筛偏高的组 + 最多 4 个其它组（图例式，省掉独立图例块）。
+  // 右侧标注：命中判据 / 粗筛偏高的组优先，再补其它组。
+  //
+  // 名字截断到 7 字（而不是更短）——截到 4 字时中文名只剩「三重…」这种无法分辨的
+  // 前缀（库里真有同名子 Key），图例就失去意义了。padR 已按 7 字宽度预留。
+  // 空间不够时宁可少列几项（剩余数量另行标注），也不把名字截到不可读。
   const labeled = picked.filter((t) => {
     const g = byKey[t.key];
     return g && (g.flag === "flagged" || g.flag === "excluded");
@@ -311,7 +338,7 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
   });
   if (labeled.length > maxLabels) {
     svg += '<text x="' + (W - padR + 2) + '" y="' + ly + '" font-size="9" fill="#86909c">+' +
-      (labeled.length - maxLabels) + ' 个</text>';
+      (labeled.length - maxLabels) + ' 个未标注</text>';
   }
   svg += "</svg>";
 
@@ -338,6 +365,40 @@ function sdFilterTrends(trends, selKeys) {
   const set = {};
   (selKeys || []).forEach((k) => { set[k] = 1; });
   return all.filter((t) => set[t.key]);
+}
+
+// sdEmptyFrame 画一个「空但完整」的图框：网格、日期刻度都在，中心是一句提示。
+// 用于「区间有效但当前没有可画的数据 / 未选任何子 Key」。
+//
+// 与直接 return 一句文字的区别：后者让整张图在页面上消失，用户无法区分
+// 「功能坏了」、「区间真没数据」、「我把子 Key 全取消了」三种情况。
+function sdEmptyFrame(axis, msg, hint) {
+  const W = 820, H = 300, padL = 56, padR = 24, padT = 14, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const slots = (axis && axis.slots) || [];
+  const n = slots.length || 1;
+  const slotW = plotW / n;
+  const xCenter = (i) => padL + slotW * (i + 0.5);
+
+  let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
+    '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + plotH * (i / 4);
+    svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
+  }
+  // 日期刻度照旧画：它是「区间有效、只是没东西可画」的可见证据。
+  const step = Math.max(1, Math.floor(n / 8));
+  for (let k = 0; k < n; k += step) {
+    svg += '<text x="' + xCenter(k).toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' +
+      ((slots[k] && slots[k].label) || "") + '</text>';
+  }
+  const cx = padL + plotW / 2, cy = padT + plotH / 2;
+  svg += '<text x="' + cx.toFixed(1) + '" y="' + (cy - 4).toFixed(1) + '" font-size="13" fill="#86909c" text-anchor="middle">' + escHtml(msg) + '</text>';
+  if (hint) {
+    svg += '<text x="' + cx.toFixed(1) + '" y="' + (cy + 16).toFixed(1) + '" font-size="11" fill="#a9aeb8" text-anchor="middle">' + escHtml(hint) + '</text>';
+  }
+  svg += "</svg>";
+  return svg;
 }
 
 // sdSlotStats 汇总一个槽位上所有选中子 Key 的当日值。

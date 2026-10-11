@@ -93,7 +93,9 @@ const ShareDetectPage = {
           return {
             key: t.key, label: t.label || t.key,
             flag: g ? g.flag : "insufficient",
-            rp: g && isFinite(g.return_period_days) ? g.return_period_days : -1,
+            // 返回期可能是「外推上界」（后端用 1e12 这类哨兵值表示无限），
+            // 直接格式化会得到「1000000000000 天」这种读数。超过 1e9 视为无限。
+            rp: g && isFinite(g.return_period_days) && g.return_period_days < 1e9 ? g.return_period_days : -1,
             median: g ? g.level_median : 0,
             days: g ? g.days : (t.buckets || []).length,
           };
@@ -101,14 +103,15 @@ const ShareDetectPage = {
         .filter((x) => !q || String(x.label).toLowerCase().indexOf(q) >= 0)
         .sort((a, b) => b.rp - a.rp);
     },
-    // 趋势图的时间轴：**槽位化**——以区间内每个自然日为一个槽（按选中集合
-    // 过滤后取并集），缺日留空槽不补零。
+    // 趋势图的时间轴：**槽位化**——以区间内每个自然日为一个槽，缺日留空槽不补零。
     //
-    // 为什么不用渲染器内部的索引：线/蜡烛要按日期对齐，各 trend 的 buckets
-    // 长度可能不同（某 Key 某天没用），必须由轴定义统一的槽序列，
-    // 再把每个 trend 的值映射到槽下标上。
+    // 时间轴按**全部** trends 构造（不受选中集合影响），这是有意的：
+    //   - 勾选/取消子 Key 时 X 轴不应跳动（轴跟着选择变，就没有「对比前后两张图」的基准）；
+    //   - 清空选中后轴仍存在，图框不会消失——否则点「清空」会看到整张图消失，
+    //     看上去像功能坏了（实测反馈的「图为空」就是这个）。
+    // Y 轴量程仍按选中集合算（那是「看谁就按谁定标」），两者职责不同。
     dayAxis() {
-      const trends = sdFilterTrends(this.trends, this.sel);
+      const trends = this.trends;
       const seen = {};
       trends.forEach((t) => (t.buckets || []).forEach((b) => { seen[b] = 1; }));
       const uniq = Object.keys(seen).map((x) => parseInt(x, 10)).sort((a, b) => a - b);
@@ -321,7 +324,7 @@ const ShareDetectPage = {
         <div class="sd-pick-list" v-if="selOpen">
           <button v-for="s in selList" :key="s.key" class="sd-pick-item"
                   :class="{on: selAll || selSet[s.key]}" @click="sdToggle(s.key)"
-                  :title="s.label + ' · ' + (flagMeta({flag:s.flag}).label) + ' · 返回期 ' + (s.rp >= 0 ? fmtInt(s.rp) : '—') + ' 天 · 中位 ' + fmtInt(Math.round(s.median)) + '/天'">
+                  :title="s.label + ' · ' + (flagMeta({flag:s.flag}).label) + ' · 返回期 ' + (s.rp >= 0 ? fmtInt(s.rp) + ' 天' : '外推上界（等同于无限）') + ' · 中位 ' + fmtInt(Math.round(s.median)) + '/天'">
             <span class="sd-pick-dot" :style="{background: selColor(s.key)}"></span>
             <span class="sd-pick-name">{{ s.label }}</span>
             <span class="sd-pick-rp" v-if="s.flag === 'flagged' || s.flag === 'excluded'">★</span>
