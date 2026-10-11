@@ -231,9 +231,12 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const slots = axis.slots;
   const n = slots.length;
-  // 槽位宽度：固定网格（缺日留空槽），蜡烛不超过槽宽 62%，也不太胖。
   const slotW = plotW / n;
-  const candleW = Math.max(2, Math.min(slotW * 0.62, 16));
+  // 槽宽 = 绘图区 / 槽数；蜡烛宽度上限设为槽宽的 78%，且不超过 22px。
+  // 上限写死成较小值（旧为 16px）会让槽多的区间里蜡烛很细——实测 31 个槽时
+  // 蜡烛只有 13px，叠在网格里几乎看不出实体。改为跟槽宽挂钩后，蜡烛在
+  // 任何槽密度下都能维持「比缝隙宽」的观感。
+  const candleW = Math.max(2, Math.min(slotW * 0.78, 22));
   const xCenter = (i) => padL + slotW * (i + 0.5);
 
   // 每个槽的合计值（选中集合）与各子 Key 明细。无数据的槽为 null（不画）。
@@ -250,7 +253,7 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
     const v = maxV * (1 - i / 4);
     const y = padT + plotH * (i / 4);
     svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
-    svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">' + fmtInt(Math.round(v)) + '</text>';
+    svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">' + sdAxisLabel(v) + '</text>';
   }
 
   // 槽位分隔（极淡竖线）：没有它，缺日留空的槽看起来像蜡烛间随机间距。
@@ -365,6 +368,23 @@ function sdFilterTrends(trends, selKeys) {
   const set = {};
   (selKeys || []).forEach((k) => { set[k] = 1; });
   return all.filter((t) => set[t.key]);
+}
+
+// sdAxisLabel 坐标轴刻度文案：按量级自适应精度。
+//
+// 为什么不能直接用 fmtInt：刻度值是 maxV 的四等分，量级小时必然是小数。
+// 旧实现一律四舍五入到整数，maxV=1 时会得到「1/1/1/0/0」——五个刻度看起来
+// 一样（实测发生过），图看起来就像没画出来，也完全无法读数。
+// 规则：数值 >= 100 取整；>= 10 取一位小数；否则两位小数。
+// 千分位仍交给 fmtInt（>=100 的分支），小数分支自己补位。
+function sdAxisLabel(v) {
+  if (!isFinite(v)) return "";
+  const a = Math.abs(v);
+  if (a >= 100) return fmtInt(Math.round(v));
+  if (a >= 10) return v.toFixed(1).replace(/\.0$/, "");
+  if (a >= 1) return v.toFixed(1);
+  if (a === 0) return "0";
+  return v.toFixed(2);
 }
 
 // sdEmptyFrame 画一个「空但完整」的图框：网格、日期刻度都在，中心是一句提示。

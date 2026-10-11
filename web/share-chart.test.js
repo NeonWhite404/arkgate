@@ -42,7 +42,7 @@ try {
   SD = new Function(PRELUDE + src + `
     return { renderSDTimeline, renderSDScatter, renderSDBox, renderSDFit,
              sdIsAll, sdFilterTrends, sdSlotStats, sdTrendIndex, sdCandleTitle,
-             sdEmptyFrame, fmtReturnPeriod };
+             sdEmptyFrame, sdAxisLabel, fmtReturnPeriod };
   `)();
 } catch (e) {
   console.error("✗ share-chart.js 无法求值（语法错误？）：" + e.message);
@@ -312,6 +312,42 @@ console.log("\n15) 语法与完整性自检");
   const f = SD.sdEmptyFrame({ slots: [{ ts: 0, label: "1/1" }] }, "msg", "hint");
   ok(f.indexOf("<svg") === 0 && f.indexOf("</svg>") > 0, "sdEmptyFrame 输出完整 svg");
   ok(f.indexOf("msg") > 0 && f.indexOf("hint") > 0, "sdEmptyFrame 带上提示与引导文案");
+}
+
+console.log("\n16) 坐标轴刻度不得退化成「1/1/1/0/0」（量级小时仍可读数）");
+{
+  // 实测发生的 bug：刻度值是 maxV 的四等分，用 fmtInt 四舍五入后
+  // maxV=1 时得到 1/1/1/0/0——五个刻度看起来一样，图好像没画出来。
+  eq(SD.sdAxisLabel(0), "0", "数值 0 → \"0\"");
+  ok(SD.sdAxisLabel(0.25) !== SD.sdAxisLabel(0.5), "0.25 与 0.5 不同（不再被舍入成同一个数）");
+  ok(SD.sdAxisLabel(0.5) !== SD.sdAxisLabel(1), "0.5 与 1 不同");
+  eq(SD.sdAxisLabel(1824), "1824", "大整数不带小数");
+  eq(SD.sdAxisLabel(45.5), "45.5", "中间量级保留一位小数");
+
+  // 端到端：maxV=1 的蜡烛图，五个刻度必须**互不相同**。
+  const trends = [mkTrend("A", [[0, 1]])];
+  const ax = axisOf(trends);
+  const h = SD.renderSDTimeline(trends, [], ax, null);
+  const labels = (h.match(/text-anchor="end">([^<]*)</g) || []).map((s) => s.replace(/.*>/, ""));
+  eq(labels.length, 5, "Y 轴 5 个刻度");
+  eq(new Set(labels).size, 5, "5 个刻度文案互不相同（旧实现会退化成 1/1/1/0/0）");
+}
+
+console.log("\n17) 蜡烛宽度随槽宽伸缩（不写死小值）");
+{
+  // 旧实现上限写死 16px，实测 31 槽时蜡烛仅 13px，叠在网格里几乎看不出实体。
+  const wide = [mkTrend("A", [[0, 100], [1, 90]])];
+  const narrow = [];
+  const day = 86400;
+  for (let i = 0; i < 2; i++) narrow.push(mkTrend("A" + i, [[i, 50 + i]]));
+  // 构造 31 个连续日的单 Key 序列
+  const many = [mkTrend("A", Array.from({ length: 31 }, (_, i) => [30 - i, 100 + i]))];
+  const hMany = SD.renderSDTimeline(many, [], axisOf(many), null);
+  const wMany = Number((hMany.match(/<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)"/) || [])[1]);
+  const hFew = SD.renderSDTimeline(wide, [], axisOf(wide), null);
+  const wFew = Number((hFew.match(/<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)"/) || [])[1]);
+  ok(wMany > 0 && wFew > 0, "两种密度都取到蜡烛宽度");
+  ok(wMany < wFew, "槽多时蜡烛更窄（宽度跟槽宽挂钩），而非固定值");
 }
 
 console.log("\n" + (failed ? "✗ " + failed + " 项失败" : "✓ 全部通过") + "（通过 " + passed + " 项）");
