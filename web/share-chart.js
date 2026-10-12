@@ -10,7 +10,7 @@
  * 图表总览：
  *   1. renderSDScatter  极值判据散点（主判据：返回期 × 波动 CV）
  *   2. renderSDBox      量级对比箱线
- *   3. renderSDTimeline 日用量蜡烛图（本文件的核心，见下方大段注释）
+ *   3. renderSDCandles 日用量蜡烛图（本文件的核心，见下方大段注释）
  *   4. renderSDFit      分布拟合（GPD 外推）
  *
  * 依赖的全局工具（app.js 提供，本文件不自己定义）：
@@ -97,7 +97,7 @@ function renderSDScatter(groups, fit, cvf, params) {
     if (x > W - padR) x = W - padR;
     const y = yOf(g.cv);
     const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
+    const color = flagged ? "#b91c1c" : PIE_COLORS[groupSlot(g.key, groups)];
     if (flagged) {
       svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="14" fill="#b91c1c" fill-opacity=".16"/>';
     }
@@ -159,8 +159,8 @@ function renderSDBox(groups, fit) {
   rows.forEach((g, i) => {
     const y = padT + i * 26 + 13;
     const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
-    const label = truncText(g.label || g.key, 13);
+    const color = flagged ? "#b91c1c" : PIE_COLORS[groupSlot(g.key, rows)];
+    const label = legendName(g, rows);
     svg += '<text x="' + (padL - 10) + '" y="' + (y + 4) + '" font-size="11" fill="#4e5969" text-anchor="end">' +
       escHtml(label) + (flagged ? " ★" : "") + '</text>';
     // P10~P90 范围条（用 level_p90 与中位数对称近似下限，避免后端再传一列）。
@@ -179,107 +179,103 @@ function renderSDBox(groups, fit) {
   svg += "</svg>";
   return svg;
 }
+// renderSDCandles 真正的 MT 蜡烛图：每个自然日一根蜡烛，OHLC 来自**日内小时桶**。
+//
+// 与旧的「相邻有数据日比较」口径的根本区别（也是旧实现被删掉的原因）：
+//   - 旧图：实体 = [前一有数据日合计, 本日合计]，影线 = 各子 Key 当日的 min/max。
+//     两者量纲不同（单 Key vs 合计），影线会低垂到蜡烛脚下很远。
+//   - 新图：实体 = [开, 收]，影线 = [低, 高]，四个值都来自同一个日内小时序列，
+//     同量纲，low <= O,C <= high 必然成立，影线天然包住实体。
+//
+// 单位 = 请求数（与旧图一致）。多选子 Key 时，把各子 Key 同日的小时桶**逐小相加**
+// 再算 OHLC——这样得到的才是「分发总量」的日内形状；若先算各 Key 的 OHLC 再相加，
+// 会得到一组互不对应的高低点（第一个 Key 的 High 时刻未必是总量的 High 时刻）。
+function renderSDCandles(groups, sgroups, axis, selKeys) {
+  const all = groups || [];
+  const picked = selKeys === null || selKeys === undefined
+    ? all.slice()
+    : all.filter((g) => selKeys.indexOf(g.key) >= 0);
 
-// ── 图表 3（趋势视角）：多子 Key 日用量蜡烛图 ──
-//
-// 文档「图 1」。这张图回答的是散点图回答不了的问题：**偶发尖峰 vs 持续高位**。
-// 分发必然是后者（整条线抬升且平稳），单点突起很常见、不必紧张。
-//
-// 形态（2026-10 改造，替换原先的多折线）：每个时间槽一根**蜡烛**——
-//   实体底 = 前一个「有数据的槽」的合计值、实体顶 = 本槽合计值，影线到本槽的 min/max。
-//   涨（顶 > 底）用红、跌用绿（MetaTrader 习惯：红涨绿跌）。
-// 为什么不是多折线：子 Key 多时线数超过调色板容量必然撞色，且细线互相压盖，
-// 「哪条是谁的」在图上根本读不出来。蜡烛把「当日总量」变成一个可比的形状，
-// 子 Key 的数量不再影响可读性。
-//
-// 点（每个选中子 Key 在该槽的原始日量）：
-//   - 单选时画在蜡烛**右侧**（此时用户就是要看这个 Key 的逐日形态，实体当参照线）；
-//   - 多选时不画散点，改为把每个子 Key 的值以**极淡的竖线**画在实体内部
-//     （构成「实体内部的取值分布」，不额外占用横向空间、也不产生第二套配色）。
-//
-// 合计口径：该槽所有「选中子 Key」当日请求数之和。选中集合变化 → 蜡烛形状与
-// Y 轴量程同步重算（这是需求「随选中的子 key 刷新」的落点）。
-//
-// selKeys 为 null 表示全选（默认视角）；否则是选中集合（数组）。
-// axis 由调用方（页面组件 dayAxis）按选中集合预计算，故本函数是纯函数。
-function renderSDTimeline(trends, groups, axis, selKeys) {
-  const picked = sdFilterTrends(trends, selKeys);
-  // 空选中集合**不拆掉图框**：保留坐标轴与网格，只在绘图区中心给一句提示。
-  //
-  // 早期版本直接 return 一个 .empty 提示块，页面上表现为「图表整块消失」——
-  // 用户点「清空」后看到的就是「图为空」，看上去像功能坏了（实测反馈）。
-  // 保留图框后，「清空 = 把所有子 Key 从图上移除」是可读的，也留住了 X 轴的
-  // 日期刻度作为「区间有效」的参考系，便于对照再逐个勾回来的过程。
-  const all = trends || [];
-  if (!picked.length) {
-    if (!axis || !axis.slots.length) {
-      return '<div class="empty">所选区间暂无数据</div>';
-    }
-    const nothing = sdIsAll(selKeys, all);
-    return sdEmptyFrame(axis,
-      nothing ? "所选区间暂无数据" : "未选择任何子 Key",
-      nothing ? "" : "在上方「选择」里勾选子 Key，或点「全部」");
-  }
-  if (!axis || !axis.slots.length) return '<div class="empty">所选区间暂无数据</div>';
-  const byKey = {};
-  (groups || []).forEach((g) => { byKey[g.key] = g; });
-
-  // padR = 104：右侧要放「颜色块 + 子 Key 名（最多 7 字）」的图例标注。
-  // 早期用了 24px（沿用旧折线图：那时标签是画在绘图区内部的），
-  // 结果中文名被裁成「te」「ss」「fx」这种无法辨认的片段（实测截图确认）。
   const W = 820, H = 300, padL = 56, padR = 104, padT = 14, padB = 30;
   const plotW = W - padL - padR, plotH = H - padT - padB;
-  const slots = axis.slots;
+  const slots = (axis && axis.slots) || [];
   const n = slots.length;
-  const slotW = plotW / n;
-  // 槽宽 = 绘图区 / 槽数；蜡烛宽度上限设为槽宽的 78%，且不超过 22px。
-  // 上限写死成较小值（旧为 16px）会让槽多的区间里蜡烛很细——实测 31 个槽时
-  // 蜡烛只有 13px，叠在网格里几乎看不出实体。改为跟槽宽挂钩后，蜡烛在
-  // 任何槽密度下都能维持「比缝隙宽」的观感。
-  const candleW = Math.max(2, Math.min(slotW * 0.78, 22));
-  const xCenter = (i) => padL + slotW * (i + 0.5);
 
-  // 每个槽的合计值（选中集合）与各子 Key 明细。无数据的槽为 null（不画）。
-  const idx = sdTrendIndex(picked, slots);
-  const stats = slots.map((_, i) => sdSlotStats(picked, idx, i));
-
-  // 自检：**有选中的子 Key、但这些 Key 的桶一个也没落在时间轴上** → 数据与轴不同源。
-  //
-  // 为什么要显式拦住：这种错配的产物是一张「看似正常的空图」——图例照样列出
-  // 子 Key、网格和日期刻度都在，却一根蜡烛都没有，Y 轴还退化成个位数（maxV 没
-  // 任何真实值可参考，回落到 1）。用户无法区分「区间真没数据」与「程序对不上」，
-  // 只能看到「图是空的」（实测反馈）。宁可把错配明说出来，也不画假图。
-  if (!stats.some((s) => s !== null)) {
-    return sdEmptyFrame(axis, "图表数据与时间轴不匹配",
-      "已选中 " + picked.length + " 个子 Key，但其日用量均未落在当前日期区间内（请刷新重试）");
+  if (!picked.length) {
+    return sdEmptyFrame(axis, "未选择任何子 Key", "在上方「选择」里勾选子 Key，或点「全部」");
   }
-  // Y 轴量程：不仅要覆盖每个槽的 max/min，还要覆盖**蜡烛实体的另一个端点**。
-  //
-  // 实体纵向跨度是 [本槽合计 total, 上一个有数据的槽合计 prev]，而 prev 可能
-  // 比当前区间任何槽的 max 都大（典型：区间首日的前一天量特别高）。只按 s.max
-  // 定量程时 yOf(prev) 会被 Math.min(v, maxV) 夹到顶部，实体塌成 1.2px 贴在最
-  // 上边——而影线仍按 s.min/s.max 正确定位，于是出现「柱子在线外面」的错位
-  // （实测截图确认）。两侧统计必须同一把尺。
-  const totalsForScale = [];
-  {
-    let p = null;
-    stats.forEach((s) => {
-      if (!s) return;
-      if (p !== null) totalsForScale.push(p);
-      totalsForScale.push(s.total);
-      p = s.total;
+  if (!n) {
+    return sdEmptyFrame(axis, "当前区间没有可画的日", "试试放宽日期区间");
+  }
+
+  // 把选中子 Key 的蜡烛按日桶归集，后面在小时粒度上合并。
+  const byBucket = {};
+  picked.forEach((g) => {
+    (g.candles || []).forEach((c) => {
+      if (!byBucket[c.bucket]) byBucket[c.bucket] = [];
+      byBucket[c.bucket].push(c);
     });
-  }
-  let maxV = 1;
-  stats.forEach((s) => {
-    if (!s) return;
-    if (s.max > maxV) maxV = s.max;
-    if (s.total > maxV) maxV = s.total;
   });
-  totalsForScale.forEach((v) => { if (v > maxV) maxV = v; });
-  // 影线要画到 s.min，但 min 不会超过 maxV，无需额外放宽。
+
+  // 合并口径：把各子 Key 的**日内小时序列逐小时相加**，再从合计序列取 OHLC。
+  //
+  // 绝不能改成"各 Key 的 High 相加、Low 相加"：两个 Key 的峰值不在同一小时时
+  // 会严重高估总量峰值（实测例：A 在 10 时 100/12 时 1，B 在 10 时 1/12 时 100
+  // → 逐小时相加的真实峰值 101，而 ΣHigh = 200）。周一并相加同样错：各 Key
+  // 的"首个小时"可能是不同的小时，相加后的开/收都没有对应的小时。
+  // 所以一律回到小时粒度——只有它在多选时仍然有确切含义。
+  const merged = slots.map((s) => {
+    const list = byBucket[s.ts];
+    if (!list) return null;
+    const hourly = new Array(24).fill(0);
+    list.forEach((c) => {
+      const h = c.hourly || [];
+      for (let i = 0; i < 24; i++) hourly[i] += h[i] || 0;
+    });
+    // 只有确实有请求的小时入样。
+    // 不能把 0 当作"当日低点"：凌晨天然没流量的时段会把每根蜡烛的影线
+    // 都拉到 0，影线就失去"当日波动"的含义。
+    const vals = hourly.filter((v) => v > 0);
+    if (!vals.length) return null;
+    const firstH = hourly.findIndex((v) => v > 0);
+    let lastH = 23;
+    while (lastH > 0 && !(hourly[lastH] > 0)) lastH--;
+    let sum = 0;
+    for (let i = 0; i < vals.length; i++) sum += vals[i];
+    return {
+      open: hourly[firstH], close: hourly[lastH],
+      high: Math.max.apply(null, vals), low: Math.min.apply(null, vals),
+      total: sum, hb: vals.length, items: list,
+    };
+  });
+
+  if (!merged.some((m) => m !== null)) {
+    // 区分两种"空"：
+    //   - 选中的子 Key 确实在区间内没有任何蜡烛 → 真的没数据；
+    //   - 有蜡烛，但没一根落在轴上 → 轴与数据错配（程序 bug，
+    //     典型原因是槽 ts 用了与后端不同的时区口径）。
+    // 后者必须显式报错：静默画一张"看似正常的空图"（图例照列、网格刻度都在、
+    // 零蜡烛、Y 轴还退化成个位数）会让用户无法区分"真没数据"与"程序对不上"，
+    // 这正是之前踩过的坑，故在此守住。
+    const total = picked.reduce((a, g) => a + (g.candles || []).length, 0);
+    if (total > 0) {
+      return sdEmptyFrame(axis, "图表数据与时间轴不匹配",
+        "选中 " + picked.length + " 个子 Key、共 " + total + " 根蜡烛，但无一落在当前时间轴上");
+    }
+    return sdEmptyFrame(axis, "当前区间没有用量数据",
+      "已选中 " + picked.length + " 个子 Key，但这些天都没有请求记录");
+  }
+
+  let maxV = 1;
+  merged.forEach((m) => { if (m && m.high > maxV) maxV = m.high; });
   maxV *= 1.06;
   const yOf = (v) => padT + plotH * (1 - Math.min(v, maxV) / maxV);
+  const slotW = plotW / n;
+  const xCenter = (i) => padL + slotW * (i + 0.5);
+  // 蜡烛宽度：真蜡烛的实体只是当日开/收的价格区间，不宜像旧图那样占满槽宽
+  // （旧图实体是"合计区间"，接近满宽才像柱状图）。0.62 倍槽宽（上限 18px）
+  // 在 28 槽下约 12px，比例接近 MT；影线是 1px 竖线，自然比实体细。
+  const candleW = Math.max(2, Math.min(slotW * 0.62, 18));
 
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
     '" preserveAspectRatio="xMidYMid meet" style="max-width:100%">';
@@ -289,72 +285,63 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
     svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e5e7eb"/>';
     svg += '<text x="' + (padL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" font-size="9" fill="#86909c" text-anchor="end">' + sdAxisLabel(v) + '</text>';
   }
-
-  // 槽位分隔（极淡竖线）：没有它，缺日留空的槽看起来像蜡烛间随机间距。
   for (let i = 1; i < n; i++) {
     const x = padL + slotW * i;
     svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#f2f3f5"/>';
   }
 
-  // 蜡烛：实体底 = 上一个「有数据的槽」的合计，实体顶 = 本槽合计。
-  // prev 只在遇到有数据的槽时推进——中间的空档不参与比较（否则「隔了 3 天」
-  // 的涨跌会被当成相邻两日的涨跌，语义是错的）。
-  let prev = null;
-  const single = picked.length === 1;
-  const hit = []; // 右侧标注：命中判据的关键组
-  stats.forEach((s, i) => {
-    if (!s) return;
-    const topV = s.total;
-    const botV = prev === null ? s.total : prev;
-    prev = s.total;
-    const up = topV > botV;                       // 涨：红（MT 习惯红涨绿跌）
-    const flat = topV === botV;
-    const color = flat ? "#86909c" : up ? "#dc2626" : "#10b981";
+  merged.forEach((m, i) => {
+    if (!m) return;
     const x = xCenter(i);
-    const yTop = yOf(Math.max(topV, botV));
-    const yBot = yOf(Math.min(topV, botV));
-    const bodyH = Math.max(1.2, yBot - yTop);      // 平盘时给 1.2px，否则实体消失
-
-    // 影线：到该槽 min/max（选中集合口径）。
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + yOf(s.max).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yOf(s.min).toFixed(1) +
+    const up = m.close > m.open;
+    const flat = m.close === m.open;
+    const color = flat ? "#86909c" : up ? "#dc2626" : "#10b981";
+    // 影线：低~高（同量纲，必包住实体）。
+    //
+    // 坐标一律先量化到 0.1px（与 SVG 实际写出的一致）再参与几何计算：
+    // 直接对未量化的浮点算包含关系、最后才 toFixed(1) 写出，两者会不一致——
+    // 实测出现过实体底边精确值 269.69、量化后 269.8 而影线底 269.7，
+    // 即"算出来包含、画出来不包含"。量化后再算，写出的图形必然满足不变量。
+    const q = (v) => Math.round(v * 10) / 10;
+    const wickTop = q(yOf(m.high));
+    const wickBot = q(yOf(m.low));
+    svg += '<line x1="' + x.toFixed(1) + '" y1="' + wickTop.toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + wickBot.toFixed(1) +
       '" stroke="' + color + '" stroke-width="1"/>';
-    // 实体：用**实心填充**（不用半透明）。
-    // 半透明在深色主题与背景图毛玻璃下会被稀成「空心描边」，几条蜡烛看上去像空框
-    // （实测截图确认）。体内的分布信息改用「体内横线」表达，不靠透明度叠加。
+    // 实体：开~收（收>开 涨=红，与 MT 习惯一致）。
+    //
+    // 硬不变量：实体必须完整落在影线区间 [wickTop, wickBot] 内。
+    // 当日只有 1-2 个小时有数据时（open/close/low/high 几乎全等），实体真实高度
+    // 可能不足 1px，甚至影线本身也只比 1px 高一点。此时任何"保底 1.2px 高度"
+    // 的做法都会把实体撑出影线（实测：固定顶边溢出 0.6px，居中后仍溢出 0.3~0.5px）。
+    // 因此最小高度只能作为**上限目标**，实际取值 = min(1.2, 影线高度)：
+    // 影线高不足 1.2px 时，实体恰等于影线（退化为一条粗线，形状仍有意义），
+    // 而"实体比影线还高"才是真正无意义的形状。
+    const wickH = Math.max(0, wickBot - wickTop);
+    const yTop0 = q(yOf(Math.max(m.open, m.close)));
+    const yBot0 = q(yOf(Math.min(m.open, m.close)));
+    // 目标高度：真实开收差与最小可见高度取大，但不超过影线高度。
+    let bodyH = q(Math.min(Math.max(1.2, yBot0 - yTop0), wickH));
+    // 居中放置后再夹回影线区间。
+    let yTop = q((yTop0 + yBot0) / 2 - bodyH / 2);
+    if (yTop < wickTop) yTop = wickTop;
+    if (yTop + bodyH > wickBot) {
+      yTop = wickBot - bodyH;
+      if (yTop < wickTop) { yTop = wickTop; bodyH = Math.max(0, wickBot - wickTop); }
+    }
     svg += '<rect x="' + (x - candleW / 2).toFixed(1) + '" y="' + yTop.toFixed(1) + '" width="' + candleW.toFixed(1) +
       '" height="' + bodyH.toFixed(1) + '" fill="' + color + '" stroke="' + color + '" stroke-width="0.5" rx="0.5">' +
-      '<title>' + escHtml(sdCandleTitle(slots[i], s, botV, single)) + '</title></rect>';
-
-    if (single) {
-      // 单选：把该 Key 的当日值画成实体右侧的点（此时值 == 实体顶，点只是强调）。
-      svg += '<circle cx="' + (x + candleW / 2 + 3).toFixed(1) + '" cy="' + yOf(s.total).toFixed(1) + '" r="2" fill="' + color +
-        '"><title>' + escHtml(sdCandleTitle(slots[i], s, botV, true)) + '</title></circle>';
-    } else {
-      // 多选：体内横向细线 = 各子 Key 当日的取值（重叠即「值集中」）。
-      // 实体是实心的，所以线用白色（深色主题下仍可辨）而非黑，且只在**实体内部**
-      // 的取值上才画 —— 超出实体的值（低于实体底或高于实体顶）画在外面反而
-      // 会被误读为影线，交由 tooltip 给出。
-      const bodyTop = Math.min(topV, botV), bodyBot = Math.max(topV, botV);
-      s.items.forEach((it) => {
-        if (it.v < bodyTop || it.v > bodyBot) return;
-        svg += '<line x1="' + (x - candleW / 2).toFixed(1) + '" y1="' + yOf(it.v).toFixed(1) + '" x2="' + (x + candleW / 2).toFixed(1) +
-          '" y2="' + yOf(it.v).toFixed(1) + '" stroke="#ffffff" stroke-opacity="0.65"/>';
-      });
-    }
+      '<title>' + escHtml(sdOhlcTitle(slots[i], m, picked.length)) + '</title></rect>';
   });
 
-  // 日刻度：最多 8 个（槽位化后 tick 落在槽心）。
   const step = Math.max(1, Math.floor(n / 8));
   for (let k = 0; k < n; k += step) {
     svg += '<text x="' + xCenter(k).toFixed(1) + '" y="' + (H - padB + 15) + '" font-size="9" fill="#86909c" text-anchor="middle">' +
       (slots[k].label || "") + '</text>';
   }
 
-  // 右侧标注：命中判据 / 粗筛偏高的组优先，再补其它组。
-  //
-  // 名字截断到 7 字（而不是更短）——截到 4 字时中文名只剩「三重…」这种无法分辨的
-  // 前缀（库里真有同名子 Key），图例就失去意义了。padR 已按 7 字宽度预留。
-  // 空间不够时宁可少列几项（剩余数量另行标注），也不把名字截到不可读。
+  // 右侧图例：单选时标注该 Key，多选时标注参与的全部 Key。
+  const byKey = {};
+  (sgroups || []).forEach((g) => { byKey[g.key] = g; });
   const labeled = picked.filter((t) => {
     const g = byKey[t.key];
     return g && (g.flag === "flagged" || g.flag === "excluded");
@@ -367,10 +354,10 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
   labeled.slice(0, maxLabels).forEach((t) => {
     const g = byKey[t.key] || {};
     const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(t.label || t.key), PIE_COLORS.length)];
+    const color = flagged ? "#b91c1c" : PIE_COLORS[colorSlot(t.key, picked)];
     svg += '<line x1="' + (W - padR + 2) + '" y1="' + (ly - 3) + '" x2="' + (W - padR + 12) + '" y2="' + (ly - 3) + '" stroke="' + color + '" stroke-width="2"/>';
     svg += '<text x="' + (W - padR + 15) + '" y="' + ly + '" font-size="10" fill="' + color + '">' +
-      escHtml(truncText(t.label || t.key, 7)) + (flagged ? " ★" : "") + '</text>';
+      escHtml(legendName(t, picked)) + (flagged ? " ★" : "") + '</text>';
     ly += 14;
   });
   if (labeled.length > maxLabels) {
@@ -380,31 +367,65 @@ function renderSDTimeline(trends, groups, axis, selKeys) {
   svg += "</svg>";
 
   const leg = '<div class="chart-legend">' +
-    '<span class="leg-item"><span class="leg-swatch" style="background:#dc2626"></span>涨（合计高于上一个有数据的日）</span>' +
-    '<span class="leg-item"><span class="leg-swatch" style="background:#10b981"></span>跌</span>' +
+    '<span class="leg-item"><span class="leg-swatch" style="background:#dc2626"></span>涨（收 > 开）</span>' +
+    '<span class="leg-item"><span class="leg-swatch" style="background:#10b981"></span>跌（收 < 开）</span>' +
     '<span class="leg-item"><span class="leg-swatch" style="background:#86909c"></span>持平</span>' +
-    '<span class="leg-item">实体 = 合计（相邻有数据日比较）· 影线 = 当日 min/max' +
-    (picked.length > 1 ? ' · 体内横线 = 各子 Key 取值' : ' · 右侧点 = 该子 Key 当日值') + '</span>' +
+    '<span class="leg-item">实体 = 当日首/末小时桶 · 影线 = 当日最高/最低小时桶 · 单位：请求数' +
+    (picked.length > 1 ? ' · 多选时按各子 Key 相加' : '') + '</span>' +
     '</div>';
   return svg + leg;
 }
 
-// sdIsAll 判断选中集合是否等价于「全部」（null 或覆盖所有 trend）。
-function sdIsAll(selKeys, trends) {
-  if (selKeys === null || selKeys === undefined) return true;
-  return sdFilterTrends(trends, selKeys).length === (trends || []).length;
+// sdOhlcTitle 蜡烛 tooltip：日期 + OHLC + 合计 + 采样小时数。
+//
+// HourBuckets 一并列出：只有 1-2 个小时有数据的日子，实体与影线必然退化成
+// 一条线——写明采样数，用户才能分辨"当日真的很平稳"与"当天只有 2 小时有数据"。
+function sdOhlcTitle(slot, m, keyCount) {
+  const day = slot ? slot.label : "";
+  const s = [day,
+    "开 " + fmtInt(Math.round(m.open)) + " · 高 " + fmtInt(Math.round(m.high)) +
+    " · 低 " + fmtInt(Math.round(m.low)) + " · 收 " + fmtInt(Math.round(m.close)),
+    "合计 " + fmtInt(Math.round(m.total)) + " 次",
+    "日内采样 " + m.hb + " 个小时桶" + (keyCount > 1 ? " · " + keyCount + " 个子 Key 相加" : "")];
+  return s.join("\n");
 }
 
-// sdFilterTrends 按选中集合过滤 trends（null/未选中任何项都返回空数组）。
-function sdFilterTrends(trends, selKeys) {
-  const all = trends || [];
-  if (selKeys === null || selKeys === undefined) return all.slice();
-  const set = {};
-  (selKeys || []).forEach((k) => { set[k] = 1; });
-  return all.filter((t) => set[t.key]);
+// groupSlot 按**在数组中的次序**分配调色板下标（不重复，除非超出调色板长度）。
+//
+// 为什么不用 hashIdx(label)：djb2 对短名字聚集严重——实测同屏 7 个子 Key 中 3 个
+// 拿到同一颜色、两个同名项完全无法区分，图例形同虚设。groupSlot 保证同一集合内
+// 每个项颜色互异；输入数组次序稳定（后端按 key 序返回），故颜色也稳定。
+function groupSlot(key, arr) {
+  const idx = (arr || []).findIndex((g) => g.key === key);
+  return (idx < 0 ? 0 : idx) % PIE_COLORS.length;
 }
 
-// sdAxisLabel 坐标轴刻度文案：按量级自适应精度。
+// colorSlot 给选中集合里的每个子 Key 分配**不重复**的调色板下标。
+//
+// 为什么不能用 hashIdx(label)：djb2 对短名字聚集得很厉害，实测库里 7 个子 Key
+// 里有 3 个（「三重奏」/「dev」/「bot」）恰好都落进同一个颜色，两个同名的
+// 「test」也完全分不出——图例于是失去意义（用户截图为证）。
+//
+// 改为「按选中集合内的稳定次序依次取色」：同一集合下颜色稳定（刷新不变、
+// 勾选顺序不影响）；集合变化时颜色可能重排，但**永不撞色**是关键。
+// 超过调色板长度时循环复用（此时颜色必然重复，但至少相邻项不同）。
+function colorSlot(key, picked) {
+  const idx = (picked || []).findIndex((t) => t.key === key);
+  return (idx < 0 ? 0 : idx) % PIE_COLORS.length;
+}
+
+// legendName 图例显示名：同名子 Key 加上 key 后缀以区分。
+//
+// 库里真有两个都叫「test」的子 Key（不同 key），只显示 label 时图例会列出
+// 两行一模一样的「test」，无法判断哪条是哪条。只对**确实重名**的项加后缀，
+// 不重名时不加噪音。
+function legendName(t, picked) {
+  const name = t.label || t.key;
+  const dup = (picked || []).filter((x) => (x.label || x.key) === name).length > 1;
+  if (!dup) return truncText(name, 7);
+  // 后缀取 key 末 4 位（sk_ 前缀之后的部分），足够区分且不占宽度。
+  return truncText(name, 4) + "·" + String(t.key || "").slice(-4);
+}// sdAxisLabel 坐标轴刻度文案：按量级自适应精度。
 //
 // 为什么不能直接用 fmtInt：刻度值是 maxV 的四等分，量级小时必然是小数。
 // 旧实现一律四舍五入到整数，maxV=1 时会得到「1/1/1/0/0」——五个刻度看起来
@@ -453,66 +474,6 @@ function sdEmptyFrame(axis, msg, hint) {
   }
   svg += "</svg>";
   return svg;
-}
-
-// sdSlotStats 汇总一个槽位上所有选中子 Key 的当日值。
-// 返回 null 表示该槽无数据（全部选中组当日都没用量）——缺日留空，不补零。
-//
-// ⚠ 按**桶值（时间戳）查值**，不能按下标：每个子 Key 的 buckets 是各自稀疏的、
-// 只含「有使用的日」，同一个槽下标在不同子 Key 上对应不同的日期。按下标取会把
-// 不同日期的值混到同一根蜡烛里（实测会表现为「形状对未来预知」的错误读图）。
-// 索引由调用方建好（trendIndex），一次 O(n·m) 而不是每个槽都线性扫一遍。
-function sdSlotStats(picked, idx, i) {
-  const items = [];
-  let total = 0, mn = Infinity, mx = 0;
-  picked.forEach((t) => {
-    const v = idx[t.key] ? idx[t.key][i] : undefined;
-    if (v === undefined || v <= 0) return;
-    items.push({ label: t.label || t.key, v: v });
-    total += v;
-    if (v < mn) mn = v;
-    if (v > mx) mx = v;
-  });
-  if (!items.length) return null;
-  items.sort((a, b) => b.v - a.v);
-  return { items: items, total: total, min: mn, max: mx, subkeys: items.length };
-}
-
-// sdTrendIndex 把各 trend 的 (bucket → days 值) 建成「槽下标 → 值」的查表。
-// 入参 slots 是共享时间轴（含空白日的槽），故未命中的槽下标天然为 undefined。
-function sdTrendIndex(picked, slots) {
-  const pos = {};
-  slots.forEach((s, i) => { pos[s.ts] = i; });
-  const out = {};
-  picked.forEach((t) => {
-    const row = {};
-    (t.buckets || []).forEach((b, j) => {
-      const i = pos[b];
-      if (i === undefined) return;
-      row[i] = (t.days || [])[j] || 0;
-    });
-    out[t.key] = row;
-  });
-  return out;
-}
-
-// sdCandleTitle 蜡烛 tooltip：日期 + 合计/上个有数据日 + 涨跌 + 各子 Key 读数。
-function sdCandleTitle(slot, s, prevTotal, single) {
-  const seg = [slot.label || ""];
-  seg.push("合计 " + fmtInt(Math.round(s.total)) + " 次");
-  if (prevTotal !== null && prevTotal !== undefined) {
-    const d = s.total - prevTotal;
-    seg.push("较上一有数据日 " + (d >= 0 ? "+" : "") + fmtInt(Math.round(d)) +
-      "（" + (d >= 0 ? "涨" : "跌") + "，基准 " + fmtInt(Math.round(prevTotal)) + "）");
-  } else {
-    seg.push("首个有数据日（无比较基准，按持平处理）");
-  }
-  seg.push("区间 " + fmtInt(Math.round(s.min)) + " ~ " + fmtInt(Math.round(s.max)) + "（" + s.subkeys + " 个子 Key）");
-  // 子 Key 明细：最多列 8 条（悬停提示过长反而读不了），其余折叠为计数。
-  const head = s.items.slice(0, 8).map((it) => it.label + " " + fmtInt(Math.round(it.v)));
-  seg.push(head.join(" · ") + (s.items.length > 8 ? " · 等 " + s.items.length + " 个" : ""));
-  if (single) seg.push("（单选中视图）");
-  return seg.join("\n");
 }
 
 // ── 图表 4（模型视角）：拟合分布与判定位置 ──
@@ -590,7 +551,7 @@ function renderSDFit(groups, fit, params) {
     const p = g.return_period_days > 0 ? 1 / g.return_period_days : pMin;
     const y = yOf(Math.max(p, pMin));
     const flagged = g.flag === "flagged";
-    const color = flagged ? "#b91c1c" : PIE_COLORS[hashIdx(String(g.label || g.key), PIE_COLORS.length)];
+    const color = flagged ? "#b91c1c" : PIE_COLORS[groupSlot(g.key, groups)];
     svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (flagged ? 6 : 4) + '" fill="' + color +
       '" fill-opacity=".9"><title>' + escHtml(sdTitle(g)) + '</title></circle>';
     if (flagged) {

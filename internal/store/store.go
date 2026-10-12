@@ -1585,6 +1585,160 @@ func (s *Store) ShareDetectionSeries(from, to int64, minReqPerDay int) ([]*Share
 	return out, nil
 }
 
+// ShareCandle 是一根真正的蜡烛（日 OHLC，单位 = 请求数）。
+//
+// 与 ShareGroup 的根本区别：ShareGroup 的 Days 是「每个日桶一个值」，只能做
+// 相邻日比较；Candle 的 Open/High/Low/Close 来自**日内的多小时桶**，符合
+// MT 蜡烛的定义（实体 = 开~收，影线 = 低~高），四个值同量纲因而影线必包住实体。
+//
+// HourBuckets 是该日实际有多少个小时桶：它决定这根蜡烛可不可信——只有 1-2 桶
+// 时实体与影线必然退化成一条线（不是 bug，是当日数据本身不够），前端据此标注。
+type ShareCandle struct {
+	Key         string  `json:"key"`
+	Label       string  `json:"label"`
+	Bucket      int64   `json:"bucket"` // 本地日 00:00 的 UTC 秒（与 ShareGroup 同口径）
+	Open        float64 `json:"open"`
+	High        float64 `json:"high"`
+	Low         float64 `json:"low"`
+	Close       float64 `json:"close"`
+	Total       float64 `json:"total"`        // 当日合计（= 各小时桶之和），即旧图的"日合计"
+	HourBuckets int     `json:"hour_buckets"` // 日内有数据的小时桶数
+
+	// Hourly 是当日逐小时的请求数（长度 = 24，下标 = 本地小时）。
+	//
+	// 为什么必须传它（而不是只传 OHLC）：多选子 Key 时要把各 Key 的日内序列
+	// **逐小时相加**再算 OHLC。若只给 OHLC 而在前端合并，就只能"各 Key 的 High
+	// 相加"——当两个 Key 的峰值不在同一小时时，这会严重高估总量峰值（实测例：
+	// A 在 10 时 100/12 时 1，B 在 10 时 1/12 时 100 → 真实峰值 101，
+	// ΣHigh = 200，高估 2 倍）。
+	Hourly []float64 `json:"hourly"`
+}
+
+// ShareCandleSeries 按子 Key 返回**日 OHLC 蜡烛**（单位 = 请求数）。
+//
+// 数据来源：把 usage_logs 先按「本地日 + 本地小时」二次分桶算出每小时请求数，
+// 再对每个自然日取 首小时=开、末小时=收、极值=高/低。小时桶缺失的小时**不入样**
+// （不补零）——补零会把凌晨天然的低谷压成 Low，使每根蜡烛的影线都被撑到 0，
+// 影线就失去了"当日波动"的含义。
+//
+// 返回的 Candle 按 (子 Key, 日) 排序；前端按 Bucket 对齐共享时间轴。
+// 低量日交由前端决定是否展示（这里不做阈值过滤：蜡烛本身要保留分布形状）。
+func (s *Store) ShareCandleSeries(from, to int64, subKeyID string) ([]*ShareCandle, error) {
+	if to <= 0 || to > nowUnix() {
+		to = nowUnix()
+	}
+	if from <= 0 || from >= to {
+		from = to - 30*86400
+	}
+	if to-from > usageQueryMaxSpan {
+		from = to - usageQueryMaxSpan
+	}
+
+	// 日桶与小时桶都用显式本地时间构造的表达式，与 ShareDetectionSeries /
+	// 用量分析共用同一套日界线口径（自己写 ts/86400 会在 DST 下归错桶）。
+	dayExpr := usageBucketExpr("day", from, to, time.Local)
+	// 小时桶：直接对 ts 取整到小时并转成本地时间串。用 strftime 的本地时区
+	// 修饰符（+N hours 已在 usageBucketExpr 中用到）确保与 dayExpr 同日界线。
+	hourExpr := "strftime('%Y-%m-%d %H', " + localTSExpr() + ")"
+
+	// 查询按「子 Key × 日 × 小时」先聚合一次（请求数 cnt），再在 Go 里折叠成
+	// OHLC。为什么不在 SQL 里取开/收：SQLite 的 `MIN(hh)` 配合 bare column 虽能
+	// 取到同行值，但这个技巧难读、且一旦将来换库就静默错（返回的值与 hh 无关联），
+	// 而本查询的行数上界是「日(≤92) × 小时(24) × 子 Key」，最多几万行，直接在
+	// Go 里按排序顺序折叠既廉价也一目了然。
+	//
+	// GROUP BY 里**不能带 subkey_name**：子 Key 改过名后同一 (id, 日, 小时) 会
+	// 拆成多行（每个历史名字一行），导致 hourly 按行扫时把同一小时加两次、
+	// 而 hb 又按行计数——两者都对不上（实测：某日真值 14 个小时桶，带 name 时
+	// 报 12 且 hourly 只有 11 个非零位）。名称是展示用的辅助列，改用 MAX(name)
+	// 取一个非空值即可（与 ShareDetectionSeries 同一教训）。
+	q := `SELECT subkey_id, MAX(subkey_name), ` + dayExpr + ` AS day, ` + hourExpr + ` AS hh, COUNT(*) AS cnt
+		FROM usage_logs WHERE ts >= ? AND ts < ? AND subkey_id <> ''` + subFilter(subKeyID) + `
+		GROUP BY subkey_id, day, hh
+		ORDER BY subkey_id ASC, day ASC, hh ASC`
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(q, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// 逐行折叠；由于已按 (子Key, 日, 小时) 升序，遇到的第一个小时就是开、
+	// 最后一个小时就是收。
+	out := []*ShareCandle{}
+	var cur *ShareCandle
+	for rows.Next() {
+		var id, name string
+		var day int64
+		var hh string
+		var cnt float64
+		if err := rows.Scan(&id, &name, &day, &hh, &cnt); err != nil {
+			return nil, err
+		}
+		if cur == nil || cur.Key != id || cur.Bucket != day {
+			if cur != nil {
+				out = append(out, cur)
+			}
+			// 新的一根蜡烛：首个小时桶同时是开与收的初始值。
+			cur = &ShareCandle{
+				Key: id, Label: name, Bucket: day,
+				Open: cnt, Close: cnt, High: cnt, Low: cnt, Total: 0, HourBuckets: 0,
+				Hourly: make([]float64, 24),
+			}
+		}
+		cur.Close = cnt // 持续更新，循环结束时即为末个小时桶
+		cur.Total += cnt
+		if name != "" {
+			cur.Label = name
+		}
+		// hh 形如 "2026-10-09 14"，取最后两字符作为小时下标。
+		// hb 用「非零小时数」而非行数：同一小时只应算一次（去掉 name 后已不会
+		// 重复，但这个口径本身才是对的——hb 的含义就是"日内有数据的小时数"）。
+		if hi, err := strconv.Atoi(hh[len(hh)-2:]); err == nil && hi >= 0 && hi < 24 {
+			if cur.Hourly[hi] == 0 {
+				cur.HourBuckets++
+			}
+			cur.Hourly[hi] += cnt
+		}
+		if cnt > cur.High {
+			cur.High = cnt
+		}
+		if cnt < cur.Low {
+			cur.Low = cnt
+		}
+	}
+	if cur != nil {
+		out = append(out, cur)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// subFilter 生成可选的子 Key 过滤片段（subkey 参数为空时不影响查询）。
+func subFilter(subKeyID string) string {
+	if subKeyID == "" {
+		return ""
+	}
+	return " AND subkey_id = '" + strings.ReplaceAll(subKeyID, "'", "''") + "'"
+}
+
+// localTSExpr 把 unix 秒转成 SQLite 可比较的本地时间串（用于 strftime 分桶）。
+// 用 time.Local 的当前偏移；跨 DST 的区间由 usageBucketExpr 的日桶对齐兜住
+// （小时桶只用于日内 O/H/L/C，边界小时归哪一天不影响当日内部形状）。
+func localTSExpr() string {
+	_, off := time.Now().Zone()
+	sign := "+"
+	if off < 0 {
+		sign = "-"
+		off = -off
+	}
+	return fmt.Sprintf("ts, 'unixepoch', '%s%d hours'", sign, off/3600)
+}
+
 // ─────────────────────────── Daily usage（日限额） ───────────────────────────
 
 // DailyUsage 某子 Key 在自然日内的用量。

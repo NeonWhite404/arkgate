@@ -50,6 +50,10 @@ const ShareDetectPage = {
       snap: JSON.stringify(saved.form),
       pOpen: false,
       r: null,
+      // cd = 蜡烛数据（日 OHLC，单位 = 请求数）。与 r.trends 分开保存：
+      // 前者是"日内采样得到的 OHLC"，后者是"日桶序列 + EVT 分析结果"，
+      // 两者聚合粒度不同（见 admin.handleShareCandles）。
+      cd: null,
       loading: false,
       tab: "scatter",
       // 趋势图的子 Key 参与开关：null = 全选（升级前后的默认视角一致）。
@@ -60,7 +64,7 @@ const ShareDetectPage = {
       selQuery: "",
       tabs: [
         { v: "scatter", label: "极值判据", tip: "主判据：返回期 × 波动 CV，右上红区 = 显著异常" },
-        { v: "timeline", label: "日用量趋势", tip: "蜡烛图：相邻有数据日比较的合计涨跌 + 当日 min/max 影线；可勾选参与的子 Key" },
+        { v: "timeline", label: "日用量趋势", tip: "日蜡烛：实体 = 当日首/末小时桶，影线 = 当日最高/最低小时桶（单位：请求数）；可勾选参与的子 Key" },
         { v: "box", label: "量级对比", tip: "各子 Key 日量的中位数、范围与最大值" },
         { v: "fit", label: "分布拟合", tip: "返回期是怎么算出来的：GPD 外推与判定位置" },
       ],
@@ -73,6 +77,16 @@ const ShareDetectPage = {
     cvf() { return (this.res && this.res.cv) || {}; },
     params() { return (this.res && this.res.params) || SD_DEFAULTS; },
     trends() { return (this.r && this.r.trends) || []; },
+    // 蜡烛按子 Key 分组（保持后端排序；前端按 Bucket 对齐共享时间轴）。
+    // 用 Map 保序：Object 的整数键会被重排，桶值是大整数，会打乱图的先后。
+    candleGroups() {
+      const m = new Map();
+      ((this.cd && this.cd.candles) || []).forEach((c) => {
+        if (!m.has(c.key)) m.set(c.key, { key: c.key, label: c.label || c.key, candles: [] });
+        m.get(c.key).candles.push(c);
+      });
+      return Array.from(m.values());
+    },
     // 选中集合（数组形式；null = 全选）。模板里到处要判断「是否选中」，
     // 统一走 selSet（避免每个调用点都把 null 特判一遍）。
     selAll() { return this.sel === null; },
@@ -81,13 +95,16 @@ const ShareDetectPage = {
       if (this.sel !== null) (this.sel || []).forEach((k) => { s[k] = 1; });
       return s;
     },
-    selCount() { return this.selAll ? this.trends.length : (this.sel || []).length; },
+    selCount() { return this.selAll ? this.candleGroups.length : (this.sel || []).length; },
     // 选择器列表：按当前返回期降序（与明细表同序），带判定与搜索过滤。
+    // 列表项来自**蜡烛分组**（趋势图的数据源），而非 trends——两边的子 Key
+    // 集合可能不同（蜡烛只含区间内真的有过请求的 Key），若用 trends 作列表会
+    // 出现"能勾选但没有蜡烛"或反之的错位。分组之外的 Key 一律不出现在列表里。
     selList() {
       const byKey = {};
       this.groups.forEach((g) => { byKey[g.key] = g; });
       const q = this.selQuery.trim().toLowerCase();
-      return this.trends
+      return this.candleGroups
         .map((t) => {
           const g = byKey[t.key] || null;
           return {
@@ -97,7 +114,7 @@ const ShareDetectPage = {
             // 直接格式化会得到「1000000000000 天」这种读数。超过 1e9 视为无限。
             rp: g && isFinite(g.return_period_days) && g.return_period_days < 1e9 ? g.return_period_days : -1,
             median: g ? g.level_median : 0,
-            days: g ? g.days : (t.buckets || []).length,
+            days: t.candles.length,
           };
         })
         .filter((x) => !q || String(x.label).toLowerCase().indexOf(q) >= 0)
@@ -105,15 +122,17 @@ const ShareDetectPage = {
     },
     // 趋势图的时间轴：**槽位化**——以区间内每个自然日为一个槽，缺日留空槽不补零。
     //
-    // 时间轴按**全部** trends 构造（不受选中集合影响），这是有意的：
+    // 时间轴按**全部蜡烛**构造（不受选中集合影响），这是有意的：
     //   - 勾选/取消子 Key 时 X 轴不应跳动（轴跟着选择变，就没有「对比前后两张图」的基准）；
     //   - 清空选中后轴仍存在，图框不会消失——否则点「清空」会看到整张图消失，
     //     看上去像功能坏了（实测反馈的「图为空」就是这个）。
     // Y 轴量程仍按选中集合算（那是「看谁就按谁定标」），两者职责不同。
     dayAxis() {
-      const trends = this.trends;
+      // 时间轴取**蜡烛**的桶（不是 trends）：蜡烛是这张图唯一的数据源，
+      // 轴的职责就是给每根蜡烛一个位置，两者同源才能保证不漏不重。
+      const cd = this.cd;
       const seen = {};
-      trends.forEach((t) => (t.buckets || []).forEach((b) => { seen[b] = 1; }));
+      ((cd && cd.candles) || []).forEach((c) => { seen[c.bucket] = 1; });
       const uniq = Object.keys(seen).map((x) => parseInt(x, 10)).sort((a, b) => a - b);
       if (!uniq.length) return null;
       // 槽序列补齐：从首桶所在日逐自然日推进到尾桶所在日，中间空白日也占一个槽
@@ -154,14 +173,14 @@ const ShareDetectPage = {
     chartHtml() {
       if (!this.res) return "";
       if (this.tab === "box") return renderSDBox(this.groups, this.fit);
-      if (this.tab === "timeline") return renderSDTimeline(this.trends, this.groups, this.dayAxis, this.sel);
+      if (this.tab === "timeline") return renderSDCandles(this.candleGroups, this.groups, this.dayAxis, this.sel);
       if (this.tab === "fit") return renderSDFit(this.groups, this.fit, this.params);
       return renderSDScatter(this.groups, this.fit, this.cvf, this.params);
     },
     // 趋势图卡片的标题：标出「已选 N / 共 M」，否则用户选完子 Key 再看图
     // 会以为是自己看错了（图里的形状变了却没有任何文字说明）。
     timelineTitle() {
-      const tot = this.trends.length;
+      const tot = this.candleGroups.length;
       if (this.selAll) return "日用量蜡烛图（全部 " + tot + " 个子 Key）";
       return "日用量蜡烛图（已选 " + this.selCount + " / " + tot + " 个子 Key）";
     },
@@ -186,13 +205,13 @@ const ShareDetectPage = {
     // ── 趋势图的子 Key 参与开关 ──
     // 内部统一存**数组**（null 表示全选），全选/空选/单选都走同一条路径，
     // 避免「null 与 [] 的语义分叉」。
-    // sdPruneSel 清理已不存在的 key（改区间/换参数后 trends 会变）。
+    // sdPruneSel 清理已不存在的 key（改区间/换参数后可选集合会变）。
     // 少了这一步，选中集合残留旧 key 会表现为「选着 5 个但只画 3 条」，
     // 没有任何提示——是最难自证的一类 UI bug。
     sdPruneSel() {
       if (this.sel === null) return;
       const live = {};
-      this.trends.forEach((t) => { live[t.key] = 1; });
+      this.candleGroups.forEach((t) => { live[t.key] = 1; });
       const next = this.sel.filter((k) => live[k]);
       if (next.length !== this.sel.length) {
         this.sel = next.length ? next : null;
@@ -200,12 +219,12 @@ const ShareDetectPage = {
       }
     },
     sdToggle(key) {
-      const cur = this.sel === null ? this.trends.map((t) => t.key) : this.sel.slice();
+      const cur = this.sel === null ? this.candleGroups.map((t) => t.key) : this.sel.slice();
       const i = cur.indexOf(key);
       if (i >= 0) cur.splice(i, 1); else cur.push(key);
       // 全部选中等价于「全选」（存储为 null）：后续新出现的子 Key 自动参与，
       // 不必再手动去勾一次。
-      this.sel = cur.length === this.trends.length ? null : cur;
+      this.sel = cur.length === this.candleGroups.length ? null : cur;
       this.sdSaveSel();
     },
     sdSelectAll() { this.sel = null; this.sdSaveSel(); },
@@ -220,7 +239,7 @@ const ShareDetectPage = {
     // Top N：列表已按返回期降序，取前 N 个（量级最高的几个）。
     sdSelectTop(n) {
       const keys = this.selList.slice(0, n).map((x) => x.key);
-      this.sel = keys.length === this.trends.length ? null : keys;
+      this.sel = keys.length === this.candleGroups.length ? null : keys;
       this.sdSaveSel();
     },
     sdSaveSel() {
@@ -249,6 +268,14 @@ const ShareDetectPage = {
         .then((d) => { this.r = d; this.sdPruneSel(); })
         .catch((e) => toast(e.message, false))
         .finally(() => { this.loading = false; });
+      // 蜡烛单独取一次：OHLC 需要**日内多小时采样**，与 EVT 所需的「日用量的
+      // 分布」聚合粒度不同，不能从同一个查询里兼得（见 admin.handleShareCandles）。
+      // 失败不当作整体失败：趋势图空着，其它三个图照常可用，且提示可分辨。
+      req("GET", "/api/share-detection/candles?" + new URLSearchParams({
+        from: String(from), to: String(to),
+      }).toString())
+        .then((d) => { this.cd = d; })
+        .catch((e) => { this.cd = null; toast("蜡烛数据加载失败：" + e.message, false); });
     },
     openParams() { this.form = Object.assign({}, this.form); this.pOpen = true; },
     saveParams() {
@@ -311,14 +338,14 @@ const ShareDetectPage = {
       <!-- 子 Key 参与开关：只管「日用量趋势」。散点/量级对比/拟合图的判据是
            全局口径（阈值由全体样本估出），收窄选中集合会让「显著平稳线」
            看起来变了——那是两套语义，因此那三张图不接这个开关。 -->
-      <div class="sd-pick" v-if="tab === 'timeline' && trends.length">
+      <div class="sd-pick" v-if="tab === 'timeline' && candleGroups.length">
         <div class="sd-pick-bar">
           <button class="btn btn-outline btn-sm" @click="sdSelectAll" :disabled="selAll">全部</button>
           <button class="btn btn-outline btn-sm" @click="sdSelectNone" :disabled="!selCount && !selAll">清空</button>
           <button class="btn btn-outline btn-sm" @click="sdSelectFlagged">仅命中</button>
           <button class="btn btn-outline btn-sm" @click="sdSelectTop(5)">Top 5</button>
           <span class="sd-pick-count">
-            已选 <b>{{ selCount }}</b> / {{ trends.length }} 个子 Key
+            已选 <b>{{ selCount }}</b> / {{ candleGroups.length }} 个子 Key
             <span v-if="!selAll" class="sd-pick-warn">（仅影响本图，其余三张图仍为全局口径）</span>
           </span>
           <div class="spacer"></div>
@@ -339,7 +366,7 @@ const ShareDetectPage = {
 
       <div class="card-head" v-if="tab === 'timeline'">
         <div class="card-title">{{ timelineTitle }}</div>
-        <span class="src-badge ic-gray" title="蜡烛实体 = 相邻「有数据的日」合计值的比较；影线 = 当日子 Key 间的 min/max。缺日留空槽，不补零">相邻日比较</span>
+        <span class="src-badge ic-gray" title="蜡烛实体 = 当日首/末个小时桶的请求数（开/收）；影线 = 当日最高/最低小时桶（高/低）。日内多小时采样来自 usage_logs 的逐次请求。缺日留空槽，不补零">日内 OHLC</span>
       </div>
       <div class="chart-wrap" v-html="chartHtml"></div>
     </div>

@@ -207,6 +207,7 @@ func (a *Admin) routes() http.Handler {
 	reg("/api/usage/rollup/rebuild", a.handleUsageRollupRebuild)
 	reg("/api/usage/cost/backfill", a.handleCostBackfill)
 	reg("/api/share-detection", a.handleShareDetection)
+	reg("/api/share-detection/candles", a.handleShareCandles)
 
 	return mux
 }
@@ -375,6 +376,46 @@ func (a *Admin) handleShareDetection(w http.ResponseWriter, r *http.Request) {
 		"from":   from,
 		"to":     to,
 		"groups": len(series),
+	})
+}
+
+// handleShareCandles 分发检测的**日 OHLC 蜡烛**（单位 = 请求数）。
+//
+// 为什么单开一个端点而不是塞进 handleShareDetection：EVT 分析要的是「每个日桶
+// 一个值」的分布（ShareGroup），而蜡烛要的是**日内多小时采样**才能算出开/收/
+// 高/低。两者聚合粒度不同，硬凑在一个查询里会让 EVT 那侧带上无用的日内明细。
+// 前端两个图各自按需取数。
+//
+// 参数：from/to（unix 秒，默认 30 天，区间上限 92 天与其它分析接口一致）、
+// subkey（可选，只算某个子 Key——单选时蜡烛与旧图的"单 Key 当日值"等价）。
+func (a *Admin) handleShareCandles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	qv := r.URL.Query()
+	to, _ := strconv.ParseInt(qv.Get("to"), 10, 64)
+	from, _ := strconv.ParseInt(qv.Get("from"), 10, 64)
+	if to <= 0 || to > time.Now().Unix() {
+		to = time.Now().Unix()
+	}
+	if from <= 0 || from >= to {
+		from = to - 30*86400
+	}
+	const maxSpan = 92 * 86400
+	if to-from > maxSpan {
+		from = to - maxSpan
+	}
+
+	candles, err := a.store.ShareCandleSeries(from, to, qv.Get("subkey"))
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"candles": candles,
+		"from":    from,
+		"to":      to,
 	})
 }
 
