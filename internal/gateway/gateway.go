@@ -1076,27 +1076,59 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 
 // ─────────────────────────── 错误输出 ───────────────────────────
 
-// writeUpstreamError 把最终错误以合理状态码 + OpenAI 结构回给客户端
-// （透传上游错误体，而非折叠成 429）。
+// writeUpstreamError 把最终错误以合理状态码 + OpenAI 结构回给客户端。
+// 上游错误体需**脱敏后**再透传（见 sanitizeUpstreamError）：上游原始错误体里
+// 常带真实模型标识（ep-xxx）、账号线索、上游请求 id 等运维信息，属于越权数据
+// （与门户日志的「错误文本不下发」同一红线）。状态码原样保留供客户端语义判断。
 func (g *Gateway) writeUpstreamError(w http.ResponseWriter, err error) {
 	if err == nil {
 		err = errors.New("未知错误")
 	}
 	if he, ok := provider.AsHTTPError(err); ok {
-		// 透传上游状态码与原始 body（若 body 是 JSON 错误结构则原样转发）。
 		status := he.Code
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		if len(he.Body) > 0 {
-			_, _ = w.Write(he.Body)
-			return
-		}
+		_ = json.NewEncoder(w).Encode(errBody("upstream_error", sanitizeUpstreamError(he.Body)))
+		return
 	}
 	// 本地错误（无账号/全熔断/限流/无能力等）用 429 + OpenAI 结构。
 	writeJSON(w, http.StatusTooManyRequests, errBody("upstream_error", errText(err)))
+}
+
+// sanitizeUpstreamError 从上游错误体里提取人类可读的 message，剥除上游模型
+// 标识/请求 id 等运维信息。提取失败时回落截断后的原始文本（不把本该给客户端的
+// 错误原因折叠成「未知错误」）。
+func sanitizeUpstreamError(body []byte) string {
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
+		return truncateErrText(parsed.Error.Message)
+	}
+	var generic struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &generic) == nil && generic.Message != "" {
+		return truncateErrText(generic.Message)
+	}
+	summary := strings.TrimSpace(string(body))
+	if summary == "" {
+		return "上游返回错误"
+	}
+	return truncateErrText(summary)
+}
+
+// truncateErrText 把错误文本截断到合理长度，避免把长 HTML 页面整段灌回客户端。
+func truncateErrText(s string) string {
+	if len(s) > 300 {
+		return s[:300] + "…"
+	}
+	return s
 }
 
 // flushWriter 每写即刷：SSE 事件必须及时推送，不能等上游整条流结束后才落客户端。
@@ -1115,13 +1147,19 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 
 // writeSSEError 给已开始的流补错误帧。Chat/图像用 chunk 形状（error + [DONE]）；
 // Responses 必须用其 event: error 类型（不伪装 [DONE]），否则客户端无法解析。
+// 错误文本同样经 sanitizeUpstreamError 脱敏——首字节后才失败的上游错误体里同样
+// 可能带真实模型标识/请求 id。
 func writeSSEError(w http.ResponseWriter, err error, api balancer.API) {
+	msg := errText(err)
+	if he, ok := provider.AsHTTPError(err); ok {
+		msg = sanitizeUpstreamError(he.Body)
+	}
 	if api == balancer.APIResponses {
-		payload, _ := json.Marshal(map[string]any{"type": "error", "code": "upstream_error", "message": errText(err)})
+		payload, _ := json.Marshal(map[string]any{"type": "error", "code": "upstream_error", "message": msg})
 		_, _ = w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
 		return
 	}
-	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": errText(err), "type": "upstream_error"}})
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
 	_, _ = w.Write([]byte("data: " + string(payload) + "\n\n"))
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 }

@@ -2045,6 +2045,7 @@ const SettingsPage = {
       prefs,
       rt: null,          // 网关运行时设置（服务端）
       rtForm: { request_timeout_sec: 0, first_token_timeout_sec: 0 },
+      tlsForm: { tls_enabled: false, tls_cert: "", tls_key: "" },
       savingRt: false,
     };
   },
@@ -2067,6 +2068,11 @@ const SettingsPage = {
             currency_rate: d.currency_rate || 0,
             currency_symbol: d.currency_symbol || "$",
             currency_code: d.currency_code || "USD",
+          };
+          this.tlsForm = {
+            tls_enabled: !!d.tls_enabled,
+            tls_cert: d.tls_cert || "",
+            tls_key: d.tls_key || "",
           };
           // 币种是全局展示参数，拉到即应用（金额格式化统一走 fmtCost）。
           applyCurrency(d);
@@ -2098,6 +2104,22 @@ const SettingsPage = {
         first_token_timeout_sec: this.rt.defaults.first_token_timeout_sec,
       };
       this.saveRuntime();
+    },
+    saveTls() {
+      if (this.savingRt) return;
+      this.savingRt = true;
+      req("PUT", "/api/settings/runtime", {
+        tls_enabled: !!this.tlsForm.tls_enabled,
+        tls_cert: this.tlsForm.tls_cert,
+        tls_key: this.tlsForm.tls_key,
+      })
+        .then((d) => {
+          this.rt = d;
+          this.tlsForm = { tls_enabled: !!d.tls_enabled, tls_cert: d.tls_cert || "", tls_key: d.tls_key || "" };
+          toast("已保存，重启进程后生效");
+        })
+        .catch((e) => toast(e.message, false))
+        .finally(() => { this.savingRt = false; });
     },
   },
   template: `
@@ -2141,6 +2163,27 @@ const SettingsPage = {
         因此调整汇率不会改写任何已落库的数据，也不需要重算历史成本；
         目录自动补全写入的仍是美元单价。
         <br/>当前展示：{{ fmtCost(1) }} = 1 美元。
+      </div>
+    </div>
+    <div class="card"><div class="card-head"><div class="card-title">HTTPS（TLS，重启后生效）</div></div>
+      <div class="hint" style="margin:0 0 12px">
+        默认关闭。网关常部署在内网或受信反代之后，明文 HTTP 即可；需要端到端加密时开启，
+        并填写 PEM 证书与私钥的<b>文件路径</b>（网关进程需有读取权限）。保存后<b>重启进程</b>生效。
+      </div>
+      <div class="form-row">
+        <div class="form-item"><label>启用 HTTPS</label>
+          <label class="switch-row"><input type="checkbox" v-model="tlsForm.tls_enabled"/><span>开启（HTTPS 监听）</span></label></div>
+        <div class="form-item"><label>证书文件路径（crt/pem）</label>
+          <input v-model="tlsForm.tls_cert" placeholder="/etc/arkgate/cert.pem"/></div>
+        <div class="form-item"><label>私钥文件路径（key）</label>
+          <input v-model="tlsForm.tls_key" placeholder="/etc/arkgate/key.pem"/></div>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" :disabled="savingRt" @click="saveTls">{{ savingRt ? '保存中…' : '保存' }}</button>
+      </div>
+      <div class="hint" style="margin-top:12px">
+        也可用环境变量 <span class="mono">ARKGATE_TLS_CERT</span> / <span class="mono">ARKGATE_TLS_KEY</span>
+        注入路径，并在本页打开开关。DB 里保存的值优先于环境变量。
       </div>
     </div>
     <div class="card"><div class="card-head"><div class="card-title">外观（仅本浏览器）</div></div>

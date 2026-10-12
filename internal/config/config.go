@@ -95,6 +95,17 @@ func (c *Currency) Convert(usd float64) float64 {
 	return usd * r
 }
 
+// TLSConfig HTTPS 监听配置（可选，默认关闭）。
+//
+// 为什么做成可选而非默认强制：网关常部署在内网或受信反代之后，明文 HTTP
+// 是常见且合理的形态（见审计结论第 6 条）；需要端到端加密时由部署者或
+// 管理面板显式开启，配上 PEM 证书与私钥路径。启用后经 ServeTLS 提供服务。
+type TLSConfig struct {
+	Enabled  bool   // 是否开启 HTTPS（管理面板可配，默认关闭）
+	CertFile string // PEM 证书路径
+	KeyFile  string // PEM 私钥路径
+}
+
 type Config struct {
 	// Web 管理监听地址。
 	ListenAddr string
@@ -121,6 +132,11 @@ type Config struct {
 	// 会话粘性 TTL：同一子 Key + 模型在该时长内的后续请求固定路由到同一叶节点
 	// （利于上游 prompt cache 命中）。0 表示关闭。默认 5min。
 	SessionTTL time.Duration
+
+	// TLS HTTPS 配置（可选，默认关闭）。由环境变量 ARKGATE_TLS_CERT/KEY 注入；
+	// 管理面板保存的证书/私钥路径与开关会持久化到 settings 表，启动时由
+	// admin.loadPersistedTLS 覆盖到此处（优先级：DB > 环境变量 > 默认关闭）。
+	TLS *TLSConfig
 }
 
 // 上游超时的内置默认值（环境变量未设置时生效）。
@@ -152,6 +168,14 @@ func Load() *Config {
 	Conf.Timeouts.SetRequest(getDurationSec("ARKGATE_REQUEST_TIMEOUT", DefaultRequestTimeout))
 	Conf.Timeouts.SetFirstToken(getDurationSec("ARKGATE_FIRST_TOKEN_TIMEOUT", DefaultFirstTokenTimeout))
 	Conf.SessionTTL = getDurationSec("ARKGATE_SESSION_TTL", 5*time.Minute)
+
+	// TLS：默认关闭。环境变量只注入证书/私钥路径，开关由管理面板控制；
+	// 路径与开关都可持久化到 settings 表并在启动时回填（见 admin）。
+	if Conf.TLS == nil {
+		Conf.TLS = &TLSConfig{}
+	}
+	Conf.TLS.CertFile = os.Getenv("ARKGATE_TLS_CERT")
+	Conf.TLS.KeyFile = os.Getenv("ARKGATE_TLS_KEY")
 
 	return Conf
 }

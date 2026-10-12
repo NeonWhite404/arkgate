@@ -55,6 +55,10 @@ const maxCurrencyRate = 1e6
 // 不是经济学约束——真实缓存倍率在 0.004~4.0 之间（见目录快照实测）。
 const maxQuotaPermille = 100000
 
+// maxAdminRequestBody 管理端请求体的上限（审计加固，与 /v1 同一上限）。
+// 管理 JSON 远小于该值；MaxBytesReader 同时限制内存占用与连接占用。
+const maxAdminRequestBody = 64 << 20
+
 const (
 	keyTimeoutRequest    = "timeout_request_sec"
 	keyTimeoutFirstToken = "timeout_first_token_sec"
@@ -62,6 +66,10 @@ const (
 	keyCurrencyRate   = "currency_rate"
 	keyCurrencySymbol = "currency_symbol"
 	keyCurrencyCode   = "currency_code"
+	// 可选 HTTPS（重启后生效）：开关 + PEM 证书/私钥路径。
+	keyTLSEnabled = "tls_enabled"
+	keyTLSCert    = "tls_cert"
+	keyTLSKey     = "tls_key"
 )
 
 // New 构造管理后端，并把已持久化的运行时设置应用到 cfg
@@ -71,6 +79,7 @@ func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.C
 		mgr: provider.NewManager(), usageCache: store.NewUsageCache(store.UsageCacheTTL)}
 	a.loadPersistedTimeouts()
 	a.loadPersistedCurrency()
+	a.loadPersistedTLS()
 	a.handler = a.routes()
 	return a
 }
@@ -109,6 +118,23 @@ func (a *Admin) loadPersistedCurrency() {
 		code = v
 	}
 	a.cfg.Currency.Set(rate, symbol, code)
+}
+
+// loadPersistedTLS 启动时把 DB 里的 TLS 设置覆盖到 cfg。
+// 优先级：DB 持久化值 > 环境变量 > 默认关闭（与环境/默认值在 config.Load 里已就位）。
+func (a *Admin) loadPersistedTLS() {
+	if a.cfg.TLS == nil {
+		a.cfg.TLS = &config.TLSConfig{}
+	}
+	if v, ok := a.store.GetSetting(keyTLSEnabled); ok {
+		a.cfg.TLS.Enabled = v == "1" || v == "true"
+	}
+	if v, ok := a.store.GetSetting(keyTLSCert); ok && v != "" {
+		a.cfg.TLS.CertFile = v
+	}
+	if v, ok := a.store.GetSetting(keyTLSKey); ok && v != "" {
+		a.cfg.TLS.KeyFile = v
+	}
 }
 
 // Handler 返回 http.Handler。
@@ -179,6 +205,10 @@ func (a *Admin) routes() http.Handler {
 				writeJSON(w, 401, map[string]any{"detail": "未授权", "code": "UNAUTHORIZED"})
 				return
 			}
+			// 请求体上限：管理端 JSON 远小于 64MB，与 /v1 同一上限。
+			// 放在鉴权之后：未鉴权请求不会因此读取大 body，避免无凭据的内存占用。
+			// MaxBytesReader 同时关闭连接，阻止慢速灌数据占住连接。
+			r.Body = http.MaxBytesReader(w, r.Body, maxAdminRequestBody)
 			h(w, r)
 		})
 	}
@@ -537,6 +567,8 @@ func (a *Admin) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]any{"detail": "已初始化"})
 		return
 	}
+	// 免鉴权也要限长：防止首启窗口期被塞入超大 body 拖垮内存。
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminRequestBody)
 	var req struct {
 		Token string `json:"token"`
 	}
@@ -549,6 +581,8 @@ func (a *Admin) handleSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// 免鉴权也要限长：未初始化/错误登录阶段同样不可无限吃内存。
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminRequestBody)
 	var req struct {
 		Token string `json:"token"`
 	}
@@ -1300,6 +1334,52 @@ func (a *Admin) handleRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			a.cfg.Currency.Set(a.cfg.Currency.Rate(), a.cfg.Currency.Symbol(), code)
 		}
+		// 可选 HTTPS：重启后生效。仅在下次启动时应用（运行时无法换监听器），
+		// 这里只持久化并更新 cfg 供 GET 回显，不改动正在运行的 server。
+		if raw, ok := probe["tls_enabled"]; ok {
+			en := false
+			switch v := raw.(type) {
+			case bool:
+				en = v
+			case float64:
+				en = v != 0
+			case string:
+				en = v == "1" || strings.EqualFold(v, "true")
+			default:
+				writeJSON(w, 400, map[string]any{"detail": "tls_enabled 必须是布尔值"})
+				return
+			}
+			if err := a.store.SetSetting(keyTLSEnabled, strconv.FormatBool(en)); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			if a.cfg.TLS == nil {
+				a.cfg.TLS = &config.TLSConfig{}
+			}
+			a.cfg.TLS.Enabled = en
+		}
+		if raw, ok := probe["tls_cert"]; ok {
+			cert := strings.TrimSpace(stringField(raw))
+			if err := a.store.SetSetting(keyTLSCert, cert); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			if a.cfg.TLS == nil {
+				a.cfg.TLS = &config.TLSConfig{}
+			}
+			a.cfg.TLS.CertFile = cert
+		}
+		if raw, ok := probe["tls_key"]; ok {
+			keyPem := strings.TrimSpace(stringField(raw))
+			if err := a.store.SetSetting(keyTLSKey, keyPem); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			if a.cfg.TLS == nil {
+				a.cfg.TLS = &config.TLSConfig{}
+			}
+			a.cfg.TLS.KeyFile = keyPem
+		}
 		writeJSON(w, 200, a.runtimeSettingsBody())
 	default:
 		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
@@ -1307,6 +1387,12 @@ func (a *Admin) handleRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) runtimeSettingsBody() map[string]any {
+	// TLS 配置：证书/私钥路径与管理端需知（路径不算敏感数据）。
+	var tlsEnabled bool
+	var tlsCert, tlsKey string
+	if a.cfg.TLS != nil {
+		tlsEnabled, tlsCert, tlsKey = a.cfg.TLS.Enabled, a.cfg.TLS.CertFile, a.cfg.TLS.KeyFile
+	}
 	return map[string]any{
 		"request_timeout_sec":     a.cfg.Timeouts.Request().Seconds(),
 		"first_token_timeout_sec": a.cfg.Timeouts.FirstToken().Seconds(),
@@ -1318,6 +1404,10 @@ func (a *Admin) runtimeSettingsBody() map[string]any {
 		"currency_rate":   a.cfg.Currency.Rate(),
 		"currency_symbol": a.cfg.Currency.Symbol(),
 		"currency_code":   a.cfg.Currency.Code(),
+		// 可选 HTTPS（重启后生效）。
+		"tls_enabled": tlsEnabled,
+		"tls_cert":    tlsCert,
+		"tls_key":     tlsKey,
 		"defaults": map[string]any{
 			"request_timeout_sec":     config.DefaultRequestTimeout.Seconds(),
 			"first_token_timeout_sec": config.DefaultFirstTokenTimeout.Seconds(),

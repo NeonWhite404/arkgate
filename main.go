@@ -105,6 +105,13 @@ func main() {
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: cors(mux),
+		// 服务器级超时（审计加固）：ReadHeaderTimeout 读头限时把 slowloris 型
+		//「慢速发头/不发头」挡在门外；IdleTimeout 回收长连接，防半开连接堆积。
+		// 刻意**不设 WriteTimeout / ReadTimeout**：WriteTimeout 会切断长流式响应，
+		// ReadTimeout 会误伤「慢客户大量上传到 64MB」的合法请求（大 body 上限已由
+		// 各入口的 MaxBytesReader 单独控制）。
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 优雅停机：停止接收新连接、等在途请求（含流式）收尾，最后才让 defer 链依次
@@ -138,6 +145,16 @@ func main() {
 		}
 	}()
 
+	// 可选 HTTPS：管理面板配置或环境变量提供 PEM 证书/私钥路径并开启开关后，
+	// 用 ServeTLS 提供 TLS 服务（证书解析在 ServeTLS 内部进行，启动即校验）。
+	if cfg.TLS != nil && cfg.TLS.Enabled && cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+		log.Printf("  - HTTPS（TLS）已启用：证书 %s", cfg.TLS.CertFile)
+		if err := srv.ServeTLS(ln, cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("TLS 服务启动失败: %v", err)
+		}
+		log.Printf("HTTPS 已停止，正在落盘剩余统计…")
+		return
+	}
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("服务启动失败: %v", err)
 	}
