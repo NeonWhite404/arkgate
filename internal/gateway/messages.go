@@ -43,15 +43,11 @@ func anthropicErrTypeForStatus(code int) string {
 }
 
 // writeUpstreamErrorAnthropic 是 writeUpstreamError 的 /v1/messages 版：
-// 状态码逻辑一致，错误体统一装进 Anthropic 信封（message 从上游错误体中
-// 提取——OpenAI 与 Anthropic 的错误体都兼容 {"error":{"message"}}）。
+// 状态码逻辑一致，错误消息使用固定文案（不泄露上游原始体/网关内部信息）。
 func (g *Gateway) writeUpstreamErrorAnthropic(w http.ResponseWriter, err error) {
-	if err == nil {
-		err = errors.New("未知错误")
-	}
 	var convErr *provider.ConversionError
 	if errors.As(err, &convErr) {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", err.Error()))
+		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 		return
 	}
 	if he, ok := provider.AsHTTPError(err); ok {
@@ -59,11 +55,10 @@ func (g *Gateway) writeUpstreamErrorAnthropic(w http.ResponseWriter, err error) 
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
-		writeJSON(w, status, errBodyAnthropic(anthropicErrTypeForStatus(status),
-			provider.AnthropicErrorMessage(he.Body, err.Error())))
+		writeJSON(w, status, errBodyAnthropic(anthropicErrTypeForStatus(status), msgUpstreamUnavailable))
 		return
 	}
-	writeJSON(w, http.StatusTooManyRequests, errBodyAnthropic("rate_limit_error", err.Error()))
+	writeJSON(w, http.StatusTooManyRequests, errBodyAnthropic("rate_limit_error", msgServiceUnavailable))
 }
 
 // messagesEntryState 是 /v1/messages 入口解析出的公共信息。
@@ -125,19 +120,19 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !modelAllowed(sk, modelName) {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
+		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgModelNotAllowed))
 		return
 	}
 	// 图像模型没有 chat 语义；路由模型按输入文本长度正常解析。
 	if mt := g.bal.ModelType(modelName); mt == model.ModelTypeImage {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "模型 "+modelName+" 是图像模型，不支持 messages 接口"))
+		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgModelTypeMismatch))
 		return
 	}
 
 	origName := modelName
 	selName, allowModels, rerr := g.applyRouter(modelName, estimateAnthropicInputTokens(body), sk.AllowedModels)
 	if rerr != nil {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", rerr.Error()))
+		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 		return
 	}
 
@@ -192,7 +187,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 				convertedBody, ferr = provider.OpenAIRequestFromAnthropic(st.body)
 				if ferr != nil {
 					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start, meta)
-					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", ferr.Error()))
+					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 					return
 				}
 			}
@@ -236,7 +231,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
-		writeJSON(w, http.StatusInternalServerError, errBodyAnthropic("api_error", "无法建立流式响应"))
+		writeJSON(w, http.StatusInternalServerError, errBodyAnthropic("api_error", msgServiceUnavailable))
 		return
 	}
 
@@ -272,7 +267,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 				convertedBody, oerr = provider.OpenAIRequestFromAnthropic(st.body)
 				if oerr != nil {
 					g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start, meta)
-					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", oerr.Error()))
+					writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 					return
 				}
 			}
@@ -283,7 +278,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 			var convErr *provider.ConversionError
 			if errors.As(oerr, &convErr) {
 				g.recordAttempt(sk, ip, leaf, ri, st.origName, actualModel, model.ModelTypeText, 0, 0, 0, oerr, 0, start, meta)
-				writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", oerr.Error()))
+				writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 				return
 			}
 			// 首字节前打开失败：换叶子重试；下游断开则直接收尾。
@@ -309,10 +304,10 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 		fl.Flush()
 		if perr != nil {
 			// 流已开始，无法更改状态码；用 Anthropic error 事件收尾
-			//（不把失败伪装成正常完成）。
+			//（不把失败伪装成正常完成）。消息使用固定文案。
 			frames, _ := json.Marshal(map[string]any{
 				"type":  "error",
-				"error": map[string]any{"type": "api_error", "message": perr.Error()},
+				"error": map[string]any{"type": "api_error", "message": msgStreamError},
 			})
 			_, _ = w.Write([]byte("event: error\ndata: " + string(frames) + "\n\n"))
 			fl.Flush()
@@ -357,7 +352,7 @@ func (g *Gateway) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !modelAllowed(sk, modelName) {
-		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
+		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgModelNotAllowed))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": estimateAnthropicInputTokens(body)})

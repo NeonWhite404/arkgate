@@ -105,7 +105,7 @@ func (g *Gateway) authSubKey(r *http.Request, modality string) (*model.SubKey, e
 		token = strings.TrimSpace(r.Header.Get("X-Api-Key"))
 	}
 	if token == "" {
-		return nil, errors.New("缺少 API Key（Authorization: Bearer sk-xxx 或 X-Api-Key）")
+		return nil, errors.New("缺少 API Key")
 	}
 	sk, err := g.store.GetSubKeyByHash(hashKey(token))
 	if err != nil {
@@ -513,13 +513,13 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !modelAllowed(sk, modelName) {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelNotAllowed))
 		return
 	}
 	// 模态正向校验：图像模型不能打 chat 接口（在打上游之前给出明确错误，
 	// 而不是转发后被上游 4xx 且记一次「客户端超限」）。
 	if mt := g.bal.ModelType(modelName); mt == model.ModelTypeImage {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是图像模型，不支持 chat 接口"))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelTypeMismatch))
 		return
 	}
 	// 虚拟路由模型解析：type=router 的名字不直接承接流量，先按输入长度
@@ -527,7 +527,7 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	origName := modelName
 	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIChat, body), sk.AllowedModels)
 	if rerr != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 		return
 	}
 	modelName = selName
@@ -613,7 +613,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 		var convErr *provider.ConversionError
 		if errors.As(ferr, &convErr) {
 			g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, model.ModelTypeText, 0, 0, 0, ferr, 0, start, meta)
-			writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", ferr.Error()))
+			writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 			return
 		}
 		var pt, ct int64
@@ -658,25 +658,25 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !modelAllowed(sk, modelName) {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelNotAllowed))
 		return
 	}
 	if mt := g.bal.ModelType(modelName); mt == model.ModelTypeImage {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是图像模型，不支持 responses 接口"))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelTypeMismatch))
 		return
 	}
 	// 虚拟路由模型解析：同 chat（responses 的输入结构不同，估算走对应分支）。
 	origName := modelName
 	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIResponses, body), sk.AllowedModels)
 	if rerr != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", rerr.Error()))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 		return
 	}
 	modelName = selName
 	// 上游协议校验：Anthropic 协议上游只有 messages（chat）能力，
 	// responses 透传对它没有意义，在入口给出明确错误。
 	if p := g.bal.ModelProtocol(modelName); p == model.ModelProtocolAnthropic {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+origName+" 的上游使用 Anthropic 协议，仅支持 /v1/chat/completions"))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelTypeMismatch))
 		return
 	}
 	// 能力前置校验：responses 的输出上限字段是 max_output_tokens；同 chat，
@@ -777,7 +777,7 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !modelAllowed(sk, modelName) {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "该 API Key 无权访问模型 "+modelName))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelNotAllowed))
 		return
 	}
 	// 类型正向校验（在打上游之前给出明确错误，而不是转发后被上游 4xx）：
@@ -785,10 +785,10 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	// 口径：balancer 的启用模型目录（停用/未知名走后面的 Select 报错）。
 	switch g.bal.ModelType(modelName) {
 	case model.ModelTypeText:
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 不是图像模型"))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelTypeMismatch))
 		return
 	case model.ModelTypeRouter:
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "模型 "+modelName+" 是路由模型，不支持图像生成接口"))
+		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgModelTypeMismatch))
 		return
 	}
 
@@ -878,7 +878,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
-		writeJSON(w, http.StatusInternalServerError, errBody("server_error", "无法建立流式响应"))
+		writeJSON(w, http.StatusInternalServerError, errBody("server_error", msgServiceUnavailable))
 		return
 	}
 
@@ -921,7 +921,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 			var convErr *provider.ConversionError
 			if errors.As(oerr, &convErr) {
 				g.recordAttempt(sk, ip, leaf, ri, origName, actualModel, modality, 0, 0, 0, oerr, 0, start, meta)
-				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", oerr.Error()))
+				writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 				return
 			}
 			// 首 token 前打开失败：换叶子重试（此时尚未向客户端写过任何字节）。
@@ -1053,7 +1053,7 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 	}
 	all, err := g.store.ListModels()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errBody("server_error", err.Error()))
+		writeJSON(w, http.StatusInternalServerError, errBody("server_error", msgServiceUnavailable))
 		return
 	}
 	items := make([]modelObj, 0, len(all))
@@ -1077,60 +1077,21 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────── 错误输出 ───────────────────────────
 
 // writeUpstreamError 把最终错误以合理状态码 + OpenAI 结构回给客户端。
-// 上游错误体需**脱敏后**再透传（见 sanitizeUpstreamError）：上游原始错误体里
-// 常带真实模型标识（ep-xxx）、账号线索、上游请求 id 等运维信息，属于越权数据
-// （与门户日志的「错误文本不下发」同一红线）。状态码原样保留供客户端语义判断。
+// 消息一律使用固定文案，不泄露上游原始错误体（含 ep-xxx、账号线索、上游请求 id
+// 等运维信息）、网关拓扑（账号名/模型名/叶子状态）或任何内部状态。详细错误信息
+// 仅记录在网关日志（usage_logs.error）供排查。状态码保留供客户端语义判断。
 func (g *Gateway) writeUpstreamError(w http.ResponseWriter, err error) {
-	if err == nil {
-		err = errors.New("未知错误")
-	}
 	if he, ok := provider.AsHTTPError(err); ok {
 		status := he.Code
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(errBody("upstream_error", sanitizeUpstreamError(he.Body)))
+		writeJSON(w, status, errBody("upstream_error", msgUpstreamUnavailable))
 		return
 	}
-	// 本地错误（无账号/全熔断/限流/无能力等）用 429 + OpenAI 结构。
-	writeJSON(w, http.StatusTooManyRequests, errBody("upstream_error", errText(err)))
+	// 本地错误（无账号/全熔断/限流/无能力等）。
+	writeJSON(w, http.StatusTooManyRequests, errBody("upstream_error", msgServiceUnavailable))
 }
-
-// sanitizeUpstreamError 从上游错误体里提取人类可读的 message，剥除上游模型
-// 标识/请求 id 等运维信息。提取失败时回落截断后的原始文本（不把本该给客户端的
-// 错误原因折叠成「未知错误」）。
-func sanitizeUpstreamError(body []byte) string {
-	var parsed struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
-		return truncateErrText(parsed.Error.Message)
-	}
-	var generic struct {
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(body, &generic) == nil && generic.Message != "" {
-		return truncateErrText(generic.Message)
-	}
-	summary := strings.TrimSpace(string(body))
-	if summary == "" {
-		return "上游返回错误"
-	}
-	return truncateErrText(summary)
-}
-
-// truncateErrText 把错误文本截断到合理长度，避免把长 HTML 页面整段灌回客户端。
-func truncateErrText(s string) string {
-	if len(s) > 300 {
-		return s[:300] + "…"
-	}
-	return s
-}
-
 // flushWriter 每写即刷：SSE 事件必须及时推送，不能等上游整条流结束后才落客户端。
 type flushWriter struct {
 	w io.Writer
@@ -1147,13 +1108,9 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 
 // writeSSEError 给已开始的流补错误帧。Chat/图像用 chunk 形状（error + [DONE]）；
 // Responses 必须用其 event: error 类型（不伪装 [DONE]），否则客户端无法解析。
-// 错误文本同样经 sanitizeUpstreamError 脱敏——首字节后才失败的上游错误体里同样
-// 可能带真实模型标识/请求 id。
+// 消息使用固定文案，不泄露上游或网关内部信息（首字节后失败同理）。
 func writeSSEError(w http.ResponseWriter, err error, api balancer.API) {
-	msg := errText(err)
-	if he, ok := provider.AsHTTPError(err); ok {
-		msg = sanitizeUpstreamError(he.Body)
-	}
+	msg := msgStreamError
 	if api == balancer.APIResponses {
 		payload, _ := json.Marshal(map[string]any{"type": "error", "code": "upstream_error", "message": msg})
 		_, _ = w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
@@ -1165,6 +1122,17 @@ func writeSSEError(w http.ResponseWriter, err error, api balancer.API) {
 }
 
 // ─────────────────────────── 工具 ───────────────────────────
+
+// ───────────────────── 下游错误消息（统一规范，不泄露上游/网关内部信息） ─────────────────────
+
+const (
+	msgUpstreamUnavailable = "上游服务暂时不可用"
+	msgServiceUnavailable  = "服务暂时不可用，请稍后重试"
+	msgRequestInvalid      = "请求参数不符合要求"
+	msgStreamError         = "处理请求时发生错误"
+	msgModelNotAllowed     = "该 API Key 无权访问指定模型"
+	msgModelTypeMismatch   = "该模型不支持此接口"
+)
 
 // maxRequestBody 下游请求体的上限。
 //
