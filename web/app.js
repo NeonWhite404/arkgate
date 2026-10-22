@@ -2044,7 +2044,7 @@ const SettingsPage = {
     return {
       prefs,
       rt: null,          // 网关运行时设置（服务端）
-      rtForm: { request_timeout_sec: 0, first_token_timeout_sec: 0 },
+      rtForm: { request_timeout_sec: 0, first_token_timeout_sec: 0, max_retries: 3 },
       tlsForm: { tls_enabled: false, tls_cert: "", tls_key: "" },
       savingRt: false,
     };
@@ -2065,6 +2065,7 @@ const SettingsPage = {
           this.rtForm = {
             request_timeout_sec: d.request_timeout_sec,
             first_token_timeout_sec: d.first_token_timeout_sec,
+            max_retries: d.max_retries,
             currency_rate: d.currency_rate || 0,
             currency_symbol: d.currency_symbol || "$",
             currency_code: d.currency_code || "USD",
@@ -2085,6 +2086,7 @@ const SettingsPage = {
       req("PUT", "/api/settings/runtime", {
         request_timeout_sec: Number(this.rtForm.request_timeout_sec) || 0,
         first_token_timeout_sec: Number(this.rtForm.first_token_timeout_sec) || 0,
+        max_retries: Number(this.rtForm.max_retries) || 0,
         currency_rate: Number(this.rtForm.currency_rate) || 0,
         currency_symbol: this.rtForm.currency_symbol,
         currency_code: this.rtForm.currency_code,
@@ -2102,6 +2104,7 @@ const SettingsPage = {
       this.rtForm = {
         request_timeout_sec: this.rt.defaults.request_timeout_sec,
         first_token_timeout_sec: this.rt.defaults.first_token_timeout_sec,
+        max_retries: this.rt.defaults.max_retries,
       };
       this.saveRuntime();
     },
@@ -2125,8 +2128,8 @@ const SettingsPage = {
   template: `
   <div class="page">
     <div class="page-title">设置</div>
-    <div class="page-sub">上游超时保存在网关，对所有客户端生效；外观与总览偏好只存本浏览器。</div>
-    <div class="card"><div class="card-head"><div class="card-title">上游超时（网关级，热生效无需重启）</div></div>
+    <div class="page-sub">上游超时与重试保存在网关，对所有客户端生效；外观与总览偏好只存本浏览器。</div>
+    <div class="card"><div class="card-head"><div class="card-title">上游超时与重试（网关级，热生效无需重启）</div></div>
       <div class="form-row">
         <div class="form-item"><label>请求超时（秒，0 = 不限）</label>
           <input v-model.number="rtForm.request_timeout_sec" type="number" min="0" :max="rt && rt.max_timeout_sec || 3600" step="1"/>
@@ -2134,6 +2137,9 @@ const SettingsPage = {
         <div class="form-item"><label>流式首字节超时（秒，0 = 关闭）</label>
           <input v-model.number="rtForm.first_token_timeout_sec" type="number" min="0" :max="rt && rt.max_timeout_sec || 3600" step="1"/>
           <div class="form-tip">上游建连后多久没吐出第一个字节就换下一个接入点重试（首字节前重试对客户端无感）。</div></div>
+        <div class="form-item"><label>跨接入点重试次数</label>
+          <input v-model.number="rtForm.max_retries" type="number" min="0" :max="rt && rt.max_retries_hard_limit || 10" step="1"/>
+          <div class="form-tip">单次请求失败后最多换几个接入点叶重试（0 = 只尝试一次不重试）。调大可让 fallback 链尾更容易被试到，代价是故障时上游重试放大。</div></div>
       </div>
       <div class="row-actions">
         <button class="btn btn-primary" :disabled="savingRt" @click="saveRuntime">{{ savingRt ? '保存中…' : '保存' }}</button>
@@ -2141,7 +2147,6 @@ const SettingsPage = {
       </div>
       <div class="kv" v-if="rt" style="margin-top:12px">
         <span class="k">会话粘性 TTL</span><span class="v mono">{{ rt.session_ttl_sec }}s（ARKGATE_SESSION_TTL）</span></div>
-      <div class="kv" v-if="rt"><span class="k">跨接入点重试上限</span><span class="v mono">{{ rt.max_retries }} 次</span></div>
     </div>
     <div class="card"><div class="card-head"><div class="card-title">计价币种（展示层，热生效）</div></div>
       <div class="form-row">

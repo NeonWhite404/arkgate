@@ -52,3 +52,63 @@ func TestLoadTimeoutDefaults(t *testing.T) {
 		t.Fatalf("explicit 0 must disable first-token timeout, got %v", c.Timeouts.FirstToken())
 	}
 }
+
+// TestRetriesSetGet 锁定跨接入点重试次数的读写语义：可热改、
+// 非法值（负数/超硬上限）回落内置默认而不是静默接受。
+func TestRetriesSetGet(t *testing.T) {
+	var r Retries
+	r.SetMax(3)
+	if r.Max() != 3 {
+		t.Fatalf("set/get mismatch: %d", r.Max())
+	}
+	// 热改：后续读立即拿到新值（网关热路径并发读，原子存取）。
+	r.SetMax(0)
+	if r.Max() != 0 {
+		t.Fatalf("hot update to 0 failed: %d", r.Max())
+	}
+	// 0 是合法值（只打一发不重试），不得被回落。
+	r.SetMax(MaxRetriesHardLimit)
+	if r.Max() != MaxRetriesHardLimit {
+		t.Fatalf("hard limit must be accepted: %d", r.Max())
+	}
+	// 超上限与负值回落默认：环境变量/手滑输入不该让网关进入
+	// 「无限重试」或「意外零重试」状态。
+	r.SetMax(MaxRetriesHardLimit + 1)
+	if r.Max() != DefaultMaxRetries {
+		t.Fatalf("over-limit must fall back to default: %d", r.Max())
+	}
+	r.SetMax(-2)
+	if r.Max() != DefaultMaxRetries {
+		t.Fatalf("negative must fall back to default: %d", r.Max())
+	}
+}
+
+// TestLoadRetriesEnv 锁定环境变量口径：未设置用内置默认，
+// 合法值透传，非法值（非数字/负数）回落默认。
+func TestLoadRetriesEnv(t *testing.T) {
+	t.Setenv("ARKGATE_MAX_RETRIES", "")
+	c := Load()
+	if c.Retries.Max() != DefaultMaxRetries {
+		t.Fatalf("default retries = %d", c.Retries.Max())
+	}
+
+	t.Setenv("ARKGATE_MAX_RETRIES", "7")
+	c = Load()
+	if c.Retries.Max() != 7 {
+		t.Fatalf("env retries = %d", c.Retries.Max())
+	}
+
+	// 0 = 关闭重试，是合法语义。
+	t.Setenv("ARKGATE_MAX_RETRIES", "0")
+	c = Load()
+	if c.Retries.Max() != 0 {
+		t.Fatalf("explicit 0 must disable retries, got %d", c.Retries.Max())
+	}
+
+	// 非法输入按未设置处理。
+	t.Setenv("ARKGATE_MAX_RETRIES", "abc")
+	c = Load()
+	if c.Retries.Max() != DefaultMaxRetries {
+		t.Fatalf("invalid env must fall back to default: %d", c.Retries.Max())
+	}
+}

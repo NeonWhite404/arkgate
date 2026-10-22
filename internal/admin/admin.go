@@ -62,6 +62,8 @@ const maxAdminRequestBody = 64 << 20
 const (
 	keyTimeoutRequest    = "timeout_request_sec"
 	keyTimeoutFirstToken = "timeout_first_token_sec"
+	// 跨接入点重试次数（热改）：单次请求失败后最多换几个叶子重试。
+	keyMaxRetries = "max_retries"
 	// 计价币种：单价与成本始终以美元存储，这里只存「展示用」的汇率与符号。
 	keyCurrencyRate   = "currency_rate"
 	keyCurrencySymbol = "currency_symbol"
@@ -78,6 +80,7 @@ func New(st *store.Store, box *secure.Box, bal *balancer.Balancer, cfg *config.C
 	a := &Admin{store: st, box: box, bal: bal, cfg: cfg, catalog: catalog.New(),
 		mgr: provider.NewManager(), usageCache: store.NewUsageCache(store.UsageCacheTTL)}
 	a.loadPersistedTimeouts()
+	a.loadPersistedRetries()
 	a.loadPersistedCurrency()
 	a.loadPersistedTLS()
 	a.handler = a.routes()
@@ -94,6 +97,16 @@ func (a *Admin) loadPersistedTimeouts() {
 	if v, ok := a.store.GetSetting(keyTimeoutFirstToken); ok {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
 			a.cfg.Timeouts.SetFirstToken(time.Duration(f * float64(time.Second)))
+		}
+	}
+}
+
+// loadPersistedRetries 启动时把 DB 里的跨接入点重试次数覆盖到 cfg
+// （未设置过则保留环境变量/默认值）。
+func (a *Admin) loadPersistedRetries() {
+	if v, ok := a.store.GetSetting(keyMaxRetries); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			a.cfg.Retries.SetMax(n)
 		}
 	}
 }
@@ -1293,6 +1306,21 @@ func (a *Admin) handleRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"detail": err.Error()})
 			return
 		}
+		// 跨接入点重试次数：仅接受显式携带的键（部分更新，与超时同一语义）。
+		// 负值或超硬上限直接拒绝而非静默回落——管理员改这个值是在排障，
+		// 「保存了但没生效」比报 400 更难排查。
+		if raw, ok := probe["max_retries"]; ok {
+			n := intField(raw)
+			if n < 0 || n > config.MaxRetriesHardLimit {
+				writeJSON(w, 400, map[string]any{"detail": fmt.Sprintf("max_retries 需在 0~%d 之间", config.MaxRetriesHardLimit)})
+				return
+			}
+			if err := a.store.SetSetting(keyMaxRetries, strconv.Itoa(n)); err != nil {
+				writeJSON(w, 500, map[string]any{"detail": err.Error()})
+				return
+			}
+			a.cfg.Retries.SetMax(n)
+		}
 		// 计价币种（展示层）。刻意允许很大的汇率上限——兑换率本身没有天然上界
 		// （历史上出现过 1:10000+ 的币种），卡得太死只会妨碍使用；但要挡住负值
 		// 与非数字，否则界面会显示莫名其妙的金额。
@@ -1397,9 +1425,10 @@ func (a *Admin) runtimeSettingsBody() map[string]any {
 		"request_timeout_sec":     a.cfg.Timeouts.Request().Seconds(),
 		"first_token_timeout_sec": a.cfg.Timeouts.FirstToken().Seconds(),
 		"session_ttl_sec":         a.cfg.SessionTTL.Seconds(),
-		"max_retries":             a.cfg.MaxRetriesAvailable,
+		"max_retries":             a.cfg.Retries.Max(),
 		"max_timeout_sec":         maxTimeoutSec,
 		"max_currency_rate":       maxCurrencyRate,
+		"max_retries_hard_limit":  config.MaxRetriesHardLimit,
 		// 计价币种：单价与成本以美元存储，这两个值只影响展示换算。
 		"currency_rate":   a.cfg.Currency.Rate(),
 		"currency_symbol": a.cfg.Currency.Symbol(),
@@ -1411,6 +1440,7 @@ func (a *Admin) runtimeSettingsBody() map[string]any {
 		"defaults": map[string]any{
 			"request_timeout_sec":     config.DefaultRequestTimeout.Seconds(),
 			"first_token_timeout_sec": config.DefaultFirstTokenTimeout.Seconds(),
+			"max_retries":             config.DefaultMaxRetries,
 		},
 	}
 }

@@ -156,7 +156,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 	// OpenAI 协议上游的请求转换只做一次（内容与叶子无关），失败直接 400。
 	var convertedBody []byte
 
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		sticky := ""
 		if attempt == 0 {
 			sticky = sk.ID
@@ -238,7 +238,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 	exclude := map[string]bool{}
 	var lastErr error
 	var convertedBody []byte
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		sticky := ""
 		if attempt == 0 {
 			sticky = sk.ID

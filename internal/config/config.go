@@ -40,6 +40,34 @@ func max0(d time.Duration) time.Duration {
 	return d
 }
 
+// Retries 跨接入点（相邻叶子）重试次数的运行时可调值。语义与 Timeouts 相同：
+// 管理端热改、网关转发热路径并发读，因此用原子存取。
+//
+// 语义：单次客户端请求在失败后「换下一个接入点叶」的最大重试次数（不含首次
+// 尝试；即值为 N 时最多尝试 N+1 个叶子，配合 fallback 链跨模型推进）。
+// 0 表示失败后不换叶（只打一发）。
+type Retries struct {
+	max atomic.Int64
+}
+
+// Max 返回跨接入点重试次数（不含首次尝试）。
+func (r *Retries) Max() int { return int(r.max.Load()) }
+
+// SetMax 由管理端热改；负值或超上限时回落到内置默认（非法输入不该让
+// 网关进入「0 重试」或「无限重试」的意外状态，宁可忽略）。
+func (r *Retries) SetMax(n int) {
+	if n < 0 || int64(n) > MaxRetriesHardLimit {
+		n = DefaultMaxRetries
+	}
+	r.max.Store(int64(n))
+}
+
+// MaxRetriesHardLimit 重试次数硬上限：每次重试都会真实打到上游（消耗配额、
+// 放大故障时的重试风暴），上限是为了挡住手滑输入（如把 3 敲成 300）。
+// 导出供管理端校验使用（admin 与 config 必须用同一个上限，否则会出现
+// 「保存成功但读回来被回落」的静默不一致）。
+const MaxRetriesHardLimit = 10
+
 // Currency 展示币种与汇率。
 //
 // 设计取舍（重要）：**存储始终保持美元**。
@@ -122,8 +150,10 @@ type Config struct {
 	AccessToken string
 
 	// 代理轮询等默认参数。
-	DefaultCircuitMax   time.Duration
-	MaxRetriesAvailable int
+	DefaultCircuitMax time.Duration
+
+	// Retries 跨接入点重试次数（含环境变量 ARKGATE_MAX_RETRIES、设置页热改）。
+	Retries *Retries
 
 	// Timeouts 上游超时（非流式整体超时 + 流式首字节超时）：
 	// 启动时取「DB 持久化值 > 环境变量 > 内置默认」，之后可在设置页热改。
@@ -145,6 +175,9 @@ const (
 	DefaultFirstTokenTimeout = 30 * time.Second
 )
 
+// DefaultMaxRetries 跨接入点重试次数的内置默认（环境变量与 DB 均未设置时）。
+const DefaultMaxRetries = 3
+
 // Load 从环境变量加载配置，未设置的项回落到默认值。
 func Load() *Config {
 	Conf.ListenAddr = getenv("ARKGATE_ADDR", "0.0.0.0:8002")
@@ -153,7 +186,11 @@ func Load() *Config {
 	Conf.AccessToken = os.Getenv("ARKGATE_TOKEN")
 
 	Conf.DefaultCircuitMax = 60 * time.Second
-	Conf.MaxRetriesAvailable = 3
+
+	if Conf.Retries == nil {
+		Conf.Retries = &Retries{}
+	}
+	Conf.Retries.SetMax(getInt("ARKGATE_MAX_RETRIES", DefaultMaxRetries))
 
 	if Conf.Timeouts == nil {
 		Conf.Timeouts = &Timeouts{}
@@ -198,6 +235,20 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// getInt 读取整型环境变量；未设置或解析失败返回 def，负数同样回落 def
+// （重试次数不存在「负数 = 关闭」的语义，非法输入按未设置处理）。
+func getInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
 }
 
 // getFloat 读取浮点环境变量；未设置或解析失败返回 def。

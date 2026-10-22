@@ -560,7 +560,7 @@ func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *mode
 	var lastErr error
 	exclude := map[string]bool{}
 
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		// 粘性会话只在全新请求的首次选举上生效；重试路径为空，避免钉错。
 		sticky := ""
 		if attempt == 0 {
@@ -703,7 +703,7 @@ func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk 
 	var lastErr error
 	exclude := map[string]bool{}
 
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		sticky := ""
 		if attempt == 0 {
 			sticky = sk.ID
@@ -807,7 +807,7 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 	var lastErr error
 	exclude := map[string]bool{}
 
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		sticky := ""
 		if attempt == 0 {
 			sticky = sk.ID
@@ -884,7 +884,7 @@ func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *mode
 
 	exclude := map[string]bool{}
 	var lastErr error
-	for attempt := 0; attempt <= g.cfg.MaxRetriesAvailable; attempt++ {
+	for attempt := 0; attempt <= g.cfg.Retries.Max(); attempt++ {
 		sticky := ""
 		if attempt == 0 {
 			sticky = sk.ID
