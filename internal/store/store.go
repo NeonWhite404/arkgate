@@ -66,7 +66,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // v16：接入点级默认请求体参数列（endpoints.default_body_params；与 v10 的
 //
 //	request_headers 同构——下游不会发、由网关按需补上的上游方言参数）。
-const schemaVersion = "16"
+//
+// v17：用量来源列（usage_logs.usage_source；区分「上游上报 / 网关估算 / 未知」）。
+const schemaVersion = "17"
 
 func (s *Store) migrate() error {
 	stmts := []string{
@@ -358,6 +360,18 @@ func (s *Store) migrate() error {
 		// 否则清理/回填/审计都无法判断某一行到底是日、周还是月。
 		// 0 = 历史行（等价「日」，与旧行为一致）。
 		`ALTER TABLE usage_daily ADD COLUMN window_secs INTEGER NOT NULL DEFAULT 0`,
+		// ────── v17：用量来源 ──────
+		// 背景：部分上游（典型如 CLIProxyAPI 的 gpt-5.6-reasoning 别名）**从不**
+		// 返回 usage。旧实现于是把整次请求记成 0 token / 0 成本——既少计费，
+		// 也让用量分析出现断崖。现在上游不给时用本地估算兜底，但必须能区分
+		// 「真实值」与「估算值」，否则两者混在同一列里，报表与账单都不可信。
+		//
+		//	0 = 未知（历史行；或取不到且无法估算，值不可信）
+		//	1 = 上游上报（可作计费依据）
+		//	2 = 网关估算（按请求体/输出字符数折算，用于避免记 0）
+		//
+		// 默认 0 是**刻意**的：历史行不能谎称可信，只能标成未知。
+		`ALTER TABLE usage_logs ADD COLUMN usage_source INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, st := range alters {
 		if _, err := s.db.Exec(st); err != nil {
@@ -1251,14 +1265,16 @@ func (s *Store) AddUsageLog(l *model.UsageLog) error {
 	_, err := s.db.Exec(`INSERT INTO usage_logs
 		(ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,requested_model,model,ep,modality,
 		 prompt_tokens,completion_tokens,total_tokens,image_count,cost,status,latency_ms,first_token_ms,error,client_ip,
-		 error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent,
+		 usage_source)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nonzero(l.TS, nowUnix()), l.SubKeyID, l.SubKeyName, l.AccountID, l.AccountName, l.Provider,
 		l.EndpointID, l.RequestedModel, l.Model, l.EP, l.Modality,
 		l.PromptTokens, l.CompletionTokens, l.TotalTokens, l.ImageCount, l.Cost, l.Status, l.LatencyMs,
 		l.FirstTokenMs, l.Error, l.ClientIP,
 		l.ErrorKind, boolToInt(l.IsStream), l.CacheCreationTokens, l.CacheReadTokens,
-		l.InputCost, l.OutputCost, l.CacheCost, truncateStr(l.UserAgent, 200))
+		l.InputCost, l.OutputCost, l.CacheCost, truncateStr(l.UserAgent, 200),
+		l.UsageSource)
 	return err
 }
 
@@ -1285,7 +1301,8 @@ func truncateStr(s string, n int) string {
 const usageLogCols = `id,ts,subkey_id,subkey_name,account_id,account_name,provider,endpoint_id,
 	requested_model,model,ep,modality,prompt_tokens,completion_tokens,total_tokens,image_count,
 	cost,status,latency_ms,first_token_ms,error,client_ip,
-	error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent`
+	error_kind,is_stream,cache_creation_tokens,cache_read_tokens,input_cost,output_cost,cache_cost,user_agent,
+	usage_source`
 
 func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 	l := &model.UsageLog{}
@@ -1295,7 +1312,7 @@ func scanUsageLog(rows *sql.Rows) (*model.UsageLog, error) {
 		&l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.ImageCount,
 		&l.Cost, &l.Status, &l.LatencyMs, &l.FirstTokenMs, &l.Error, &l.ClientIP,
 		&l.ErrorKind, &isStream, &l.CacheCreationTokens, &l.CacheReadTokens,
-		&l.InputCost, &l.OutputCost, &l.CacheCost, &l.UserAgent); err != nil {
+		&l.InputCost, &l.OutputCost, &l.CacheCost, &l.UserAgent, &l.UsageSource); err != nil {
 		return nil, err
 	}
 	l.IsStream = isStream != 0

@@ -166,7 +166,7 @@ func extractModel(body []byte) string {
 //
 // 不能直接用 `struct{ Stream bool }` 解码：字符串 "true"/"false" 会让整个解码
 // 失败并被静默当成非流式，随后请求体被原样透传给上游，触发上游的类型错误
-//（"stream 必须是布尔值"）。这里读 RawMessage 后宽容解析，与
+// （"stream 必须是布尔值"）。这里读 RawMessage 后宽容解析，与
 // provider.normalizeStreamFlag 的取值口径保持一致。
 func wantsStream(body []byte) bool {
 	var v struct {
@@ -235,7 +235,7 @@ type routeInfo struct {
 // 用 newReqMeta(r, stream) 取一次，传值（非指针）避免逃逸到堆。
 //
 // 注意：UserAgent 只写入 usage_logs，**不得**加入门户列白名单
-//（store.subKeyLogCols）——UA 可指纹化下游客户端，属管理端可见信息。
+// （store.subKeyLogCols）——UA 可指纹化下游客户端，属管理端可见信息。
 type reqMeta struct {
 	userAgent string // 截断 200 字节；仅管理端可见
 	isStream  bool   // 本请求走流式路径（用于区分 TTFT 口径与流式占比）
@@ -243,12 +243,42 @@ type reqMeta struct {
 	// 非流式在拿到 TextUsage 后填，流式在 Pump 结束后填。
 	cacheCreation int64
 	cacheRead     int64
+	// estPrompt 是本次请求的输入 token 本地估算值（按请求体字符数折算）。
+	//
+	// 只在上游**完全不报 usage** 时才会被用到（见 resolveUsage）：部分上游
+	// （实测 CLIProxyAPI 的 gpt-5.6-reasoning 别名 173/173 条）从不返回 usage，
+	// 旧实现于是把整次请求记成 0 token / 0 成本，既少计费也让报表出现断崖。
+	//
+	// 不另花代价：虚拟路由选型（applyRouter）本来就要算一次输入长度，
+	// 这里只是把那个值留下来备用。
+	estPrompt int64
 }
 
 // newReqMeta 从请求取一次元数据。stream 由各入口根据自己的分流结果传入
-//（不能用 wantsStream 现算：归一后 body 已改写，且 anthropic 入口的判定不同源）。
+// （不能用 wantsStream 现算：归一后 body 已改写，且 anthropic 入口的判定不同源）。
 func newReqMeta(r *http.Request, stream bool) reqMeta {
 	return reqMeta{userAgent: r.Header.Get("User-Agent"), isStream: stream}
+}
+
+// resolveUsage 决定本次尝试最终记账用的 token 数与用量来源。
+//
+// 优先级是**硬约束**：上游给了真实值就绝不用估算值。只有上游完全没给
+// （pt 与 ct 均为 0）时才启用本地估算，并标记 usage_source=估算，
+// 以便报表能把它与真实值区分开（混在一起则账单与命中率都不可信）。
+//
+// 估算口径：输入取 reqMeta.estPrompt（applyRouter 顺手算的请求体估算），
+// 输出由 provider 层按输出字符数折算（见 Stream.Usage）。两者共用
+// model 包的同一套折算函数，保证同一错误在两边一致。
+func resolveUsage(pt, ct int64, meta reqMeta) (int64, int64, int) {
+	if pt > 0 || ct > 0 {
+		return pt, ct, model.UsageSourceUpstream
+	}
+	// 上游没给。输入用请求体估算；输出为 0 说明上游连内容都没吐（或
+	// 全部内容都是空串），此时估算值等于输入侧——仍然比记 0 接近真相。
+	if meta.estPrompt > 0 {
+		return meta.estPrompt, ct, model.UsageSourceEstimated
+	}
+	return pt, ct, model.UsageSourceUnknown
 }
 
 // resolveRoute 把选中的叶节点解析成可发送路由：
@@ -361,30 +391,38 @@ func (g *Gateway) recordAttempt(sk *model.SubKey, ip string, leaf *model.Endpoin
 	// 两者的区别只在日志标注上（便于分别统计），对熔断的影响一致。
 	clientErr := !ok && (provider.IsRequestFault(ferr) || provider.IsClientCancel(ferr))
 	cancelErr := !ok && provider.IsClientCancel(ferr)
+	// 用量来源判定：上游没给 usage 时用本地估算兜底（否则整次请求记 0 token /
+	// 0 成本）。**只对成功请求**估算——失败的尝试本来就不该产生计费，
+	// 把它们也算出 token 会让失败率与成本统计双双失真。
+	usageSource := model.UsageSourceUnknown
+	if ok {
+		pt, ct, usageSource = resolveUsage(pt, ct, meta)
+	}
 	l := &model.UsageLog{
-		TS:               time.Now().Unix(),
-		SubKeyID:         sk.ID,
-		SubKeyName:       sk.Name,
-		AccountID:        ri.accountID,
-		AccountName:      ri.accountName,
-		Provider:         ri.rt.Def.ID,
-		EndpointID:       leaf.ID,
-		EP:               leaf.EP, // 实际调用的上游模型标识
-		RequestedModel:   requestedModel,
-		Model:            actualModel, // 记录真实命中的模型（fallback 后）
-		Modality:         modality,
-		PromptTokens:     pt,
-		CompletionTokens: ct,
-		TotalTokens:      pt + ct,
-		ImageCount:       images,
-		Status:           "ok",
-		LatencyMs:        time.Since(start).Milliseconds(),
-		FirstTokenMs:     firstTokenMs,
-		ClientIP:         ip,
+		TS:                  time.Now().Unix(),
+		SubKeyID:            sk.ID,
+		SubKeyName:          sk.Name,
+		AccountID:           ri.accountID,
+		AccountName:         ri.accountName,
+		Provider:            ri.rt.Def.ID,
+		EndpointID:          leaf.ID,
+		EP:                  leaf.EP, // 实际调用的上游模型标识
+		RequestedModel:      requestedModel,
+		Model:               actualModel, // 记录真实命中的模型（fallback 后）
+		Modality:            modality,
+		PromptTokens:        pt,
+		CompletionTokens:    ct,
+		TotalTokens:         pt + ct,
+		ImageCount:          images,
+		Status:              "ok",
+		LatencyMs:           time.Since(start).Milliseconds(),
+		FirstTokenMs:        firstTokenMs,
+		ClientIP:            ip,
 		IsStream:            meta.isStream,
 		UserAgent:           meta.userAgent,
 		CacheCreationTokens: meta.cacheCreation,
 		CacheReadTokens:     meta.cacheRead,
+		UsageSource:         usageSource,
 	}
 	if !ok {
 		l.Status = "error"
@@ -525,7 +563,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 虚拟路由模型解析：type=router 的名字不直接承接流量，先按输入长度
 	// 换算成真实目标模型，之后的选路/裁剪/粘性都针对目标进行。
 	origName := modelName
-	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIChat, body), sk.AllowedModels)
+	// 输入长度估算同时服务于路由选型与「上游不报 usage 时的计费兜底」，
+	// 算一次传下去，避免两处各算一遍（口径也会漂移）。
+	estTokens := estimateInputTokens(balancer.APIChat, body)
+	selName, allowModels, rerr := g.applyRouter(modelName, estTokens, sk.AllowedModels)
 	if rerr != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 		return
@@ -542,10 +583,10 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if wantsStream(body) {
 		// 流式：首字节之前未向客户端写过数据，失败可换叶子重试；
 		// 首字节到手后才提交 SSE 响应头，之后单次尝试到流结束。
-		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIChat)
+		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIChat, estTokens)
 		return
 	}
-	g.chatNonStream(w, r, sk, body, origName, modelName, allowModels)
+	g.chatNonStream(w, r, sk, body, origName, modelName, allowModels, estTokens)
 }
 
 // chatNonStream 非流式：支持失败后排除当前叶子、切换下一个重试。
@@ -553,10 +594,11 @@ func (g *Gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // （路由解析后）；日志里 requested_model 记 origName，让「路由模型 → 真实模型」
 // 的分流在日志里可见。
 func (g *Gateway) chatNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
-	origName, selName string, allowModels []string) {
+	origName, selName string, allowModels []string, estTokens int64) {
 	start := time.Now()
 	ip := clientIP(r)
 	meta := newReqMeta(r, false) // 走非流式路径
+	meta.estPrompt = estTokens
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -667,7 +709,8 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	// 虚拟路由模型解析：同 chat（responses 的输入结构不同，估算走对应分支）。
 	origName := modelName
-	selName, allowModels, rerr := g.applyRouter(modelName, estimateInputTokens(balancer.APIResponses, body), sk.AllowedModels)
+	estTokens := estimateInputTokens(balancer.APIResponses, body)
+	selName, allowModels, rerr := g.applyRouter(modelName, estTokens, sk.AllowedModels)
 	if rerr != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", msgRequestInvalid))
 		return
@@ -688,18 +731,19 @@ func (g *Gateway) responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIResponses)
+		g.streamForward(w, r, sk, body, origName, modelName, allowModels, balancer.APIResponses, estTokens)
 		return
 	}
-	g.responsesNonStream(w, r, sk, body, origName, modelName, allowModels)
+	g.responsesNonStream(w, r, sk, body, origName, modelName, allowModels, estTokens)
 }
 
 // responsesNonStream 非流式 responses：与 chat 相同的重试语义（origName/selName 见 chatNonStream）。
 func (g *Gateway) responsesNonStream(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
-	origName, selName string, allowModels []string) {
+	origName, selName string, allowModels []string, estTokens int64) {
 	start := time.Now()
 	ip := clientIP(r)
 	meta := newReqMeta(r, false)
+	meta.estPrompt = estTokens
 	var lastErr error
 	exclude := map[string]bool{}
 
@@ -793,7 +837,9 @@ func (g *Gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wantsStream(body) {
-		g.streamForward(w, r, sk, body, modelName, modelName, sk.AllowedModels, balancer.APIImages)
+		// 图像请求没有输入长度语义（路由模型不承接图像），估算值恒 0，
+		// 因此上游不报 usage 时无法兜底——按「未知」记账，不凭空造 token。
+		g.streamForward(w, r, sk, body, modelName, modelName, sk.AllowedModels, balancer.APIImages, 0)
 		return
 	}
 	g.imagesNonStream(w, r, sk, body, modelName)
@@ -869,12 +915,13 @@ func (g *Gateway) imagesNonStream(w http.ResponseWriter, r *http.Request, sk *mo
 //     SSE error 帧收尾；
 //   - 所有叶子都失败时，以普通 HTTP 错误透传（此时响应头尚未提交）。
 func (g *Gateway) streamForward(w http.ResponseWriter, r *http.Request, sk *model.SubKey, body []byte,
-	origName, selName string, allowModels []string, api balancer.API) {
+	origName, selName string, allowModels []string, api balancer.API, estTokens int64) {
 
 	start := time.Now()
 	modality := modalityOf(api)
 	ip := clientIP(r)
 	meta := newReqMeta(r, true) // 本函数只服务流式请求
+	meta.estPrompt = estTokens
 
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -1092,6 +1139,7 @@ func (g *Gateway) writeUpstreamError(w http.ResponseWriter, err error) {
 	// 本地错误（无账号/全熔断/限流/无能力等）。
 	writeJSON(w, http.StatusTooManyRequests, errBody("upstream_error", msgServiceUnavailable))
 }
+
 // flushWriter 每写即刷：SSE 事件必须及时推送，不能等上游整条流结束后才落客户端。
 type flushWriter struct {
 	w io.Writer

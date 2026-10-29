@@ -15,7 +15,8 @@ import (
 //
 // 做法：手工构造一个「缺失 v13 列」的库 + 写入历史数据，然后走正常 Open 升级，
 // 断言：① 升级成功；② 历史数据一字不改；③ 新列取默认值（= 旧行为）；
-//       ④ 重复升级幂等。
+//
+//	④ 重复升级幂等。
 func TestAuditMigrateV12ToV13(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "arkgate.db")
@@ -128,8 +129,10 @@ func TestAuditMigrateV12ToV13(t *testing.T) {
 				t.Fatalf("历史行 1 被改动: %+v", l)
 			}
 			// ③ 新列取默认值（= 旧行为）
+			// usage_source 必须是 0（未知）：历史行不能谎称「上游上报」可信。
 			if l.ErrorKind != "" || l.IsStream || l.CacheReadTokens != 0 ||
-				l.InputCost != 0 || l.OutputCost != 0 || l.CacheCost != 0 || l.UserAgent != "" {
+				l.InputCost != 0 || l.OutputCost != 0 || l.CacheCost != 0 || l.UserAgent != "" ||
+				l.UsageSource != model.UsageSourceUnknown {
 				t.Fatalf("新列应为零值, got %+v", l)
 			}
 		}
@@ -155,11 +158,11 @@ func TestAuditMigrateV12ToV13(t *testing.T) {
 		t.Fatalf("重复升级后日志数变了: %d", total2)
 	}
 
-	// ⑤ 升级后新写入的数据能带上 v13 列
+	// ⑤ 升级后新写入的数据能带上 v13/v17 列
 	if err := st2.AddUsageLog(&model.UsageLog{
 		TS: 1700000100, Model: "gpt-4o", Status: "ok", TotalTokens: 10,
 		ErrorKind: "", IsStream: true, CacheReadTokens: 7, InputCost: 0.1,
-		UserAgent: "audit/1.0",
+		UserAgent: "audit/1.0", UsageSource: model.UsageSourceEstimated,
 	}); err != nil {
 		t.Fatalf("写入新日志: %v", err)
 	}
@@ -170,6 +173,11 @@ func TestAuditMigrateV12ToV13(t *testing.T) {
 	if len(newLogs) == 0 || !newLogs[0].IsStream || newLogs[0].CacheReadTokens != 7 ||
 		newLogs[0].UserAgent != "audit/1.0" {
 		t.Fatalf("v13 列未生效: %+v", newLogs[0])
+	}
+	// v17 的 usage_source 必须能往返：估算标记落库后要能读回来，
+	// 否则报表无法把估算值与真实值分开。
+	if newLogs[0].UsageSource != model.UsageSourceEstimated {
+		t.Fatalf("v17 usage_source 未生效: got %d", newLogs[0].UsageSource)
 	}
 }
 

@@ -67,6 +67,9 @@ type messagesEntryState struct {
 	selName     string
 	allowModels []string
 	body        []byte
+	// estTokens 是入站请求的输入 token 估算值：既用于路由选型，也作为
+	// 「上游不报 usage 时」的计费兜底（与 chat/responses 同一口径）。
+	estTokens int64
 }
 
 // handleMessages 处理 POST /v1/messages（流式/非流式）。
@@ -130,14 +133,15 @@ func (g *Gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origName := modelName
-	selName, allowModels, rerr := g.applyRouter(modelName, estimateAnthropicInputTokens(body), sk.AllowedModels)
+	estTokens := estimateAnthropicInputTokens(body)
+	selName, allowModels, rerr := g.applyRouter(modelName, estTokens, sk.AllowedModels)
 	if rerr != nil {
 		writeJSON(w, http.StatusBadRequest, errBodyAnthropic("invalid_request_error", msgRequestInvalid))
 		return
 	}
 
 	st := &messagesEntryState{origName: origName, selName: selName,
-		allowModels: allowModels, body: body}
+		allowModels: allowModels, body: body, estTokens: estTokens}
 	if wantsStream(body) {
 		g.messagesStreamForward(w, r, sk, st)
 		return
@@ -151,6 +155,7 @@ func (g *Gateway) messagesNonStream(w http.ResponseWriter, r *http.Request, sk *
 	start := time.Now()
 	ip := clientIP(r)
 	meta := newReqMeta(r, false)
+	meta.estPrompt = st.estTokens
 	var lastErr error
 	exclude := map[string]bool{}
 	// OpenAI 协议上游的请求转换只做一次（内容与叶子无关），失败直接 400。
@@ -228,6 +233,7 @@ func (g *Gateway) messagesStreamForward(w http.ResponseWriter, r *http.Request, 
 	start := time.Now()
 	ip := clientIP(r)
 	meta := newReqMeta(r, true) // 本函数只服务流式请求
+	meta.estPrompt = st.estTokens
 
 	fl, ok := w.(http.Flusher)
 	if !ok {

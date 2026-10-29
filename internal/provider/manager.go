@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"arkgate/internal/model"
+
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 )
@@ -277,12 +279,39 @@ type Stream struct {
 	// 流跑完后用 Usage() 取即可（未跑到 usage 事件时为 0）。
 	cacheCreation int64
 	cacheRead     int64
+
+	// 输出 token 估算：供「上游不发 usage 时」的兜底（见 Usage）。
+	//
+	// 为什么要在这里算：Pump 已经逐行解析每个 SSE 帧（为了 sniff 用量），
+	// 顺手取 delta 文本交给 model.TextTokens 是零额外成本，且完全不影响
+	// 写出的字节。上游一旦给了真实 usage，这两个值不会被用到。
+	//
+	// 存 token 而不是字符数：字符数丢失了 CJK 与拉丁的区别，纯中文对话会
+	// 低估约 4 倍（中文约 1 字 1 token）。与输入侧共用同一套口径。
+	//
+	// reasoningTokens 单独计数是因为推理模型（gpt-5.6-reasoning 等）把
+	// 思考过程放在 delta.reasoning_content，那份 token 同样计入上游用量；
+	// 漏掉它会让兜底值系统性偏低。
+	outTokens       int64
+	reasoningTokens int64
+	sawUsage        bool // 是否真的从上游拿到过非空 usage
 }
 
-// Usage 返回流式过程中累计的用量（含缓存 token）。应在 Pump 返回后读取。
+// Usage 返回流式过程中取得的用量（含缓存 token，取最后一帧终态快照）。
+// 应在 Pump 返回后读取。
+//
+// **上游从一开始就没给 usage 时，CompletionTokens 回落为按输出文本估算**
+// （调用方传 pt=0 表示「没拿到」，此时用估算补齐）。上游给了就当真实值用，
+// 绝不估算——估算只在缺失时兜底。
 func (s *Stream) Usage(pt, ct int64) *TextUsage {
 	if s == nil {
 		return &TextUsage{PromptTokens: pt, CompletionTokens: ct}
+	}
+	// pt 为 0 是调用方表达「上游没给 usage」的唯一信号：真正的 0 token
+	// 请求在流式场景不存在（有内容就必有 token，无内容也该有输入 token）。
+	if pt == 0 && ct == 0 && !s.sawUsage {
+		// 输出估算已按 CJK/拉丁分别折算（与输入侧同一口径）。
+		ct = s.outTokens + s.reasoningTokens
 	}
 	return &TextUsage{
 		PromptTokens:        pt,
@@ -316,8 +345,22 @@ func (s *Stream) Pump(sink io.Writer) (pt, ct int64, err error) {
 	for {
 		if len(line) > 0 {
 			if p, c, ok := sniffDataLine(line, s.sniff); ok {
-				pt += p
-				ct += c
+				// usage 是「终态快照」而非增量，必须覆盖不能累加：
+				// 上游常把用量发两次（finish chunk + 末尾的 usage-only chunk，
+				// 值完全相同），累加会让 token 直接翻倍——实测 cpa 账号的
+				// deepseek 系出现 2 倍虚高（单请求超模型上下文窗口）。
+				// 空 usage 帧（{} / null / 全零）不覆盖已有值：部分上游先发
+				// 真值再补一个空帧，覆盖会让真实用量丢失。
+				if p > 0 || c > 0 {
+					pt, ct = p, c
+					s.sawUsage = true
+				}
+			}
+			// 输出 token 估算：仅在上游没给 usage 时才会被用到，但必须每行都记
+			// （不能等「确认没 usage」再数，那时内容已经流走了）。
+			if oc, rc := sniffOutputTokens(line); oc > 0 || rc > 0 {
+				s.outTokens += oc
+				s.reasoningTokens += rc
 			}
 			// 缓存 token 单独扫一遍：不同上游字段名不同，统一在这里归一，
 			// 不必给 sniff 加第三个返回值（那会改到所有协议分支）。
@@ -558,6 +601,57 @@ func sniffDataLine(line []byte, sniff func(payload []byte) (int64, int64, bool))
 		return 0, 0, false
 	}
 	return sniff(payload)
+}
+
+// sniffOutputTokens 从一行 SSE 载荷里直接算出**输出 token 估算值**（不是字符数）。
+//
+// 为何不先数字符再统一折算：字符数丢失了 CJK 与拉丁的区别。上游不发 usage 时
+// 若一律按「4 字符 1 token」折算，纯中文对话会低估约 4 倍（中文实际约 1 字
+// 1 token）——而中文恰恰是本项目的主要场景。这里直接拿原文交给
+// model.TextTokens，与输入侧（请求体估算）用完全同一套口径。
+//
+// 返回 (正文, 推理) 两个估算值。覆盖三种协议形态：
+//   - OpenAI chat chunk：choices[].delta.content / reasoning_content / reasoning
+//   - Anthropic 事件：content_block_delta 的 delta.text / thinking（按 type 区分）
+//   - responses 事件：delta 字段为文本增量
+//
+// 仅在上游全程未上报 usage 时才被用到（见 Stream.Usage）。
+func sniffOutputTokens(line []byte) (out, reasoning int64) {
+	payload, ok := dataPayloadOf(line)
+	if !ok {
+		return 0, 0
+	}
+	var parsed struct {
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
+			} `json:"delta"`
+		} `json:"choices"`
+		Delta *struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+		} `json:"delta"`
+	}
+	if json.Unmarshal(payload, &parsed) != nil {
+		return 0, 0
+	}
+	for _, c := range parsed.Choices {
+		out += model.TextTokens(c.Delta.Content)
+		reasoning += model.TextTokens(c.Delta.ReasoningContent)
+		reasoning += model.TextTokens(c.Delta.Reasoning)
+	}
+	if d := parsed.Delta; d != nil {
+		// Anthropic 的 text_delta 与 thinking_delta 共用 delta 字段，靠 type 区分。
+		if d.Type == "thinking_delta" {
+			reasoning += model.TextTokens(d.Thinking)
+		} else {
+			out += model.TextTokens(d.Text)
+		}
+	}
+	return out, reasoning
 }
 
 // chatUsageFromChunk 从 chat 流式 chunk（include_usage 的 final chunk）提取用量。

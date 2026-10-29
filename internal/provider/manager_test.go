@@ -287,8 +287,42 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 	}
 }
 
-// TestChatStreamForward：SSE 逐字节原样回传 + include_usage 强制注入 + 用量提取。
+// TestChatStreamUsageIsSnapshotNotAccumulated 锁定 usage 的「终态快照」语义：
+//
+// 上游常把用量发两次——finish chunk 带一份完整 usage，随后紧跟一个
+// choices:[] 的 usage-only chunk（值完全相同），这是 CLIProxyAPI 注入
+// include_usage 后 DeepSeek 等上游的典型形态（其 issue #6475 有原文）。
+// 历史实现用 pt += p 累加，两帧相同的值会直接翻倍，导致单请求 token 超过
+// 模型上下文窗口（实测 2.0 倍）并虚增成本。usage 描述的是整次请求的终态，
+// 必须覆盖而不能累加；空帧（{} / null / 全零）也不得覆盖已有的真实值
+// （部分上游先发真值再补一个空帧）。
+func TestChatStreamUsageIsSnapshotNotAccumulated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 帧 A：finish chunk 带完整 usage；帧 B：usage-only 重复帧；帧 C：空 usage 帧。
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"+
+			"\"usage\":{\"prompt_tokens\":140025,\"completion_tokens\":741}}\n\n"+
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140025,\"completion_tokens\":741}}\n\n"+
+			"data: {\"choices\":[],\"usage\":{}}\n\n"+
+			"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+	var sink strings.Builder
+	usage, err := m.ChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", &sink)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if usage.PromptTokens != 140025 || usage.CompletionTokens != 741 {
+		t.Fatalf("usage 被重复计入或空帧覆盖：pt=%d ct=%d, want 140025/741",
+			usage.PromptTokens, usage.CompletionTokens)
+	}
+}
+
 func TestChatStreamForward(t *testing.T) {
+	// SSE 逐字节原样回传 + include_usage 强制注入 + 用量提取。
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -476,5 +510,97 @@ func TestOpenStreamFirstTokenTimeout(t *testing.T) {
 	}
 	if !strings.Contains(sink.String(), "[DONE]") {
 		t.Fatal("stream bytes missing")
+	}
+}
+
+// TestStreamUsageEstimatesOutputTokens 锁定「上游从不报 usage」时的输出估算：
+//
+// 实测 CLIProxyAPI 的 gpt-5.6-reasoning 别名 173/173 条请求全无 usage，
+// 旧实现把这些记成 0 token / 0 成本。现在按输出文本兜底折算，
+// 且必须同时覆盖正文与推理内容（推理模型的思考过程同样计入上游用量）。
+func TestStreamUsageEstimatesOutputTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 无任何 usage 帧；正文 8 个字符 + 推理内容 8 个字符。
+		_, _ = io.WriteString(w,
+			"data: {\"choices\":[{\"delta\":{\"content\":\"abcdefgh\"}}]}\n\n"+
+				"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"12345678\"}}]}\n\n"+
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+	var sink strings.Builder
+	usage, err := m.ChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", &sink)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	// 16 个拉丁字符按 4 字符/token 折算 = 4 token。
+	if usage.PromptTokens != 0 {
+		t.Fatalf("上游没给 usage 时输入侧不应凭空造数, got %d", usage.PromptTokens)
+	}
+	if usage.CompletionTokens != 4 {
+		t.Fatalf("输出侧应估算为 4, got %d", usage.CompletionTokens)
+	}
+}
+
+// TestStreamUsageEstimatesChineseOutput 锁定中文输出的 rune 级口径。
+//
+// 为什么单独测：早期实现只数「字符数」再统一按 4 字符/token 折算，纯中文
+// 对话会被低估约 4 倍（中文实际约 1 字 1 token）。中文是本项目主要场景，
+// 这个偏低不是小数级别的误差而是量级错误，必须由测试钉死。
+func TestStreamUsageEstimatesChineseOutput(t *testing.T) {
+	// 14 个汉字 + 8 个拉丁字符：期望 14*1 + 8/4 = 16 token。
+	const cn = "这是一段中文测试内容用于估算"
+	// 让上游完全不发 usage 帧。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"data: {\"choices\":[{\"delta\":{\"content\":\""+cn+"\"}}]}\n\n"+
+				"data: {\"choices\":[{\"delta\":{\"content\":\"abcdefgh\"}}]}\n\n"+
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+	var sink strings.Builder
+	usage, err := m.ChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", &sink)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	// 汉字 14 个（1 token/字）+ 拉丁 8 个（4 字符/token → 2）= 16。
+	// 若退回到「4 字符 1 token」的粗口径，这个值会是 5——差距 3 倍。
+	if want := int64(16); usage.CompletionTokens != want {
+		t.Fatalf("中文输出估算应为 %d（汉字 14 + 拉丁 8/4）, got %d",
+			want, usage.CompletionTokens)
+	}
+}
+
+// TestStreamUsageUpstreamValueNotOverridden 上游给了 usage 时，估算值绝不覆盖。
+func TestStreamUsageUpstreamValueNotOverridden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// 正文远多于 usage 声明的 3 token —— 真实值必须优先。
+		_, _ = io.WriteString(w,
+			"data: {\"choices\":[{\"delta\":{\"content\":\""+strings.Repeat("x", 400)+"\"}}]}\n\n"+
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n"+
+				"data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	m := NewManager()
+	rt := Route{Def: mustDef(t, "ark"), BaseURL: srv.URL, Key: "k"}
+	var sink strings.Builder
+	usage, err := m.ChatStream(context.Background(), rt, []byte(`{"model":"m","stream":true}`), "ep-1", &sink)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if usage.PromptTokens != 9 || usage.CompletionTokens != 3 {
+		t.Fatalf("上游真实值被估算覆盖: pt=%d ct=%d, want 9/3",
+			usage.PromptTokens, usage.CompletionTokens)
 	}
 }

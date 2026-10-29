@@ -12,16 +12,9 @@ package gateway
 
 import (
 	"encoding/json"
-	"unicode"
 
 	"arkgate/internal/balancer"
-)
-
-// 估算的经验参数（见文件头注释）。
-const (
-	estBaseTokens    = 3 // 对话级固定开销
-	estMsgOverhead   = 4 // 每条消息的结构开销
-	estOtherPerToken = 4 // 非CJK字符：约 4 字符折 1 token
+	"arkgate/internal/model"
 )
 
 // estimateInputTokens 按 API 形态估算输入 token 数（图像请求不参与路由，恒 0）。
@@ -47,9 +40,9 @@ func estimateChatTokens(body []byte) int64 {
 	if json.Unmarshal(body, &v) != nil {
 		return 0
 	}
-	total := int64(estBaseTokens)
+	total := int64(model.EstBaseTokens)
 	for _, msg := range v.Messages {
-		total += contentTokens(msg.Content) + estMsgOverhead
+		total += contentTokens(msg.Content) + model.EstMsgOverhead
 	}
 	return total
 }
@@ -65,7 +58,7 @@ func estimateResponsesTokens(body []byte) int64 {
 	if json.Unmarshal(body, &v) != nil {
 		return 0
 	}
-	total := int64(estBaseTokens) + responsesInstructionsTokens(v.Instructions)
+	total := int64(model.EstBaseTokens) + responsesInstructionsTokens(v.Instructions)
 
 	type inputItem struct {
 		Content      json.RawMessage `json:"content"`
@@ -79,7 +72,7 @@ func estimateResponsesTokens(body []byte) int64 {
 	var items []inputItem
 	if json.Unmarshal(v.Input, &items) == nil && len(items) > 0 {
 		for _, it := range items {
-			total += contentTokens(it.Content) + estMsgOverhead
+			total += contentTokens(it.Content) + model.EstMsgOverhead
 			if it.FunctionCall != nil {
 				total += textTokens(it.FunctionCall.Arguments)
 			}
@@ -133,9 +126,9 @@ func estimateAnthropicInputTokens(body []byte) int64 {
 	if json.Unmarshal(body, &v) != nil {
 		return 0
 	}
-	total := int64(estBaseTokens) + anthropicContentTokens(v.System)
+	total := int64(model.EstBaseTokens) + anthropicContentTokens(v.System)
 	for _, m := range v.Messages {
-		total += anthropicContentTokens(m.Content) + estMsgOverhead
+		total += anthropicContentTokens(m.Content) + model.EstMsgOverhead
 	}
 	return total
 }
@@ -163,51 +156,8 @@ func anthropicContentTokens(raw json.RawMessage) int64 {
 	return 0
 }
 
-// contentTokens 计算一段「内容」的估算 tokens：字符串，或分段数组
-// （[{type:"text", text:"..."}, ...]，只统计 text 字段；图像等分段忽略）。
-// null / 无法识别的形态按 0 处理（粗估不需要兜底报错）。
-func contentTokens(raw json.RawMessage) int64 {
-	if len(raw) == 0 {
-		return 0
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return textTokens(s)
-	}
-	var parts []struct {
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &parts) == nil {
-		var n int64
-		for _, p := range parts {
-			n += textTokens(p.Text)
-		}
-		return n
-	}
-	return 0
-}
+// contentTokens / textTokens / isCJK 的统一实现在 model 包（估算口径必须与
+// 「上游无 usage 时的兜底值」共用同一份，否则同一次请求的输入与输出不可比）。
+func contentTokens(raw json.RawMessage) int64 { return model.TextContentTokens(raw) }
 
-// textTokens 估算一段文本的 token 数：CJK 约 1 字 1 token，其余约 4 字符 1 token
-// （向上取整）。
-func textTokens(s string) int64 {
-	if s == "" {
-		return 0
-	}
-	var cjk, other int
-	for _, r := range s {
-		if isCJK(r) {
-			cjk++
-		} else {
-			other++
-		}
-	}
-	return int64(cjk + (other+estOtherPerToken-1)/estOtherPerToken)
-}
-
-// isCJK 判断是否中日韩表意文字（这些文字密度高，约 1 字符 ≈ 1 token）。
-func isCJK(r rune) bool {
-	return unicode.Is(unicode.Han, r) ||
-		unicode.Is(unicode.Hiragana, r) ||
-		unicode.Is(unicode.Katakana, r) ||
-		unicode.Is(unicode.Hangul, r)
-}
+func textTokens(s string) int64 { return model.TextTokens(s) }

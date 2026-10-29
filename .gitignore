@@ -23,6 +23,8 @@ secret.key
 # AI slop
 AGENTS.md
 docs/
+# AI 工具会话状态（pi 的 MCP 配置与后台任务日志，属本机环境产物）
+.pi/
 
 # 离线分析产物（tools/shareanalyze -charts 生成的报告，不入库）
 charts.html

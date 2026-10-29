@@ -144,21 +144,17 @@ func TestEstimateInputTokensDispatch(t *testing.T) {
 }
 
 // TestIsCJK 覆盖中日韩四类文字与拉丁字符的判定。
+// isCJK 的实现已下沉到 model 包（估算口径共用）；此处用 TextTokens 的
+// 行为间接锁定：CJK 单字计 1 token，拉丁字符 4 个计 1 token。
 func TestIsCJK(t *testing.T) {
-	for _, r := range "中日本한" {
-		if !isCJK(r) {
-			t.Fatalf("rune %q should be CJK", r)
+	for _, s := range []string{"中", "日", "本", "한", "か", "ナ"} {
+		if got := textTokens(s); got != 1 {
+			t.Fatalf("CJK %q 应计 1 token, got %d", s, got)
 		}
 	}
-	// 平假名/片假名。
-	for _, r := range "かなカナ" {
-		if !isCJK(r) {
-			t.Fatalf("rune %q should be CJK", r)
-		}
-	}
-	for _, r := range "abc 1!" {
-		if isCJK(r) {
-			t.Fatalf("rune %q should not be CJK", r)
+	for _, s := range []string{"abcd", "1! 2"} {
+		if got := textTokens(s); got != 1 {
+			t.Fatalf("非CJK %q 应计 1 token, got %d", s, got)
 		}
 	}
 }

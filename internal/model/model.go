@@ -236,8 +236,8 @@ type EndpointRuntime struct {
 	// ProbeStartedAt 是探测租约的开始时间（unix nano），供判断探测者是否失联，
 	// 避免叶子永久卡在 HalfOpen（一个请求都不放）。
 	ProbeStartedAt int64
-	RPM     *Window
-	TPM     *Window
+	RPM            *Window
+	TPM            *Window
 }
 
 // EndpointRuntimeInfo 是 EndpointRuntime 的 JSON 可见快照。
@@ -246,7 +246,7 @@ type EndpointRuntimeInfo struct {
 	CircuitOpen     bool  `json:"circuit_open"`      // 是否熔断中
 	CircuitRemainMS int64 `json:"circuit_remain_ms"` // 剩余冷却毫秒
 	// HalfOpen 表示冷却已到期、正在放行一个探测请求试上游（界面可展示为「探测中」）。
-	HalfOpen  bool `json:"half_open"`
+	HalfOpen   bool  `json:"half_open"`
 	RPMCurrent int64 `json:"rpm_current"`
 	TPMCurrent int64 `json:"tpm_current"`
 }
@@ -310,11 +310,11 @@ type SubKey struct {
 	// 高频小请求是比 token 更常见的滥用形态，token 限额抓不住。
 	WindowLimitRequests int64 `json:"window_limit_requests"`
 	ExpiresAt           int64 `json:"expires_at"`
-	CreatedAt        int64    `json:"created_at"`
-	LastUsedAt       int64    `json:"last_used_at"`
-	TotalRequests    int64    `json:"total_requests"`
-	TotalTokens      int64    `json:"total_tokens"`
-	TotalImages      int64    `json:"total_images"`
+	CreatedAt           int64 `json:"created_at"`
+	LastUsedAt          int64 `json:"last_used_at"`
+	TotalRequests       int64 `json:"total_requests"`
+	TotalTokens         int64 `json:"total_tokens"`
+	TotalImages         int64 `json:"total_images"`
 }
 
 // UsageLog 单次请求日志（用于管理页日志列表）。
@@ -344,6 +344,16 @@ type UsageLog struct {
 	// 缓存 token（v13）：prompt cache 的写入/读取量，用于命中率与缓存成本分析。
 	CacheCreationTokens int64 `json:"cache_creation_tokens"`
 	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	// UsageSource 用量来源（v17）：0=未知 1=上游上报 2=网关估算。
+	//
+	// 为什么需要这一列：部分上游**从不**返回 usage（实测 CLIProxyAPI 的
+	// gpt-5.6-reasoning 别名 173/173 条全为 0）。旧实现把这类请求记成 0 token
+	// / 0 成本，既少计费也让报表出现断崖。现在上游不给时按请求体与输出字符数
+	// 本地估算兜底，但「真实值」与「估算值」必须能区分——混在同一列里，
+	// 账单和命中率都不可信。
+	//
+	// 历史行一律是 0（未知）：迁移不谎称它们可信。
+	UsageSource int `json:"usage_source"`
 	// ErrorKind 错误分类（v13）。见 model.ErrorKind* 常量；成功为空串。
 	// 比自由文本 Error 更适合聚合：日志文本会带上游请求 id/模型标识，无法直接分组。
 	ErrorKind    string `json:"error_kind"`
@@ -359,10 +369,24 @@ type UsageLog struct {
 // 错误分类枚举（usage_logs.error_kind）。区分的目的是把「不是上游故障」的失败
 // 从上游失败率里剔出去——否则成功率和熔断都会被客户端行为污染。
 const (
-	ErrorKindNone            = ""                  // 成功
-	ErrorKindUpstreamError   = "upstream_error"    // 真实上游 4xx/5xx
-	ErrorKindUpstreamTimeout = "upstream_timeout"  // 上游整体超时 / 首 token 超时
-	ErrorKindClientInvalid   = "client_invalid"    // 请求方参数/内容问题（含流类型错、上下文超限）
-	ErrorKindClientCancel    = "client_cancel"     // 下游断连（context canceled）
-	ErrorKindLocal           = "local_error"       // 无账号/全熔断/限流/无能力/转换拒绝
+	ErrorKindNone            = ""                 // 成功
+	ErrorKindUpstreamError   = "upstream_error"   // 真实上游 4xx/5xx
+	ErrorKindUpstreamTimeout = "upstream_timeout" // 上游整体超时 / 首 token 超时
+	ErrorKindClientInvalid   = "client_invalid"   // 请求方参数/内容问题（含流类型错、上下文超限）
+	ErrorKindClientCancel    = "client_cancel"    // 下游断连（context canceled）
+	ErrorKindLocal           = "local_error"      // 无账号/全熔断/限流/无能力/转换拒绝
+)
+
+// 用量来源枚举（usage_logs.usage_source，v17）。
+//
+// 三者互斥，且**只由网关写**：
+//   - SourceUnknown：取不到，也无法估算（例如流式请求在首字节前就失败）。
+//     值不可信，报表应把它排除在「平均 token / 缓存命中率」的分母之外。
+//   - SourceUpstream：上游真实上报，可作计费依据。
+//   - SourceEstimated：网关本地估算（请求体字符数 + 输出字符数折算）。
+//     用于让「上游从不报 usage」的请求不至于记 0；误差可接受，但必须标注。
+const (
+	UsageSourceUnknown   = 0
+	UsageSourceUpstream  = 1
+	UsageSourceEstimated = 2
 )
